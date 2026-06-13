@@ -13,6 +13,7 @@ echo >> ${TMP} || exit 1 # Formatting
 
 # Let's sort by ratio; thanks Gemini!
 REMOTE=$(/usr/local/bin/transmission-remote -l)
+[[ -n "${REMOTE}" ]] || exit 1
 head -n 1 <<< ${REMOTE} >> ${TMP}
 sed '1d;$d' <<< ${REMOTE} | sed -E 's/ (GB|MB|kB|B|mins|hrs|days|secs)/@\1/g' | sort -k7rn | sed -E 's/@(GB|MB|kB|B|mins|hrs|days|secs)/ \1/g' >> ${TMP}
 tail -n 1 <<< ${REMOTE} >> ${TMP}
