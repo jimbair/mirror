@@ -19,7 +19,6 @@ echo >> ${TMP} || exit 1 # Formatting
 # (e.g. '10 mins') with '@' so they don't break column-based sorting.
 # 'sort -k7rn' sorts numerically (-n) and in reverse/descending (-r) by the 7th column.
 # The final 'sed -E' swaps the '@' characters back into normal spaces.
-#
 REMOTE=$(/usr/local/bin/transmission-remote -l)
 [[ -n "${REMOTE}" ]] || exit 1
 head -n 1 <<< ${REMOTE} >> ${TMP} || exit 1
