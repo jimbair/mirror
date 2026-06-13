@@ -23,5 +23,4 @@ cat ${TMP} > /var/lib/transmission/Downloads/status.txt || exit 1
 rm ${TMP} || exit 1 
 
 # All done
-curl -fsS -m 10 --retry 5 -o /dev/null https://hc-ping.com/a754b727-50d2-4bf5-8195-7a4cf7d468a3
 exit 0
