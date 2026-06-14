@@ -29,32 +29,61 @@ STATUS_FILE = ISO_DIR / 'status.txt'
 # Number of consecutive fetch failures before a domain is reported as down.
 # Transient outages are silently ignored until this threshold is reached.
 FAIL_THRESHOLD = 3
-FAIL_FILE = Path('/tmp/new-torrents-failures.txt')
+# XDG-compliant config dir; created on first run if absent
+FAIL_FILE = Path.home() / '.config' / 'new-torrents' / 'failures.json'
 
 
 ###########
 # HELPERS #
 ###########
 
-def _read_failures() -> dict[str, int]:
-    """Read the failure counters file into a dict."""
-    counts: dict[str, int] = {}
-    if not FAIL_FILE.exists():
-        return counts
-    for line in FAIL_FILE.read_text().splitlines():
-        if '=' in line:
-            k, _, v = line.partition('=')
-            try:
-                counts[k] = int(v)
-            except ValueError:
-                pass
-    return counts
+class FailureTracker:
+    """Persists consecutive fetch failure counts across runs.
 
+    Counts are loaded from JSON at construction, held in memory while checkers
+    run, then written back once via save() only if they changed. This avoids
+    concurrent read/write races from the threaded checkers and skips unnecessary
+    disk writes on clean runs. Surviving reboots prevents a reboot from silently
+    resetting an ongoing outage counter.
+    """
 
-def _write_failures(counts: dict[str, int]) -> None:
-    """Write the failure counters dict back to the file."""
-    FAIL_FILE.parent.mkdir(parents=True, exist_ok=True)
-    FAIL_FILE.write_text(''.join(f'{k}={v}\n' for k, v in counts.items()))
+    def __init__(self, path: Path, threshold: int) -> None:
+        self._path      = path
+        self._threshold = threshold
+        self._counts    = self._load()
+        self._dirty     = False
+
+    def increment(self, name: str) -> None:
+        """Increment the failure counter for name."""
+        self._counts[name] = self._counts.get(name, 0) + 1
+        self._dirty = True
+
+    def clear(self, name: str) -> None:
+        """Remove the failure counter for name if one exists."""
+        if name in self._counts:
+            del self._counts[name]
+            self._dirty = True
+
+    def at_threshold(self, name: str) -> bool:
+        """Return True if name has reached the alert threshold."""
+        return self._counts.get(name, 0) >= self._threshold
+
+    def save(self) -> None:
+        """Write counts to disk if they changed. Called once after all checkers finish."""
+        if not self._dirty:
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.write_text(json.dumps(self._counts, indent=2))
+
+    # Internal
+
+    def _load(self) -> dict[str, int]:
+        if not self._path.exists():
+            return {}
+        try:
+            return json.loads(self._path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
 
 
 def ver_key(v: str) -> tuple[int, ...]:
@@ -121,9 +150,7 @@ class StatusDisplay:
         self._refresh_thread = threading.Thread(target=self._refresh_loop, daemon=True)
         self._refresh_thread.start()
 
-    # ------------------------------------------------------------------
     # Public interface called by Checker
-    # ------------------------------------------------------------------
 
     def update(self, name: str, msg: str) -> None:
         with self._lock:
@@ -153,9 +180,7 @@ class StatusDisplay:
             self._redraw()
         print(file=sys.stderr)  # blank line before alerts
 
-    # ------------------------------------------------------------------
     # Internal
-    # ------------------------------------------------------------------
 
     def _refresh_loop(self) -> None:
         """Redraw every second so elapsed timers tick for silent checkers."""
@@ -168,6 +193,7 @@ class StatusDisplay:
         visible = re.sub(r'\x1b\[[^m]*m', '', rendered)
         if self._term_width <= 0:
             return 1
+        # Ceiling division: how many full terminal rows does this line consume?
         return max(1, (len(visible) + self._term_width - 1) // self._term_width)
 
     def _move_to_top(self, rendered_lines: list[str]) -> None:
@@ -180,7 +206,9 @@ class StatusDisplay:
         self._move_to_top(rendered)
         for line in rendered:
             rows = self._physical_rows(line)
-            # Erase each physical row this line occupies, then move back up
+            # Erase every physical row the previous render of this line occupied,
+            # then move the cursor back to the first row before printing the new content.
+            # This handles lines that wrapped differently between redraws.
             for _ in range(rows):
                 print(self._ERASE_LINE, file=sys.stderr, end='\n')
             print(self._CURSOR_UP.format(rows), file=sys.stderr, end='')
@@ -200,6 +228,7 @@ class StatusDisplay:
             timing = ''
         return f'  {color}{name:<20}{self._RESET} {status}{timing}'
 
+
 ################
 # BASE CHECKER #
 ################
@@ -213,11 +242,13 @@ class Checker(ABC):
     """
 
     def __init__(self, iso_dir: Path, status_content: str,
+                 failures: FailureTracker,
                  display: 'StatusDisplay | None' = None) -> None:
         self.iso_dir = iso_dir
         self.status_content = status_content
         self.updates: set[str] = set()
-        self._body: str = ''
+        self._page: str = ''
+        self._failures = failures
         self._display = display
         self._name = self.__class__.__name__
 
@@ -225,20 +256,15 @@ class Checker(ABC):
         if self._display:
             self._display.update(self._name, msg)
 
-    # ------------------------------------------------------------------
-    # Alert accumulation
-    # ------------------------------------------------------------------
+    # Public interface called by subclasses
 
     def alert(self, name: str) -> None:
         self._debug(f'alert {name}')
         self.updates.add(name)
 
-    # ------------------------------------------------------------------
-    # HTTP fetch with failure tracking
-    # ------------------------------------------------------------------
 
     def fetch(self, url: str, name: str) -> bool:
-        """Fetch url into self._body. Tracks consecutive failures per name.
+        """Fetch url into self._page. Tracks consecutive failures per name.
         Returns True on success, False on failure.
         """
         domain = url.split('/')[2]
@@ -246,6 +272,7 @@ class Checker(ABC):
         try:
             req = urllib.request.Request(
                 url,
+                # Mimic curl's UA; some servers (e.g. Proxmox) return stripped pages to non-browser agents
                 headers={'Accept-Encoding': 'gzip, deflate', 'User-Agent': 'curl/8.5.0'},
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -256,70 +283,60 @@ class Checker(ABC):
                     raw = gzip.decompress(raw)
                 elif ce == 'deflate':
                     raw = zlib.decompress(raw)
-                self._body = raw.decode(encoding, errors='replace')
+                self._page = raw.decode(encoding, errors='replace')
 
-            self._debug(f'fetch ok ({len(self._body)} bytes)')
-            self._clear_failure(name)
+            self._debug(f'fetch ok ({len(self._page)} bytes)')
+            self._failures.clear(name)
             return True
 
         except (urllib.error.URLError, OSError) as e:
             self._debug(f'fetch failed: {e}')
-            self._body = ''
-            self._increment_failure(name, domain)
+            self._page = ''
+            self._failures.increment(name)
+            # Check threshold against in-memory state; no disk read needed
+            if self._failures.at_threshold(name):
+                self.alert(domain)
             return False
 
-    def _increment_failure(self, name: str, domain: str) -> None:
-        counts = _read_failures()
-        counts[name] = counts.get(name, 0) + 1
-        _write_failures(counts)
-        if counts[name] >= FAIL_THRESHOLD:
-            self.alert(domain)
-
-    def _clear_failure(self, name: str) -> None:
-        counts = _read_failures()
-        if name in counts:
-            del counts[name]
-            _write_failures(counts)
-
-    # ------------------------------------------------------------------
-    # Body validation
-    # ------------------------------------------------------------------
 
     def body_ok(self, alert_name: str, min_len: int = 250) -> bool:
-        """Return False and alert if self._body is empty or suspiciously short."""
-        if not self._body or len(self._body) < min_len:
+        """Return False and alert if self._page is empty or below min_len bytes.
+        A short response usually means a transient error page or a CDN block
+        rather than real content; 250 bytes is safely below any valid index page.
+        """
+        if not self._page or len(self._page) < min_len:
             self.alert(alert_name)
             return False
         return True
 
-    # ------------------------------------------------------------------
-    # Disk / transmission checks
-    # ------------------------------------------------------------------
 
     def check_iso(self, iso: str, new_alert: str = '') -> None:
         """Check a flat ISO file against transmission status and local disk."""
         if not new_alert:
             new_alert = f'NEW:{iso}'
+        # Transmission knows about this ISO; nothing to do
         if iso in self.status_content:
             return
         path = self.iso_dir / iso
+        # ISO is on disk but transmission has no record of it
         if path.exists() and path.stat().st_size > 0:
             self.alert(f'ORPHAN:{iso}')
+        # ISO is not on disk and not known to transmission
         else:
             self.alert(new_alert)
 
     def check_dir(self, directory: str) -> None:
         """Check a torrent directory against transmission status and local disk."""
+        # Transmission knows about this directory; nothing to do
         if directory in self.status_content:
             return
+        # Directory is on disk but transmission has no record of it
         if (self.iso_dir / directory).is_dir():
             self.alert(f'ORPHAN:{directory}')
+        # Directory is not on disk and not known to transmission
         else:
             self.alert(f'NEW:{directory}')
 
-    # ------------------------------------------------------------------
-    # Entry point
-    # ------------------------------------------------------------------
 
     def run(self) -> set[str]:
         """Run the check and return accumulated alerts."""
@@ -357,7 +374,8 @@ class MintChecker(Checker):
         if not self.body_ok('pub.linuxmint.io'):
             return
 
-        versions = re.findall(r'href="([0-9]+\.[0-9]+)/"', self._body)
+        versions = re.findall(r'href="([0-9]+\.[0-9]+)/"', self._page)
+        # Stable index structure could change; alert and bail if it does
         if not versions:
             self.alert('MALFORMED:Linux-Mint')
             return
@@ -369,21 +387,22 @@ class MintChecker(Checker):
         if not self.body_ok('pub.linuxmint.io'):
             return
 
-        tracker = sorted(re.findall(r'href="(linuxmint-[^"]+\.iso)"', self._body))
-        if not tracker:
+        upstream_isos = sorted(re.findall(r'href="(linuxmint-[^"]+\.iso)"', self._page))
+        # Version directory structure could change; alert and bail if it does
+        if not upstream_isos:
             self.alert(f'MALFORMED:Linux-Mint-{current}')
             return
 
-        for iso in tracker:
+        for iso in upstream_isos:
             self.check_iso(iso)
 
-        local = sorted(self.iso_dir.glob('linuxmint-*.iso'))
-        if not local:
+        local_isos = sorted(self.iso_dir.glob('linuxmint-*.iso'))
+        if not local_isos:
             self.alert('MISSING:linuxmint-*.iso')
             return
 
-        for path in local:
-            if path.name not in tracker:
+        for path in local_isos:
+            if path.name not in set(upstream_isos):
                 self.alert(f'STALE:{path.name}')
 
 
@@ -403,31 +422,35 @@ class CachyChecker(Checker):
         if not self.body_ok('cachyos.org'):
             return
 
-        tracker = sorted(
+        # The download page embeds torrent metadata in HTML-entity-encoded JSON props
+        # on Astro island components; torrent_url values look like:
+        #   torrent_url&quot;:[0,&quot;https://host/path/cachyos-NAME.torrent&quot;
+        upstream_isos = sorted(
             iso + '.iso'
             for iso in re.findall(
                 r'torrent_url&quot;:\[0,&quot;[^&]+/(cachyos-[^&]+)\.torrent&quot;',
-                self._body,
+                self._page,
             )
         )
-        if not tracker:
+        # Page structure could change; alert and bail if it does
+        if not upstream_isos:
             self.alert('MALFORMED:cachyos.org')
             return
 
         release_dates = sorted({
             m
-            for iso in tracker
+            for iso in upstream_isos
             for m in re.findall(r'cachyos-[^-]+-linux-(\d+)\.iso', iso)
         })
         current_release = release_dates[-1] if release_dates else ''
 
-        for iso in tracker:
+        for iso in upstream_isos:
             self.check_iso(iso, f'NEW:CachyOS-{current_release}')
 
         for path in self.iso_dir.glob('cachyos-*.iso'):
             if not path.stat().st_size:
                 continue
-            if path.name not in tracker:
+            if path.name not in set(upstream_isos):
                 self.alert(f'STALE:{path.name}')
 
 
@@ -446,7 +469,8 @@ class ArchChecker(Checker):
         if not self.body_ok('archlinux.org'):
             return
 
-        m = re.search(r'Current Release:</strong> (\d{4}\.\d{2}\.\d{2})', self._body)
+        m = re.search(r'Current Release:</strong> (\d{4}\.\d{2}\.\d{2})', self._page)
+        # Page structure could change; alert and bail if it does
         if not m:
             self.alert('MALFORMED:archlinux.org')
             return
@@ -481,7 +505,8 @@ class FedoraChecker(Checker):
             return
 
         try:
-            data = json.loads(self._body)
+            data = json.loads(self._page)
+        # JSON structure could change; alert and bail if it does
         except json.JSONDecodeError:
             self.alert('MALFORMED:Fedora-Tracker')
             return
@@ -490,11 +515,13 @@ class FedoraChecker(Checker):
             (entry['name'] for entry in data),
             key=ver_key,
         )
+        # Empty version list means the JSON structure changed
         if not tracker_versions:
             self.alert('MALFORMED:Fedora-Tracker')
             return
 
-        # Versions present in local directories
+        # Collect versions present in local directories. The trailing slash in
+        # the glob pattern ensures we only match directories, not ISO files.
         local_versions = {
             dirpath.name.rsplit('-', 1)[-1]
             for dirpath in self.iso_dir.glob('Fedora-*-*/')
@@ -550,12 +577,14 @@ class AlmaChecker(Checker):
         if not self.body_ok('mirrors.almalinux.org'):
             return
 
-        # Extract (version, arch) pairs from /isos/ARCH/VERSION.html links
-        raw = re.findall(r'/isos/([^/]+)/([0-9]+\.[0-9]+)\.html', self._body)
+        # Extract (version, arch) pairs from /isos/ARCH/VERSION.html links;
+        # the regex captures (arch, version) so we swap on unpack
+        raw = re.findall(r'/isos/([^/]+)/([0-9]+\.[0-9]+)\.html', self._page)
         pairs = sorted(
             {(ver, arch) for arch, ver in raw},
             key=lambda p: ver_key(p[0]),
         )
+        # Page structure could change; alert and bail if it does
         if not pairs:
             self.alert('MALFORMED:AlmaLinux-isos.html')
             return
@@ -618,22 +647,24 @@ class UbuntuChecker(Checker):
         if not self.body_ok('torrent.ubuntu.com'):
             return
 
-        lines = [l for l in self._body.splitlines() if not re.search(r'beta|snapshot', l, re.IGNORECASE)]
-        tracker = re.findall(r'>([^<]+\.iso)<', '\n'.join(lines))
-        if not tracker:
+        lines = [l for l in self._page.splitlines() if not re.search(r'beta|snapshot', l, re.IGNORECASE)]
+        upstream_isos = re.findall(r'>([^<]+\.iso)<', '\n'.join(lines))
+        # Page structure could change; alert and bail if it does
+        if not upstream_isos:
             self.alert('MALFORMED:Ubuntu-Tracker')
             return
 
-        for iso in tracker:
+        for iso in upstream_isos:
             self.check_iso(iso)
 
-        local = sorted(self.iso_dir.glob('*buntu*.iso'))
-        if not local:
+        local_isos = sorted(self.iso_dir.glob('*buntu*.iso'))
+        if not local_isos:
             self.alert('MISSING:*buntu*.iso')
             return
 
-        for path in local:
-            if path.name not in tracker:
+        upstream_set = set(upstream_isos)
+        for path in local_isos:
+            if path.name not in upstream_set:
                 self.alert(f'STALE:{path.name}')
 
 
@@ -654,9 +685,10 @@ class ProxmoxChecker(Checker):
             return
 
         versions = sorted(
-            set(re.findall(r'\d+\.\d+-\d+', self._body)),
+            set(re.findall(r'\d+\.\d+-\d+', self._page)),
             key=ver_key,
         )
+        # Page structure could change; alert and bail if it does
         if not versions:
             self.alert('MALFORMED:Proxmox-Downloads')
             return
@@ -691,6 +723,8 @@ class DebianChecker(Checker):
     """
 
     def check(self) -> None:
+        # Filter rules are order-dependent: include directories so rsync recurses,
+        # include .torrent files, then exclude everything else
         result = subprocess.run(
             [
                 'rsync', '--list-only', '--no-motd', '-r',
@@ -704,30 +738,35 @@ class DebianChecker(Checker):
         )
 
         if result.returncode != 0:
-            self._increment_failure('Debian', 'cdimage.debian.org')
+            self._failures.increment('Debian')
+            # Check threshold against in-memory state; no disk read needed
+            if self._failures.at_threshold('Debian'):
+                self.alert('cdimage.debian.org')
             return
 
-        self._clear_failure('Debian')
+        self._failures.clear('Debian')
 
-        tracker = sorted(
+        upstream_isos = sorted(
             line.split()[-1].rsplit('/', 1)[-1].removesuffix('.torrent')
             for line in result.stdout.splitlines()
             if line.endswith('.torrent')
         )
-        if not tracker:
+        # rsync succeeded but returned no .torrent files; structure may have changed
+        if not upstream_isos:
             self.alert('MALFORMED:Debian-Tracker')
             return
 
-        for iso in tracker:
+        for iso in upstream_isos:
             self.check_iso(iso)
 
-        local = sorted(self.iso_dir.glob('debian-*.iso'))
-        if not local:
+        local_isos = sorted(self.iso_dir.glob('debian-*.iso'))
+        if not local_isos:
             self.alert('MISSING:debian-*.iso')
             return
 
-        for path in local:
-            if path.name not in tracker:
+        upstream_set = set(upstream_isos)
+        for path in local_isos:
+            if path.name not in upstream_set:
                 self.alert(f'STALE:{path.name}')
 
 
@@ -764,22 +803,27 @@ def main() -> int:
         return 1
 
     status_content = STATUS_FILE.read_text()
+    # 'Sum:' appears in the totals line of transmission-remote -l output;
+    # its absence means the file wasn't written by transmission or was truncated
     if 'Sum:' not in status_content:
         print(f'ERROR: status.txt appears malformed at {STATUS_FILE}. Exiting.')
         return 1
 
-    # Run all checkers concurrently; merge results into a sorted deduplicated list
-    # Show the live status display when running interactively or when --verbose is
-    # passed explicitly. Cron and other non-tty callers get quiet output.
+    # Run all checkers concurrently. Show the live status display when running
+    # interactively or when --verbose is passed; cron gets quiet output.
     interactive = sys.stderr.isatty() or '--verbose' in sys.argv
     names = [cls.__name__ for cls in CHECKERS]
     display = StatusDisplay(names) if interactive else None
-    instances = [cls(ISO_DIR, status_content, display) for cls in CHECKERS]
+    failures = FailureTracker(FAIL_FILE, FAIL_THRESHOLD)
+    instances = [cls(ISO_DIR, status_content, failures, display) for cls in CHECKERS]
     all_updates: set[str] = set()
 
     with ThreadPoolExecutor(max_workers=len(instances)) as pool:
         for future in as_completed(pool.submit(checker.run) for checker in instances):
             all_updates |= future.result()
+
+    # Persist failure counts now that all checkers have finished
+    failures.save()
 
     if display:
         display.close()
