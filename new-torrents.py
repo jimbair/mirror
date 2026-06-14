@@ -48,10 +48,10 @@ class FailureTracker:
     """
 
     def __init__(self, path: Path, threshold: int) -> None:
-        self._path      = path
-        self._threshold = threshold
-        self._counts    = self._load()
-        self._dirty     = False
+        self._path      = path         # noqa: E221
+        self._threshold = threshold    # noqa: E221
+        self._counts    = self._load() # noqa: E221
+        self._dirty     = False        # noqa: E221
 
     def increment(self, name: str) -> None:
         """Increment the failure counter for name."""
@@ -116,22 +116,22 @@ class StatusDisplay:
       red    - reserved for future error/exception states
     """
 
-    _ERASE_LINE = '\x1b[2K'
-    _CURSOR_UP  = '\x1b[{}A'
-    _RESET      = '\x1b[0m'
-    _DIM        = '\x1b[2m'
-    _YELLOW     = '\x1b[33m'
-    _GREEN      = '\x1b[32m'
-    _CYAN       = '\x1b[36m'
-    _RED        = '\x1b[31m'   # reserved for future error states
+    _ERASE_LINE = '\x1b[2K'   # noqa: E221
+    _CURSOR_UP  = '\x1b[{}A'  # noqa: E221
+    _RESET      = '\x1b[0m'   # noqa: E221
+    _DIM        = '\x1b[2m'   # noqa: E221
+    _YELLOW     = '\x1b[33m'  # noqa: E221
+    _GREEN      = '\x1b[32m'  # noqa: E221
+    _CYAN       = '\x1b[36m'  # noqa: E221
+    _RED        = '\x1b[31m'  # noqa: E221
 
     def __init__(self, names: list[str]) -> None:
-        self._names   = names
-        self._lock    = threading.Lock()
-        self._status: dict[str, str]   = {n: 'waiting' for n in names}
-        self._start:  dict[str, float] = {}
-        self._alerts: dict[str, int]   = {}
-        self._done:   dict[str, bool]  = {n: False for n in names}
+        self._names                   = names                          # noqa: E221
+        self._lock                    = threading.Lock()               # noqa: E221
+        self._status: dict[str, str]  = {n: 'waiting' for n in names}  # noqa: E221
+        self._start: dict[str, float] = {}                             # noqa: E221
+        self._alerts: dict[str, int]  = {}                             # noqa: E221
+        self._done: dict[str, bool]   = {n: False for n in names}      # noqa: E221
 
         # Measure terminal width once; used to compute physical row count when
         # a rendered line wraps. Falls back to 80 if stderr is not a tty.
@@ -165,7 +165,7 @@ class StatusDisplay:
 
     def finish(self, name: str, alert_count: int) -> None:
         with self._lock:
-            self._done[name]   = True
+            self._done[name] = True
             self._alerts[name] = alert_count
             elapsed = time.monotonic() - self._start.get(name, time.monotonic())
             noun = 'alert' if alert_count == 1 else 'alerts'
@@ -197,7 +197,7 @@ class StatusDisplay:
         return max(1, (len(visible) + self._term_width - 1) // self._term_width)
 
     def _move_to_top(self, rendered_lines: list[str]) -> None:
-        total_rows = sum(self._physical_rows(l) for l in rendered_lines)
+        total_rows = sum(self._physical_rows(line) for line in rendered_lines)
         if total_rows:
             print(self._CURSOR_UP.format(total_rows), file=sys.stderr, end='')
 
@@ -217,14 +217,14 @@ class StatusDisplay:
     def _render_line(self, name: str) -> str:
         status = self._status[name]
         if self._done[name]:
-            color  = self._CYAN if self._alerts.get(name, 0) else self._GREEN
+            color  = self._CYAN if self._alerts.get(name, 0) else self._GREEN  # noqa: E221
             timing = ''
         elif name in self._start:
-            color  = self._YELLOW
-            secs   = time.monotonic() - self._start[name]
+            color  = self._YELLOW                                              # noqa: E221
+            secs   = time.monotonic() - self._start[name]                      # noqa: E221
             timing = f' {self._DIM}({secs:.1f}s){self._RESET}'
         else:
-            color  = self._DIM
+            color  = self._DIM                                                 # noqa: E221
             timing = ''
         return f'  {color}{name:<20}{self._RESET} {status}{timing}'
 
@@ -262,7 +262,6 @@ class Checker(ABC):
         self._debug(f'alert {name}')
         self.updates.add(name)
 
-
     def fetch(self, url: str, name: str) -> bool:
         """Fetch url into self._page. Tracks consecutive failures per name.
         Returns True on success, False on failure.
@@ -272,7 +271,8 @@ class Checker(ABC):
         try:
             req = urllib.request.Request(
                 url,
-                # Mimic curl's UA; some servers (e.g. Proxmox) return stripped pages to non-browser agents
+                # Mimic curl's UA; some servers (e.g. Proxmox) return stripped
+                # pages to non-browser agents
                 headers={'Accept-Encoding': 'gzip, deflate', 'User-Agent': 'curl/8.5.0'},
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -298,7 +298,6 @@ class Checker(ABC):
                 self.alert(domain)
             return False
 
-
     def body_ok(self, alert_name: str, min_len: int = 250) -> bool:
         """Return False and alert if self._page is empty or below min_len bytes.
         A short response usually means a transient error page or a CDN block
@@ -308,7 +307,6 @@ class Checker(ABC):
             self.alert(alert_name)
             return False
         return True
-
 
     def check_iso(self, iso: str, new_alert: str = '') -> None:
         """Check a flat ISO file against transmission status and local disk."""
@@ -336,7 +334,6 @@ class Checker(ABC):
         # Directory is not on disk and not known to transmission
         else:
             self.alert(f'NEW:{directory}')
-
 
     def run(self) -> set[str]:
         """Run the check and return accumulated alerts."""
@@ -598,7 +595,10 @@ class AlmaChecker(Checker):
         }
 
         for major in tracker_majors:
-            local_major_dirs = [d for d in self.iso_dir.glob(f'AlmaLinux-{major}.*-*/') if d.is_dir()]
+            local_major_dirs = [
+                d for d in self.iso_dir.glob(f'AlmaLinux-{major}.*-*/')
+                if d.is_dir()
+            ]
             if not local_major_dirs:
                 self.alert(f'NEW:AlmaLinux-{major}')
                 continue
@@ -616,7 +616,10 @@ class AlmaChecker(Checker):
 
     def _check_version(self, major: str, current_version: str, arches: list[str]) -> None:
         """Check a single AlmaLinux major version against local disk."""
-        local_current = [d for d in self.iso_dir.glob(f'AlmaLinux-{current_version}-*/') if d.is_dir()]
+        local_current = [
+            d for d in self.iso_dir.glob(f'AlmaLinux-{current_version}-*/')
+            if d.is_dir()
+        ]
         if not local_current:
             self.alert(f'NEW:AlmaLinux-{current_version}')
         else:
@@ -647,7 +650,10 @@ class UbuntuChecker(Checker):
         if not self.body_ok('torrent.ubuntu.com'):
             return
 
-        lines = [l for l in self._page.splitlines() if not re.search(r'beta|snapshot', l, re.IGNORECASE)]
+        lines = [
+            ln for ln in self._page.splitlines()
+            if not re.search(r'beta|snapshot', ln, re.IGNORECASE)
+        ]
         upstream_isos = re.findall(r'>([^<]+\.iso)<', '\n'.join(lines))
         # Page structure could change; alert and bail if it does
         if not upstream_isos:
@@ -679,7 +685,8 @@ class ProxmoxChecker(Checker):
     """
 
     def check(self) -> None:
-        if not self.fetch('https://www.proxmox.com/en/downloads/proxmox-virtual-environment', 'Proxmox'):
+        url = 'https://www.proxmox.com/en/downloads/proxmox-virtual-environment'
+        if not self.fetch(url, 'Proxmox'):
             return
         if not self.body_ok('www.proxmox.com'):
             return
