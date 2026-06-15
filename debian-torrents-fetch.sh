@@ -18,3 +18,6 @@ find torrents_tree -type f -name '*.torrent' -exec mv '{}' torrents/ \; || exit 
 
 # Remove tree (which should now be empty)
 rm -r torrents_tree || exit 3
+
+# All done
+exit 0
