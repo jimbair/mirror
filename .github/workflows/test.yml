@@ -1,0 +1,21 @@
+name: Tests
+
+on:
+  push:
+    paths:
+      - 'new-torrents.py'
+      - 'tests/test_new_torrents.py'
+  pull_request:
+    paths:
+      - 'new-torrents.py'
+      - 'tests/test_new_torrents.py'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python3 tests/test_new_torrents.py -v
