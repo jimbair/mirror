@@ -2,10 +2,10 @@
 """Tests for new-torrents.py
 
 Run from the repo root:
-    python3 test_new_torrents.py
+    python3 tests/test_new_torrents.py
 
 Or with verbose output:
-    python3 test_new_torrents.py -v
+    python3 tests/test_new_torrents.py -v
 
 No external dependencies required. The script under test is imported directly;
 adjust SCRIPT_PATH below if you rename or move files.
