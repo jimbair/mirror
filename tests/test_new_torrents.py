@@ -20,10 +20,8 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-# ---------------------------------------------------------------------------
 # Import the script as a module. Since new-torrents.py has a hyphen in its
 # name, importlib is required rather than a plain import statement.
-# ---------------------------------------------------------------------------
 SCRIPT_PATH = Path(__file__).parent.parent / 'new-torrents.py'
 
 spec = importlib.util.spec_from_file_location('new_torrents', SCRIPT_PATH)
@@ -31,9 +29,9 @@ nt = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nt)
 
 
-# ---------------------------------------------------------------------------
-# Shared fixtures
-# ---------------------------------------------------------------------------
+###################
+# Shared fixtures #
+###################
 
 # Padding used to satisfy body_ok()'s 250-byte minimum without polluting
 # page content.  Appended to every fake page that carries real test data.
@@ -76,10 +74,6 @@ def fake_fetch_seq(checker, pages):
 
     return _fetch
 
-
-# ---------------------------------------------------------------------------
-# FailureTracker
-# ---------------------------------------------------------------------------
 
 class TestFailureTracker(unittest.TestCase):
 
@@ -144,10 +138,6 @@ class TestFailureTracker(unittest.TestCase):
         self.assertFalse(t.at_threshold('x'))  # no crash, empty state
 
 
-# ---------------------------------------------------------------------------
-# Checker base: fetch() and check_iso() / check_dir()
-# ---------------------------------------------------------------------------
-
 class TestCheckerBase(unittest.TestCase):
 
     def setUp(self):
@@ -158,8 +148,6 @@ class TestCheckerBase(unittest.TestCase):
         # Use AlmaChecker as a concrete stand-in for the abstract base
         return make_checker(nt.AlmaChecker, self.tmp, status_content=status,
                             failures=self.ftrack)
-
-    # check_iso -----------------------------------------------------------
 
     def test_check_iso_in_status_no_alert(self):
         """ISO already known to transmission → no alert."""
@@ -197,8 +185,6 @@ class TestCheckerBase(unittest.TestCase):
         self.assertIn('NEW:archlinux-2025.01.01-x86_64.iso', c.updates)
         self.assertNotIn('ORPHAN:archlinux-2025.01.01-x86_64.iso', c.updates)
 
-    # check_dir -----------------------------------------------------------
-
     def test_check_dir_in_status_no_alert(self):
         d = self.tmp / 'Fedora-Workstation-42'
         d.mkdir()
@@ -217,8 +203,6 @@ class TestCheckerBase(unittest.TestCase):
         c = self._checker()
         c.check_dir('Fedora-Workstation-42')
         self.assertIn('ORPHAN:Fedora-Workstation-42', c.updates)
-
-    # fetch() failure tracking -------------------------------------------
 
     def test_fetch_failure_increments_counter(self):
         c = self._checker()
@@ -260,9 +244,7 @@ class TestCheckerBase(unittest.TestCase):
         self.assertTrue(c.updates)
 
 
-# ---------------------------------------------------------------------------
 # MintChecker
-# ---------------------------------------------------------------------------
 
 MINT_INDEX = (
     '<a href="21.3/">21.3/</a>'
@@ -338,9 +320,7 @@ class TestMintChecker(unittest.TestCase):
         self.assertIn('MALFORMED:Linux-Mint-22.0', c.updates)
 
 
-# ---------------------------------------------------------------------------
 # ArchChecker
-# ---------------------------------------------------------------------------
 
 ARCH_PAGE = '<strong>Current Release:</strong> 2025.06.01'
 
@@ -382,9 +362,7 @@ class TestArchChecker(unittest.TestCase):
         self.assertNotIn('STALE:archlinux-2024.01.01-x86_64.iso', updates)
 
 
-# ---------------------------------------------------------------------------
 # CachyChecker
-# ---------------------------------------------------------------------------
 
 CACHY_PAGE = (
     'torrent_url&quot;:[0,&quot;https://cdn.cachyos.org/ISO/241201/'
@@ -432,9 +410,7 @@ class TestCachyChecker(unittest.TestCase):
         self.assertNotIn('STALE:cachyos-kde-linux-231101.iso', updates)
 
 
-# ---------------------------------------------------------------------------
 # UbuntuChecker
-# ---------------------------------------------------------------------------
 
 # The tracker_index format uses bare >NAME< spans, one per line.
 # The beta/snapshot filter works at the line level, so each entry must be
@@ -504,9 +480,7 @@ class TestUbuntuChecker(unittest.TestCase):
         self.assertIn('MALFORMED:Ubuntu-Tracker', updates)
 
 
-# ---------------------------------------------------------------------------
 # ProxmoxChecker
-# ---------------------------------------------------------------------------
 
 PROXMOX_PAGE = 'Download Proxmox VE 8.2-1 ISO\nDownload Proxmox VE 8.2-2 ISO\n'
 
@@ -555,9 +529,7 @@ class TestProxmoxChecker(unittest.TestCase):
         self.assertIn('MALFORMED:Proxmox-Downloads', updates)
 
 
-# ---------------------------------------------------------------------------
 # FedoraChecker
-# ---------------------------------------------------------------------------
 
 FEDORA_JSON = json.dumps([
     {
@@ -628,9 +600,7 @@ class TestFedoraChecker(unittest.TestCase):
         self.assertIn('MALFORMED:Fedora-Tracker', updates)
 
 
-# ---------------------------------------------------------------------------
 # AlmaChecker
-# ---------------------------------------------------------------------------
 
 ALMA_PAGE = (
     '<a href="/isos/x86_64/9.4.html">AlmaLinux 9.4 x86_64</a>'
@@ -687,9 +657,7 @@ class TestAlmaChecker(unittest.TestCase):
         self.assertIn('MALFORMED:AlmaLinux-isos.html', updates)
 
 
-# ---------------------------------------------------------------------------
 # DebianChecker (mocks subprocess.run)
-# ---------------------------------------------------------------------------
 
 DEBIAN_RSYNC_OUTPUT = (
     'drwxr-xr-x          4,096 2025/01/01 00:00:00 .\n'
@@ -766,9 +734,7 @@ class TestDebianChecker(unittest.TestCase):
         self.assertIn('MALFORMED:Debian-Tracker', updates)
 
 
-# ---------------------------------------------------------------------------
 # main() guard tests
-# ---------------------------------------------------------------------------
 
 class TestMain(unittest.TestCase):
 
@@ -873,10 +839,6 @@ class TestMain(unittest.TestCase):
 
         self.assertEqual(ret, 1)
 
-
-# ---------------------------------------------------------------------------
-# ver_key
-# ---------------------------------------------------------------------------
 
 class TestVerKey(unittest.TestCase):
 
