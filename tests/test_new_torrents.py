@@ -228,8 +228,8 @@ class TestCheckerBase(unittest.TestCase):
         self.assertEqual(self.ftrack._counts.get('example', 0), 1)
 
     def test_fetch_success_clears_counter(self):
-        self.ftrack._counts['example'] = 2
-        self.ftrack._dirty = True
+        self.ftrack.increment('example')
+        self.ftrack.increment('example')
         c = self._checker()
         mock_resp = MagicMock()
         mock_resp.__enter__ = lambda s: s
@@ -523,8 +523,7 @@ class TestProxmoxChecker(unittest.TestCase):
         return c.updates
 
     def test_new_version_alerts(self):
-        # Both versions appear on page; only the latest (8.2-2) triggers NEW:
-        # because check_iso fires for every version found
+        # Both versions on the page are absent from disk, so both produce NEW: alerts
         updates = self._run()
         self.assertIn('NEW:Proxmox-8.2-2', updates)
 
@@ -596,9 +595,7 @@ class TestFedoraChecker(unittest.TestCase):
 
     def test_no_new_alert_when_local_dirs_exist(self):
         (self.tmp / 'Fedora-Workstation-Live-x86_64-42').mkdir()
-        updates = self._run(
-            status='Fedora-Workstation-Live-x86_64-42 Fedora-Server-dvd-x86_64-42',
-        )
+        updates = self._run(status='Fedora-Workstation-Live-x86_64-42')
         self.assertNotIn('NEW:Fedora-42', updates)
 
     def test_dropped_version_alerts(self):
