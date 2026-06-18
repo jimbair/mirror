@@ -13,6 +13,7 @@ adjust SCRIPT_PATH below if you rename or move files.
 
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -242,6 +243,34 @@ class TestCheckerBase(unittest.TestCase):
             c.fetch('https://example.com/x', 'svc')
             c.fetch('https://example.com/x', 'svc')
         self.assertTrue(c.updates)
+
+    def test_body_ok_alerts_on_empty_page(self):
+        """body_ok fires when page is empty."""
+        c = self._checker()
+        c._page = ''
+        self.assertFalse(c.body_ok('test-domain'))
+        self.assertIn('test-domain', c.updates)
+
+    def test_body_ok_alerts_on_short_page(self):
+        """body_ok fires when page is below the 250-byte minimum."""
+        c = self._checker()
+        c._page = 'x' * 100
+        self.assertFalse(c.body_ok('test-domain'))
+        self.assertIn('test-domain', c.updates)
+
+    def test_body_ok_passes_on_adequate_page(self):
+        """body_ok returns True when page exceeds the minimum."""
+        c = self._checker()
+        c._page = 'x' * 300
+        self.assertTrue(c.body_ok('test-domain'))
+        self.assertEqual(c.updates, set())
+
+    def test_body_ok_respects_custom_min_len(self):
+        """body_ok respects a custom min_len argument."""
+        c = self._checker()
+        c._page = 'x' * 50
+        self.assertFalse(c.body_ok('test-domain', min_len=100))
+        self.assertIn('test-domain', c.updates)
 
 
 # MintChecker
@@ -497,8 +526,8 @@ class TestProxmoxChecker(unittest.TestCase):
         return c.updates
 
     def test_new_version_alerts(self):
-        # Both versions on the page are absent from disk, so both produce NEW: alerts
         updates = self._run()
+        self.assertIn('NEW:Proxmox-8.2-1', updates)
         self.assertIn('NEW:Proxmox-8.2-2', updates)
 
     def test_no_alert_when_in_status(self):
@@ -569,6 +598,21 @@ class TestFedoraChecker(unittest.TestCase):
         (self.tmp / 'Fedora-Workstation-Live-x86_64-42').mkdir()
         updates = self._run(status='Fedora-Workstation-Live-x86_64-42')
         self.assertNotIn('NEW:Fedora-42', updates)
+
+    def test_missing_torrent_within_known_version_alerts_new(self):
+        """When one torrent dir exists for a version but another is absent
+        from both disk and transmission, the missing one alerts NEW."""
+        (self.tmp / 'Fedora-Workstation-Live-x86_64-42').mkdir()
+        updates = self._run(status='Fedora-Workstation-Live-x86_64-42')
+        self.assertIn('NEW:Fedora-Server-dvd-x86_64-42', updates)
+
+    def test_orphan_torrent_within_known_version_alerts(self):
+        """A torrent directory on disk but absent from transmission status
+        should produce an ORPHAN alert."""
+        (self.tmp / 'Fedora-Workstation-Live-x86_64-42').mkdir()
+        (self.tmp / 'Fedora-Server-dvd-x86_64-42').mkdir()
+        updates = self._run(status='Fedora-Workstation-Live-x86_64-42')
+        self.assertIn('ORPHAN:Fedora-Server-dvd-x86_64-42', updates)
 
     def test_dropped_version_alerts(self):
         # Version 40 exists locally but is absent from the tracker JSON
@@ -652,6 +696,22 @@ class TestAlmaChecker(unittest.TestCase):
         updates = self._run()
         self.assertIn('DROPPED:AlmaLinux-8', updates)
 
+    def test_missing_arch_alerts_new_dir(self):
+        """When current version exists for one arch but not another, the
+        missing arch should produce a NEW:AlmaLinux-VER-ARCH alert."""
+        (self.tmp / 'AlmaLinux-9.4-x86_64').mkdir()
+        updates = self._run(status='AlmaLinux-9.4-x86_64')
+        self.assertIn('NEW:AlmaLinux-9.4-aarch64', updates)
+        self.assertNotIn('NEW:AlmaLinux-9.4-x86_64', updates)
+
+    def test_orphan_arch_dir_alerts(self):
+        """A current-version arch directory on disk but absent from
+        transmission status should produce an ORPHAN alert."""
+        (self.tmp / 'AlmaLinux-9.4-x86_64').mkdir()
+        (self.tmp / 'AlmaLinux-9.4-aarch64').mkdir()
+        updates = self._run(status='AlmaLinux-9.4-x86_64')
+        self.assertIn('ORPHAN:AlmaLinux-9.4-aarch64', updates)
+
     def test_malformed_page_alerts(self):
         updates = self._run(page='<html>no isos links</html>')
         self.assertIn('MALFORMED:AlmaLinux-isos.html', updates)
@@ -727,6 +787,24 @@ class TestDebianChecker(unittest.TestCase):
         with patch('subprocess.run', return_value=self._rsync(returncode=11)):
             c.check()
         self.assertTrue(c.updates)
+
+    def test_rsync_timeout_increments_counter(self):
+        ftrack_path = self.tmp / 'f.json'
+        ftrack_path.write_text('{}')
+        ftrack = nt.FailureTracker(ftrack_path, 3)
+        c = make_checker(nt.DebianChecker, self.tmp, failures=ftrack)
+        with patch('subprocess.run', side_effect=subprocess.TimeoutExpired('rsync', 60)):
+            c.check()
+        self.assertEqual(ftrack._counts.get('Debian', 0), 1)
+
+    def test_rsync_timeout_at_threshold_alerts(self):
+        ftrack_path = self.tmp / 'f.json'
+        ftrack_path.write_text(json.dumps({'Debian': 2}))
+        ftrack = nt.FailureTracker(ftrack_path, 3)
+        c = make_checker(nt.DebianChecker, self.tmp, failures=ftrack)
+        with patch('subprocess.run', side_effect=subprocess.TimeoutExpired('rsync', 60)):
+            c.check()
+        self.assertIn('cdimage.debian.org', c.updates)
 
     def test_malformed_rsync_output_alerts(self):
         # rsync succeeds but returns no .torrent lines

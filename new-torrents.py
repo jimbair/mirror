@@ -732,17 +732,25 @@ class DebianChecker(Checker):
     def check(self) -> None:
         # Filter rules are order-dependent: include directories so rsync recurses,
         # include .torrent files, then exclude everything else
-        result = subprocess.run(
-            [
-                'rsync', '--list-only', '--no-motd', '-r',
-                '--include=*/',
-                '--include=*.torrent',
-                '--exclude=*',
-                'rsync://cdimage.debian.org/debian-cd/',
-            ],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    'rsync', '--list-only', '--no-motd', '-r',
+                    '--include=*/',
+                    '--include=*.torrent',
+                    '--exclude=*',
+                    'rsync://cdimage.debian.org/debian-cd/',
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            self._debug('rsync timed out')
+            self._failures.increment('Debian')
+            if self._failures.at_threshold('Debian'):
+                self.alert('cdimage.debian.org')
+            return
 
         if result.returncode != 0:
             self._failures.increment('Debian')
