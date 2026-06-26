@@ -137,7 +137,7 @@ fi
 INSTALLED_NOW=$(/usr/local/bin/transmission-remote --version 2>&1 \
     | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' \
     | head -1)
-[[ -n "" ]] || die "Failed to capture installed version after install"
+[[ -n "$INSTALLED_NOW" ]] || die "Failed to capture installed version after install"
 
 # All done
 log "Upgrade complete. Installed version: $INSTALLED_NOW"
