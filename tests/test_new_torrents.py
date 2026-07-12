@@ -14,7 +14,6 @@ adjust SCRIPT_PATH below if you rename or move files.
 import importlib.util
 import json
 import subprocess
-import sys
 import tempfile
 import unittest
 import urllib.error
@@ -719,14 +718,33 @@ class TestAlmaChecker(unittest.TestCase):
 
 # DebianChecker (mocks subprocess.run)
 
+# Every torrent filename on cdimage.debian.org is the ISO name with .torrent
+# appended, e.g. debian-12.9.0-amd64-DVD-1.iso.torrent. The .iso matters: it's
+# what ends up in local filenames and in transmission's status output, so the
+# fixture needs it too or the version-vs-file matching below tests the wrong
+# thing. (The previous fixture omitted it — harmless for the old per-file
+# checks, but it would have hidden a false-positive STALE in the new
+# version-grouping logic, since a local "foo.iso" can never string-match an
+# upstream "foo" with no extension.)
 DEBIAN_RSYNC_OUTPUT = (
     'drwxr-xr-x          4,096 2025/01/01 00:00:00 .\n'
     'drwxr-xr-x          4,096 2025/01/01 00:00:00 12.9.0-amd64-DVD-1\n'
     '-rw-r--r-- 982024192 2025/01/01 00:00:00 '
-    '12.9.0-amd64-DVD-1/debian-12.9.0-amd64-DVD-1.torrent\n'
+    '12.9.0-amd64-DVD-1/debian-12.9.0-amd64-DVD-1.iso.torrent\n'
     'drwxr-xr-x          4,096 2025/01/01 00:00:00 12.9.0-arm64-DVD-1\n'
     '-rw-r--r-- 982024192 2025/01/01 00:00:00 '
-    '12.9.0-arm64-DVD-1/debian-12.9.0-arm64-DVD-1.torrent\n'
+    '12.9.0-arm64-DVD-1/debian-12.9.0-arm64-DVD-1.iso.torrent\n'
+)
+
+# A wider release spanning the -edu/-live/-mac variants and a numbered source
+# disc, to check the version regex against every filename shape it has to
+# parse — these are exactly the families that produced the 46-alert spam.
+DEBIAN_RSYNC_OUTPUT_WIDE = DEBIAN_RSYNC_OUTPUT + (
+    '-rw-r--r--      12,345 2025/01/01 00:00:00 debian-edu-12.9.0-amd64-netinst.iso.torrent\n'
+    '-rw-r--r--      12,345 2025/01/01 00:00:00 debian-live-12.9.0-amd64-kde.iso.torrent\n'
+    '-rw-r--r--      12,345 2025/01/01 00:00:00 debian-mac-12.9.0-amd64-netinst.iso.torrent\n'
+    '-rw-r--r--      12,345 2025/01/01 00:00:00 '
+    '12.9.0-source-DVD-1/debian-12.9.0-source-DVD-1.iso.torrent\n'
 )
 
 
@@ -749,26 +767,68 @@ class TestDebianChecker(unittest.TestCase):
             c.check()
         return c.updates
 
-    def test_new_iso_alerts(self):
+    def test_version_bump_grouped_not_per_file(self):
+        """The original bug report, in miniature: a version bump used to
+        alert once per file on both sides (46 NEW + 46 STALE for a real
+        Debian point release). Old-version files on disk plus a new version
+        upstream must collapse to one NEW:Debian-VER and one STALE:Debian-VER
+        with no individual per-file alerts leaking through."""
+        for name in ('debian-12.8.0-amd64-DVD-1.iso', 'debian-12.8.0-arm64-DVD-1.iso'):
+            (self.tmp / name).write_bytes(b'x' * 100)
         updates = self._run()
-        self.assertIn('NEW:debian-12.9.0-amd64-DVD-1', updates)
-        self.assertIn('NEW:debian-12.9.0-arm64-DVD-1', updates)
-
-    def test_no_alert_when_in_status(self):
-        updates = self._run(status='debian-12.9.0-amd64-DVD-1')
-        self.assertNotIn('NEW:debian-12.9.0-amd64-DVD-1', updates)
-
-    def test_stale_iso_alerted(self):
-        old = self.tmp / 'debian-12.8.0-amd64-DVD-1.iso'
-        old.write_bytes(b'x' * 100)
-        status = 'debian-12.9.0-amd64-DVD-1 debian-12.9.0-arm64-DVD-1'
-        updates = self._run(status=status)
-        self.assertIn('STALE:debian-12.8.0-amd64-DVD-1.iso', updates)
+        self.assertEqual(updates, {'NEW:Debian-12.9.0', 'STALE:Debian-12.8.0'})
 
     def test_no_local_isos_alerts_missing(self):
-        status = 'debian-12.9.0-amd64-DVD-1 debian-12.9.0-arm64-DVD-1'
+        """Completely empty disk pairs MISSING with a single grouped
+        NEW:Debian-VER rather than one NEW: per upstream file."""
+        status = 'debian-12.9.0-amd64-DVD-1.iso debian-12.9.0-arm64-DVD-1.iso'
         updates = self._run(status=status)
-        self.assertIn('MISSING:debian-*.iso', updates)
+        self.assertEqual(updates, {'MISSING:debian-*.iso', 'NEW:Debian-12.9.0'})
+
+    def test_no_alert_when_current_version_fully_present(self):
+        for name in ('debian-12.9.0-amd64-DVD-1.iso', 'debian-12.9.0-arm64-DVD-1.iso'):
+            (self.tmp / name).write_bytes(b'x' * 100)
+        status = 'debian-12.9.0-amd64-DVD-1.iso debian-12.9.0-arm64-DVD-1.iso'
+        updates = self._run(status=status)
+        self.assertEqual(updates, set())
+
+    def test_missing_file_within_current_version_alerts_individually(self):
+        """Once mirroring for the current release has started, a file
+        that's still missing alerts by name instead of waiting on the
+        group alert — mirrors FedoraChecker's per-torrent fallback."""
+        (self.tmp / 'debian-12.9.0-amd64-DVD-1.iso').write_bytes(b'x' * 100)
+        status = 'debian-12.9.0-amd64-DVD-1.iso'
+        updates = self._run(status=status)
+        self.assertEqual(updates, {'NEW:debian-12.9.0-arm64-DVD-1.iso'})
+
+    def test_orphan_within_current_version_alerts(self):
+        """A current-version file on disk but unknown to transmission is
+        still an individual ORPHAN once mirroring has started."""
+        for name in ('debian-12.9.0-amd64-DVD-1.iso', 'debian-12.9.0-arm64-DVD-1.iso'):
+            (self.tmp / name).write_bytes(b'x' * 100)
+        status = 'debian-12.9.0-amd64-DVD-1.iso'  # arm64 exists but isn't tracked
+        updates = self._run(status=status)
+        self.assertEqual(updates, {'ORPHAN:debian-12.9.0-arm64-DVD-1.iso'})
+
+    def test_stale_same_version_file_alerts_individually(self):
+        """A file matching the CURRENT version but dropped from the tracker
+        isn't something a version-level alert can express, so it should
+        still surface by name rather than being swallowed by the group."""
+        for name in ('debian-12.9.0-amd64-DVD-1.iso', 'debian-12.9.0-arm64-DVD-1.iso'):
+            (self.tmp / name).write_bytes(b'x' * 100)
+        (self.tmp / 'debian-12.9.0-oldvariant-1.iso').write_bytes(b'x' * 100)
+        status = 'debian-12.9.0-amd64-DVD-1.iso debian-12.9.0-arm64-DVD-1.iso'
+        updates = self._run(status=status)
+        self.assertEqual(updates, {'STALE:debian-12.9.0-oldvariant-1.iso'})
+
+    def test_version_parsed_across_edu_live_mac_and_source_variants(self):
+        """The point release must parse correctly regardless of where the
+        -edu/-live/-mac tag or the source-disc numbering shifts it in the
+        filename — the grouping in every other test here depends on it."""
+        for name in ('debian-12.8.0-amd64-DVD-1.iso', 'debian-12.8.0-arm64-DVD-1.iso'):
+            (self.tmp / name).write_bytes(b'x' * 100)
+        updates = self._run(rsync_result=self._rsync(stdout=DEBIAN_RSYNC_OUTPUT_WIDE))
+        self.assertEqual(updates, {'NEW:Debian-12.9.0', 'STALE:Debian-12.8.0'})
 
     def test_rsync_failure_increments_counter(self):
         ftrack_path = self.tmp / 'f.json'
@@ -809,6 +869,14 @@ class TestDebianChecker(unittest.TestCase):
     def test_malformed_rsync_output_alerts(self):
         # rsync succeeds but returns no .torrent lines
         updates = self._run(rsync_result=self._rsync(stdout='drwxr-xr-x 4,096 2025/01/01 .\n'))
+        self.assertIn('MALFORMED:Debian-Tracker', updates)
+
+    def test_malformed_when_no_filename_has_parseable_version(self):
+        """rsync succeeds and returns a .torrent file, but nothing in the
+        name is a parseable version — MALFORMED rather than crashing on
+        an empty ver_key() sort."""
+        stdout = '-rw-r--r-- 123 2025/01/01 00:00:00 debian-README.torrent\n'
+        updates = self._run(rsync_result=self._rsync(stdout=stdout))
         self.assertIn('MALFORMED:Debian-Tracker', updates)
 
 
