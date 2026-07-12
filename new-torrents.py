@@ -721,13 +721,35 @@ class ProxmoxChecker(Checker):
 class DebianChecker(Checker):
     """Debian — uses rsync --list-only against cdimage.debian.org.
 
-    Alerts:
-      NEW:ISO                  - rsync ISO absent from disk and unknown to transmission
-      ORPHAN:ISO               - rsync ISO present on disk but unknown to transmission
-      STALE:ISO                - local debian-*.iso no longer listed in rsync output
+    Every debian/debian-edu/debian-live/debian-mac filename (flat installer
+    ISOs, live spins, and the 22-disc source set) carries the same point
+    release, e.g. debian-13.6.0-amd64-DVD-1.iso or
+    debian-live-13.6.0-amd64-kde.iso. Unlike Fedora/AlmaLinux there's no
+    upstream JSON/HTML giving us that version directly, so it's pulled out
+    of each filename with a regex instead.
+
+    Version-level alerts:
+      NEW:Debian-VER   - current release has no matching ISOs on disk yet
+      STALE:Debian-VER - local ISOs exist for a version no longer on the tracker
+
+    Per-file alerts (only once at least one local ISO matches the current version):
+      NEW:ISO    - tracker ISO absent from disk and unknown to transmission
+      ORPHAN:ISO - tracker ISO present on disk but unknown to transmission
+      STALE:ISO  - current-version (or unparseable) local ISO dropped from the tracker
+
       MISSING:debian-*.iso     - no Debian ISOs found on our disk at all
-      MALFORMED:Debian-Tracker - rsync ran but returned no .torrent filenames
+      MALFORMED:Debian-Tracker - rsync ran but returned no .torrent filenames,
+                                  or no filename had a parseable version
     """
+
+    # The point release is the only dotted numeric run in these filenames; a
+    # fixed prefix offset doesn't work since "-edu"/"-live"/"-mac" and the
+    # "source" DVDs shift where it falls, so search for it instead.
+    _VERSION_RE = re.compile(r'(\d+\.\d+(?:\.\d+)*)')
+
+    def _version_of(self, filename: str) -> str | None:
+        m = self._VERSION_RE.search(filename)
+        return m.group(1) if m else None
 
     def check(self) -> None:
         # Filter rules are order-dependent: include directories so rsync recurses,
@@ -771,18 +793,49 @@ class DebianChecker(Checker):
             self.alert('MALFORMED:Debian-Tracker')
             return
 
-        for iso in upstream_isos:
-            self.check_iso(iso)
+        upstream_versions = {self._version_of(iso) for iso in upstream_isos}
+        upstream_versions.discard(None)
+        # Every filename failed to parse a version; structure may have changed
+        if not upstream_versions:
+            self.alert('MALFORMED:Debian-Tracker')
+            return
+        current_version = sorted(upstream_versions, key=ver_key)[-1]
 
         local_isos = sorted(self.iso_dir.glob('debian-*.iso'))
         if not local_isos:
             self.alert('MISSING:debian-*.iso')
+            self.alert(f'NEW:Debian-{current_version}')
             return
 
+        local_current = [p for p in local_isos if self._version_of(p.name) == current_version]
+
+        if not local_current:
+            # Nothing for the new release yet: one alert beats one per file.
+            self.alert(f'NEW:Debian-{current_version}')
+        else:
+            # Already partway through mirroring the current release (or it's
+            # been fully mirrored); fall back to per-file checks so stragglers
+            # and orphans still surface individually.
+            for iso in upstream_isos:
+                if self._version_of(iso) == current_version:
+                    self.check_iso(iso)
+
         upstream_set = set(upstream_isos)
+        stale_versions: set[str] = set()
         for path in local_isos:
-            if path.name not in upstream_set:
+            if path.name in upstream_set:
+                continue
+            ver = self._version_of(path.name)
+            if ver is not None and ver != current_version:
+                # Whole prior release superseded; group instead of one alert per file.
+                stale_versions.add(ver)
+            else:
+                # Current-version (or unparseable) file dropped from the tracker;
+                # unusual enough to keep visible individually.
                 self.alert(f'STALE:{path.name}')
+
+        for ver in sorted(stale_versions, key=ver_key):
+            self.alert(f'STALE:Debian-{ver}')
 
 
 ########
