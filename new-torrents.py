@@ -187,7 +187,6 @@ class StatusDisplay:
         self._refresh_thread.join()
         with self._lock:
             self._redraw()
-        print(file=sys.stderr)  # blank line before alerts
 
     # Internal
 
@@ -1038,6 +1037,8 @@ def main() -> int:
 
     # Report all accumulated alerts and exit non-zero so healthchecks.io fires
     if all_updates:
+        if display:
+            print(file=sys.stderr)  # blank line separating the status board from the alerts
         print('\n'.join(sorted(all_updates)))
         return 1
 
