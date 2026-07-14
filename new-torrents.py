@@ -6,6 +6,7 @@
 # We send the output as a POST to /fail in the event of a non-zero exit.
 
 import gzip
+import http.client
 import json
 import os
 import re
@@ -140,9 +141,17 @@ class StatusDisplay:
         except OSError:
             self._term_width = 80
 
-        # Reserve space by printing the initial waiting lines
-        for name in names:
-            print(f'  {self._DIM}{name:<20}{self._RESET} waiting', file=sys.stderr)
+        # Reserve space by printing the initial waiting lines, and remember
+        # how many physical rows each occupied. _redraw() needs this on the
+        # NEXT call to know how far to move the cursor up — using the row
+        # counts of the content it's about to print instead would drift
+        # whenever a line's wrapped height changes between redraws (e.g. a
+        # long "fetch failed: <url error>" message, then a short one next
+        # tick), corrupting the live display.
+        initial_lines = [self._render_line(name) for name in names]
+        for line in initial_lines:
+            print(line, file=sys.stderr)
+        self._last_rows = [self._physical_rows(line) for line in initial_lines]
 
         # Background thread redraws every second so elapsed timers tick
         # for silent checkers (e.g. Debian rsync)
@@ -196,23 +205,27 @@ class StatusDisplay:
         # Ceiling division: how many full terminal rows does this line consume?
         return max(1, (len(visible) + self._term_width - 1) // self._term_width)
 
-    def _move_to_top(self, rendered_lines: list[str]) -> None:
-        total_rows = sum(self._physical_rows(line) for line in rendered_lines)
-        if total_rows:
-            print(self._CURSOR_UP.format(total_rows), file=sys.stderr, end='')
-
     def _redraw(self) -> None:
         rendered = [self._render_line(name) for name in self._names]
-        self._move_to_top(rendered)
+
+        # Move up to the top of the block as it currently exists on screen
+        # (based on what was actually last printed, tracked in _last_rows),
+        # erase every row it occupies, then print the new block fresh.
+        # Erasing and reprinting line-by-line in place only works if each
+        # line's wrapped height is unchanged since the last redraw; grouping
+        # it into one whole-block erase avoids relying on that.
+        old_total = sum(self._last_rows)
+        if old_total:
+            print(self._CURSOR_UP.format(old_total), file=sys.stderr, end='')
+        for _ in range(old_total):
+            print(self._ERASE_LINE, file=sys.stderr)
+        if old_total:
+            print(self._CURSOR_UP.format(old_total), file=sys.stderr, end='')
+
         for line in rendered:
-            rows = self._physical_rows(line)
-            # Erase every physical row the previous render of this line occupied,
-            # then move the cursor back to the first row before printing the new content.
-            # This handles lines that wrapped differently between redraws.
-            for _ in range(rows):
-                print(self._ERASE_LINE, file=sys.stderr, end='\n')
-            print(self._CURSOR_UP.format(rows), file=sys.stderr, end='')
             print(line, file=sys.stderr)
+
+        self._last_rows = [self._physical_rows(line) for line in rendered]
 
     def _render_line(self, name: str) -> str:
         status = self._status[name]
@@ -289,7 +302,17 @@ class Checker(ABC):
             self._failures.clear(name)
             return True
 
-        except (urllib.error.URLError, OSError) as e:
+        # URLError/OSError cover connection- and DNS-level failures. The rest
+        # are malformed-response failure modes that are just as much "this
+        # fetch didn't work" but aren't OSError subclasses, so without them
+        # a single bad response anywhere crashes the whole threaded run and
+        # silently drops every other checker's results: zlib.error from a
+        # corrupt "Content-Encoding: deflate" body, LookupError from a
+        # garbage charset name in the Content-Type header, and
+        # http.client.HTTPException (e.g. IncompleteRead) from a connection
+        # that drops mid-response.
+        except (urllib.error.URLError, OSError, zlib.error,
+                LookupError, http.client.HTTPException) as e:
             self._debug(f'fetch failed: {e}')
             self._page = ''
             self._failures.increment(name)
@@ -356,14 +379,29 @@ class Checker(ABC):
 class MintChecker(Checker):
     """Linux Mint — scrapes pub.linuxmint.io/stable/ for the current version directory.
 
-    Alerts:
-      NEW:ISO                  - index ISO absent from disk and unknown to transmission
-      ORPHAN:ISO               - index ISO present on disk but unknown to transmission
-      STALE:ISO                - local linuxmint-*.iso not present in current version directory
+    Only one version is ever current (the previous one is retired once a new
+    one ships), so unlike Ubuntu this can group around a single version —
+    same shape as DebianChecker.
+
+    Version-level alerts:
+      NEW:Linux-Mint-VER   - current version has no matching ISOs on disk yet
+      STALE:Linux-Mint-VER - local ISOs exist for a version no longer current
+
+    Per-file alerts (only once at least one local ISO matches the current version):
+      NEW:ISO    - current-version ISO absent from disk and unknown to transmission
+      ORPHAN:ISO - current-version ISO present on disk but unknown to transmission
+      STALE:ISO  - current-version (or unparseable) local ISO no longer listed
+
       MISSING:linuxmint-*.iso  - no Linux Mint ISOs found on our disk at all
       MALFORMED:Linux-Mint     - stable index returned no version directories
       MALFORMED:Linux-Mint-VER - version directory returned no ISOs
     """
+
+    _VERSION_RE = re.compile(r'(\d+\.\d+(?:\.\d+)*)')
+
+    def _version_of(self, filename: str) -> str | None:
+        m = self._VERSION_RE.search(filename)
+        return m.group(1) if m else None
 
     def check(self) -> None:
         if not self.fetch('https://pub.linuxmint.io/stable/', 'Linux-Mint'):
@@ -384,23 +422,48 @@ class MintChecker(Checker):
         if not self.body_ok('pub.linuxmint.io'):
             return
 
+        # This listing is already scoped to the current version's directory,
+        # so (unlike Debian/Ubuntu) every upstream_iso here is current by
+        # construction — no per-filename version filtering needed on this side.
         upstream_isos = sorted(re.findall(r'href="(linuxmint-[^"]+\.iso)"', self._page))
         # Version directory structure could change; alert and bail if it does
         if not upstream_isos:
             self.alert(f'MALFORMED:Linux-Mint-{current}')
             return
 
-        for iso in upstream_isos:
-            self.check_iso(iso)
-
         local_isos = sorted(self.iso_dir.glob('linuxmint-*.iso'))
         if not local_isos:
             self.alert('MISSING:linuxmint-*.iso')
+            self.alert(f'NEW:Linux-Mint-{current}')
             return
 
+        local_current = [p for p in local_isos if self._version_of(p.name) == current]
+
+        if not local_current:
+            # Nothing for the new release yet: one alert beats one per file.
+            self.alert(f'NEW:Linux-Mint-{current}')
+        else:
+            # Already partway through mirroring; fall back to per-file checks
+            # so stragglers and orphans still surface individually.
+            for iso in upstream_isos:
+                self.check_iso(iso)
+
+        upstream_set = set(upstream_isos)
+        stale_versions: set[str] = set()
         for path in local_isos:
-            if path.name not in set(upstream_isos):
+            if path.name in upstream_set:
+                continue
+            ver = self._version_of(path.name)
+            if ver is not None and ver != current:
+                # Whole prior release superseded; group instead of one alert per file.
+                stale_versions.add(ver)
+            else:
+                # Current-version (or unparseable) file dropped from the listing;
+                # unusual enough to keep visible individually.
                 self.alert(f'STALE:{path.name}')
+
+        for ver in sorted(stale_versions, key=ver_key):
+            self.alert(f'STALE:Linux-Mint-{ver}')
 
 
 class CachyChecker(Checker):
@@ -626,23 +689,57 @@ class AlmaChecker(Checker):
             for arch in arches:
                 self.check_dir(f'AlmaLinux-{current_version}-{arch}')
 
+        # Group superseded point releases by version instead of alerting once
+        # per arch directory (e.g. a 10.0 → 10.1 bump used to fire one STALE
+        # per arch; this collapses it to a single STALE:AlmaLinux-10.0).
+        stale_versions: set[str] = set()
         for dirpath in self.iso_dir.glob(f'AlmaLinux-{major}.*-*/'):
             if not dirpath.is_dir():
                 continue
             ver = dirpath.name.removeprefix('AlmaLinux-').rsplit('-', 1)[0]
             if ver != current_version:
-                self.alert(f'STALE:{dirpath.name}')
+                stale_versions.add(ver)
+
+        for ver in sorted(stale_versions, key=ver_key):
+            self.alert(f'STALE:AlmaLinux-{ver}')
 
 
 class UbuntuChecker(Checker):
     """Ubuntu — scrapes torrent.ubuntu.com/tracker_index.
 
-    Alerts:
-      NEW:ISO              - tracker ISO absent from disk and unknown to transmission
-      ORPHAN:ISO           - tracker ISO present on disk but unknown to transmission
-      STALE:ISO            - local *buntu*.iso no longer listed on the tracker
-      MISSING:*buntu*.iso  - no Ubuntu ISOs found on our disk at all
+    Unlike Debian/Mint, Ubuntu runs multiple release lines (X.Y) at once —
+    typically an LTS plus the current interim release — so there's no single
+    global "current version" to group around; grouping by the overall max
+    would misclassify a perfectly current, unrelated line as stale the
+    moment any other line advances. Each X.Y line is tracked and grouped
+    independently instead. Which lines currently exist is read entirely off
+    the tracker page — nothing about LTS/interim status is hardcoded.
+
+    Version-level alerts:
+      NEW:Ubuntu-VER   - a line's current point release has no local ISOs yet
+      STALE:Ubuntu-VER - local ISOs exist for a point release no longer
+                          current within its line (superseded, or the whole
+                          line dropped from the tracker)
+
+    Per-file alerts (only once at least one local ISO matches that line's current version):
+      NEW:ISO    - tracker ISO absent from disk and unknown to transmission
+      ORPHAN:ISO - tracker ISO present on disk but unknown to transmission
+      STALE:ISO  - current-version (or unparseable) local ISO dropped from the tracker
+
+      MISSING:*buntu*.iso      - no Ubuntu-family ISOs found on our disk at all
+      MALFORMED:Ubuntu-Tracker - tracker page returned no ISOs, or none had a
+                                  parseable version
     """
+
+    _VERSION_RE = re.compile(r'(\d+\.\d+(?:\.\d+)*)')
+
+    def _version_of(self, filename: str) -> str | None:
+        m = self._VERSION_RE.search(filename)
+        return m.group(1) if m else None
+
+    def _line_of(self, version: str) -> str:
+        """Reduce a full X.Y(.Z) version to its X.Y release line."""
+        return '.'.join(version.split('.')[:2])
 
     def check(self) -> None:
         if not self.fetch('https://torrent.ubuntu.com/tracker_index', 'Ubuntu'):
@@ -650,28 +747,71 @@ class UbuntuChecker(Checker):
         if not self.body_ok('torrent.ubuntu.com'):
             return
 
-        lines = [
+        page_lines = [
             ln for ln in self._page.splitlines()
             if not re.search(r'beta|snapshot', ln, re.IGNORECASE)
         ]
-        upstream_isos = re.findall(r'>([^<]+\.iso)<', '\n'.join(lines))
+        upstream_isos = re.findall(r'>([^<]+\.iso)<', '\n'.join(page_lines))
         # Page structure could change; alert and bail if it does
         if not upstream_isos:
             self.alert('MALFORMED:Ubuntu-Tracker')
             return
 
-        for iso in upstream_isos:
-            self.check_iso(iso)
+        upstream_versions = {self._version_of(iso) for iso in upstream_isos}
+        upstream_versions.discard(None)
+        # Every filename failed to parse a version; structure may have changed
+        if not upstream_versions:
+            self.alert('MALFORMED:Ubuntu-Tracker')
+            return
+
+        # Independently find the current (max) point release within each
+        # release line — e.g. 24.04.3 and 25.10 can both be current at once.
+        current_by_line: dict[str, str] = {}
+        for v in upstream_versions:
+            line = self._line_of(v)
+            if line not in current_by_line or ver_key(v) > ver_key(current_by_line[line]):
+                current_by_line[line] = v
+        current_versions = set(current_by_line.values())
 
         local_isos = sorted(self.iso_dir.glob('*buntu*.iso'))
         if not local_isos:
             self.alert('MISSING:*buntu*.iso')
+            for ver in current_versions:
+                self.alert(f'NEW:Ubuntu-{ver}')
             return
 
+        for current_version in current_versions:
+            local_current = [
+                p for p in local_isos if self._version_of(p.name) == current_version
+            ]
+            if not local_current:
+                # Nothing for this line's new release yet: one alert beats one per file.
+                self.alert(f'NEW:Ubuntu-{current_version}')
+            else:
+                # Already partway through mirroring this line; fall back to
+                # per-file checks so stragglers and orphans still surface
+                # individually, scoped to just this line's current version.
+                for iso in upstream_isos:
+                    if self._version_of(iso) == current_version:
+                        self.check_iso(iso)
+
         upstream_set = set(upstream_isos)
+        stale_versions: set[str] = set()
         for path in local_isos:
-            if path.name not in upstream_set:
+            if path.name in upstream_set:
+                continue
+            ver = self._version_of(path.name)
+            if ver is not None and ver not in current_versions:
+                # Superseded within its line, or the whole line is gone from
+                # the tracker; either way, group instead of one alert per file.
+                stale_versions.add(ver)
+            else:
+                # Current-version (or unparseable) file dropped from the tracker;
+                # unusual enough to keep visible individually.
                 self.alert(f'STALE:{path.name}')
+
+        for ver in sorted(stale_versions, key=ver_key):
+            self.alert(f'STALE:Ubuntu-{ver}')
 
 
 class ProxmoxChecker(Checker):

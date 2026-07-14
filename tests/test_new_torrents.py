@@ -11,8 +11,11 @@ No external dependencies required. The script under test is imported directly;
 adjust SCRIPT_PATH below if you rename or move files.
 """
 
+import http.client
 import importlib.util
+import io
 import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -138,6 +141,62 @@ class TestFailureTracker(unittest.TestCase):
         self.assertFalse(t.at_threshold('x'))  # no crash, empty state
 
 
+class TestStatusDisplay(unittest.TestCase):
+    """StatusDisplay writes ANSI cursor-control codes to stderr; these tests
+    capture that output rather than parsing it visually."""
+
+    def _display(self, names=('CheckerA',), term_width=80):
+        with patch('sys.stderr', io.StringIO()):
+            d = nt.StatusDisplay(list(names))
+        d._term_width = term_width
+
+        def _cleanup():
+            with patch('sys.stderr', io.StringIO()):
+                d.close()
+        self.addCleanup(_cleanup)
+        return d
+
+    def test_initial_row_counts_are_one_line_each(self):
+        d = self._display(names=('CheckerA', 'CheckerB'))
+        self.assertEqual(d._last_rows, [1, 1])
+
+    def test_last_rows_updates_after_redraw(self):
+        d = self._display(names=('CheckerA',))
+        with patch('sys.stderr', io.StringIO()):
+            d.start('CheckerA')
+        self.assertEqual(d._last_rows, [1])
+
+    def test_cursor_moves_by_previous_not_new_row_count(self):
+        """The core of the fix: when a line's wrapped height changes between
+        redraws, the next redraw must move the cursor by how many rows are
+        actually on screen from the PREVIOUS render, not by the row count
+        of the content about to be printed — otherwise the live display
+        drifts out of alignment with what's really there."""
+        d = self._display(names=('CheckerA',), term_width=50)
+        with patch('sys.stderr', io.StringIO()):
+            d.update('CheckerA', 'x' * 40)  # wraps to 2 rows at width 50
+        self.assertEqual(d._last_rows, [2])
+
+        buf = io.StringIO()
+        with patch('sys.stderr', buf):
+            d.update('CheckerA', 'short')  # fits in 1 row
+        cursor_up_amounts = [int(n) for n in re.findall(r'\x1b\[(\d+)A', buf.getvalue())]
+        self.assertIn(
+            2, cursor_up_amounts,
+            f'Expected a cursor move by the old row count (2), got: {cursor_up_amounts}',
+        )
+        self.assertEqual(d._last_rows, [1])
+
+    def test_close_leaves_final_state_visible(self):
+        d = self._display(names=('CheckerA',))
+        with patch('sys.stderr', io.StringIO()):
+            d.finish('CheckerA', 0)
+        buf = io.StringIO()
+        with patch('sys.stderr', buf):
+            d.close()
+        self.assertIn('CheckerA', buf.getvalue())
+
+
 class TestCheckerBase(unittest.TestCase):
 
     def setUp(self):
@@ -243,6 +302,49 @@ class TestCheckerBase(unittest.TestCase):
             c.fetch('https://example.com/x', 'svc')
         self.assertTrue(c.updates)
 
+    def test_fetch_handles_corrupt_deflate_body(self):
+        """zlib.error from a corrupt Content-Encoding: deflate body must not
+        escape fetch() — it's not an OSError subclass, so without explicit
+        handling it would crash the whole threaded run instead of being
+        treated as an ordinary fetch failure."""
+        c = self._checker()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = b'not valid zlib data at all'
+        mock_resp.headers.get_content_charset.return_value = 'utf-8'
+        mock_resp.headers.get.return_value = 'deflate'
+        with patch('urllib.request.urlopen', return_value=mock_resp):
+            result = c.fetch('https://example.com/x', 'svc')
+        self.assertFalse(result)
+        self.assertEqual(self.ftrack._counts.get('svc', 0), 1)
+
+    def test_fetch_handles_unknown_charset(self):
+        """LookupError from a garbage charset name in Content-Type must not
+        escape fetch() either."""
+        c = self._checker()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = b'hello world' * 50
+        mock_resp.headers.get_content_charset.return_value = 'totally-bogus-charset'
+        mock_resp.headers.get.return_value = ''
+        with patch('urllib.request.urlopen', return_value=mock_resp):
+            result = c.fetch('https://example.com/x', 'svc')
+        self.assertFalse(result)
+        self.assertEqual(self.ftrack._counts.get('svc', 0), 1)
+
+    def test_fetch_handles_dropped_connection(self):
+        """A connection that drops mid-response raises
+        http.client.HTTPException (e.g. IncompleteRead), also not an
+        OSError/URLError subclass."""
+        c = self._checker()
+        with patch('urllib.request.urlopen',
+                   side_effect=http.client.IncompleteRead(b'partial')):
+            result = c.fetch('https://example.com/x', 'svc')
+        self.assertFalse(result)
+        self.assertEqual(self.ftrack._counts.get('svc', 0), 1)
+
     def test_body_ok_alerts_on_empty_page(self):
         """body_ok fires when page is empty."""
         c = self._checker()
@@ -300,26 +402,49 @@ class TestMintChecker(unittest.TestCase):
         c.check()
         return c.updates
 
-    def test_missing_isos_raise_new(self):
+    def test_version_bump_grouped_not_per_file(self):
+        """A version bump collapses to one grouped NEW/STALE instead of one
+        per edition."""
+        for ed in ('cinnamon', 'mate'):
+            (self.tmp / f'linuxmint-21.3-{ed}-64bit.iso').write_bytes(b'x' * 100)
         updates = self._run()
-        self.assertIn('NEW:linuxmint-22.0-cinnamon-64bit.iso', updates)
-        self.assertIn('NEW:linuxmint-22.0-mate-64bit.iso', updates)
+        self.assertEqual(updates, {'NEW:Linux-Mint-22.0', 'STALE:Linux-Mint-21.3'})
 
-    def test_no_alert_when_isos_in_status(self):
+    def test_no_alert_when_current_version_fully_present(self):
+        for iso in MINT_ISOS:
+            (self.tmp / iso).write_bytes(b'x' * 100)
         updates = self._run(status=' '.join(MINT_ISOS))
-        self.assertNotIn('NEW:linuxmint-22.0-cinnamon-64bit.iso', updates)
-        self.assertNotIn('NEW:linuxmint-22.0-mate-64bit.iso', updates)
+        self.assertEqual(updates, set())
 
-    def test_stale_iso_alerted(self):
-        old = self.tmp / 'linuxmint-21.3-cinnamon-64bit.iso'
-        old.write_bytes(b'x' * 100)
+    def test_missing_file_within_current_version_alerts_individually(self):
+        """Once mirroring for the current release has started, a file
+        that's still missing alerts by name instead of waiting on the
+        group alert."""
+        (self.tmp / 'linuxmint-22.0-cinnamon-64bit.iso').write_bytes(b'x' * 100)
+        updates = self._run(status='linuxmint-22.0-cinnamon-64bit.iso')
+        self.assertEqual(updates, {'NEW:linuxmint-22.0-mate-64bit.iso'})
+
+    def test_orphan_within_current_version_alerts(self):
+        for iso in MINT_ISOS:
+            (self.tmp / iso).write_bytes(b'x' * 100)
+        # mate exists on disk but isn't tracked by transmission
+        updates = self._run(status='linuxmint-22.0-cinnamon-64bit.iso')
+        self.assertEqual(updates, {'ORPHAN:linuxmint-22.0-mate-64bit.iso'})
+
+    def test_stale_same_version_file_alerts_individually(self):
+        """A file matching the CURRENT version but no longer listed isn't
+        something a version-level alert can express, so it should still
+        surface by name."""
+        for iso in MINT_ISOS:
+            (self.tmp / iso).write_bytes(b'x' * 100)
+        (self.tmp / 'linuxmint-22.0-oldvariant-64bit.iso').write_bytes(b'x' * 100)
         updates = self._run(status=' '.join(MINT_ISOS))
-        self.assertIn('STALE:linuxmint-21.3-cinnamon-64bit.iso', updates)
+        self.assertEqual(updates, {'STALE:linuxmint-22.0-oldvariant-64bit.iso'})
 
     def test_missing_all_local_isos_alerts(self):
-        # ISOs are in status (so no NEW:) but none exist on disk
+        # ISOs are in status (so no NEW: per file) but none exist on disk
         updates = self._run(status=' '.join(MINT_ISOS))
-        self.assertIn('MISSING:linuxmint-*.iso', updates)
+        self.assertEqual(updates, {'MISSING:linuxmint-*.iso', 'NEW:Linux-Mint-22.0'})
 
     def test_no_missing_alert_when_local_iso_exists(self):
         p = self.tmp / 'linuxmint-22.0-cinnamon-64bit.iso'
@@ -469,32 +594,88 @@ class TestUbuntuChecker(unittest.TestCase):
         c.check()
         return c.updates
 
-    def test_new_isos_alert(self):
+    def test_new_release_grouped_per_line_when_nothing_local(self):
+        """Ubuntu runs multiple release lines at once (an LTS plus the
+        current interim release) — each line's current point release gets
+        its own grouped NEW:Ubuntu-VER, not a NEW: per file."""
         updates = self._run()
-        self.assertIn('NEW:ubuntu-24.04-desktop-amd64.iso', updates)
+        self.assertIn('NEW:Ubuntu-24.04', updates)
+        self.assertIn('NEW:Ubuntu-22.04.4', updates)
+        self.assertFalse(
+            any(u.startswith('NEW:') and u not in ('NEW:Ubuntu-24.04', 'NEW:Ubuntu-22.04.4')
+                for u in updates),
+            f'Unexpected per-file NEW: alert in: {updates}',
+        )
 
     def test_beta_and_snapshot_filtered(self):
-        """Beta and snapshot ISOs must not produce NEW: alerts."""
+        """Beta and snapshot ISOs must not produce alerts."""
         updates = self._run()
         self.assertFalse(
             any('beta' in u.lower() or 'snapshot' in u.lower() for u in updates),
             f'Beta/snapshot leaked into alerts: {updates}',
         )
 
-    def test_no_alert_when_in_status(self):
+    def test_no_alert_when_current_versions_fully_present(self):
+        for name in UBUNTU_ISOS:
+            (self.tmp / name).write_bytes(b'x' * 100)
         updates = self._run(status=' '.join(UBUNTU_ISOS))
-        self.assertNotIn('NEW:ubuntu-24.04-desktop-amd64.iso', updates)
+        self.assertEqual(updates, set())
 
-    def test_stale_iso_alerted(self):
-        old = self.tmp / 'ubuntu-20.04-desktop-amd64.iso'
-        old.write_bytes(b'x' * 100)
+    def test_independent_lines_dont_cross_contaminate(self):
+        """A point-release bump within one line must not affect a
+        different, still-current line — the reason Ubuntu can't group
+        around one global 'current version' the way Debian/Mint can."""
+        for name in ('ubuntu-24.04-desktop-amd64.iso', 'ubuntu-24.04-live-server-amd64.iso'):
+            (self.tmp / name).write_bytes(b'x' * 100)
+        (self.tmp / 'ubuntu-22.04.3-desktop-amd64.iso').write_bytes(b'x' * 100)
+        status = 'ubuntu-24.04-desktop-amd64.iso ubuntu-24.04-live-server-amd64.iso'
+        updates = self._run(status=status)
+        # The 22.04 line's bump (.3 on disk -> .4 current on the tracker) surfaces, grouped
+        self.assertEqual(updates, {'NEW:Ubuntu-22.04.4', 'STALE:Ubuntu-22.04.3'})
+        # Critically: the fully-current, unrelated 24.04 line is untouched
+        self.assertFalse(any('24.04' in u for u in updates), f'24.04 leaked in: {updates}')
+
+    def test_missing_file_within_current_version_alerts_individually(self):
+        """Once mirroring for a line's current release has started, a file
+        that's still missing alerts by name instead of waiting on the group."""
+        (self.tmp / 'ubuntu-24.04-desktop-amd64.iso').write_bytes(b'x' * 100)
+        updates = self._run(status='ubuntu-24.04-desktop-amd64.iso')
+        # live-server (24.04) is still missing; the untouched 22.04 line also
+        # has nothing local yet, so it gets its own grouped alert
+        self.assertEqual(updates, {'NEW:ubuntu-24.04-live-server-amd64.iso', 'NEW:Ubuntu-22.04.4'})
+
+    def test_orphan_within_current_version_alerts(self):
+        for name in UBUNTU_ISOS:
+            (self.tmp / name).write_bytes(b'x' * 100)
+        # live-server exists on disk but isn't tracked by transmission
+        status = 'ubuntu-24.04-desktop-amd64.iso ubuntu-22.04.4-desktop-amd64.iso'
+        updates = self._run(status=status)
+        self.assertEqual(updates, {'ORPHAN:ubuntu-24.04-live-server-amd64.iso'})
+
+    def test_stale_release_grouped_not_per_file(self):
+        """An old line no longer on the tracker collapses to one
+        STALE:Ubuntu-VER instead of one per leftover flavor."""
+        for name in ('ubuntu-20.04-desktop-amd64.iso', 'kubuntu-20.04-desktop-amd64.iso'):
+            (self.tmp / name).write_bytes(b'x' * 100)
+        for name in UBUNTU_ISOS:
+            (self.tmp / name).write_bytes(b'x' * 100)
         updates = self._run(status=' '.join(UBUNTU_ISOS))
-        self.assertIn('STALE:ubuntu-20.04-desktop-amd64.iso', updates)
+        self.assertEqual(updates, {'STALE:Ubuntu-20.04'})
+
+    def test_stale_same_version_file_alerts_individually(self):
+        for name in UBUNTU_ISOS:
+            (self.tmp / name).write_bytes(b'x' * 100)
+        (self.tmp / 'ubuntu-24.04-oldvariant-amd64.iso').write_bytes(b'x' * 100)
+        updates = self._run(status=' '.join(UBUNTU_ISOS))
+        self.assertEqual(updates, {'STALE:ubuntu-24.04-oldvariant-amd64.iso'})
 
     def test_no_local_isos_alerts_missing(self):
         # ISOs in status but none on disk
         updates = self._run(status=' '.join(UBUNTU_ISOS))
-        self.assertIn('MISSING:*buntu*.iso', updates)
+        self.assertEqual(
+            updates,
+            {'MISSING:*buntu*.iso', 'NEW:Ubuntu-24.04', 'NEW:Ubuntu-22.04.4'},
+        )
 
     def test_kubuntu_matches_glob(self):
         """*buntu* glob catches Kubuntu; its presence should suppress MISSING."""
@@ -505,6 +686,10 @@ class TestUbuntuChecker(unittest.TestCase):
 
     def test_malformed_page_alerts(self):
         updates = self._run(page='<html>nothing here</html>')
+        self.assertIn('MALFORMED:Ubuntu-Tracker', updates)
+
+    def test_malformed_when_no_filename_has_parseable_version(self):
+        updates = self._run(page='<td>ubuntu-README.iso</td>\n')
         self.assertIn('MALFORMED:Ubuntu-Tracker', updates)
 
 
@@ -682,12 +867,18 @@ class TestAlmaChecker(unittest.TestCase):
         self.assertNotIn('NEW:AlmaLinux-9', updates)
         self.assertNotIn('NEW:AlmaLinux-9.4', updates)
 
-    def test_stale_point_release_alerted(self):
-        # Both 9.3 and 9.4 dirs exist; 9.3 should be STALE
-        (self.tmp / 'AlmaLinux-9.3-x86_64').mkdir()
-        (self.tmp / 'AlmaLinux-9.4-x86_64').mkdir()
-        updates = self._run(status='AlmaLinux-9.4-x86_64')
-        self.assertIn('STALE:AlmaLinux-9.3-x86_64', updates)
+    def test_stale_point_release_grouped_not_per_arch(self):
+        """Two arch directories left over from a superseded point release
+        collapse into one STALE:AlmaLinux-VER instead of one per arch."""
+        for arch in ('x86_64', 'aarch64'):
+            (self.tmp / f'AlmaLinux-9.3-{arch}').mkdir()
+            (self.tmp / f'AlmaLinux-9.4-{arch}').mkdir()
+        status = 'AlmaLinux-9.4-x86_64 AlmaLinux-9.4-aarch64'
+        updates = self._run(status=status)
+        self.assertEqual(
+            [u for u in updates if u.startswith('STALE:')],
+            ['STALE:AlmaLinux-9.3'],
+        )
 
     def test_dropped_major_alerts(self):
         # Major 8 dirs exist locally but absent from the page
