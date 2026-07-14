@@ -17,6 +17,7 @@ import io
 import json
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 import urllib.error
@@ -1175,6 +1176,65 @@ class TestMain(unittest.TestCase):
                 p.stop()
 
         self.assertEqual(ret, 1)
+
+    def test_clean_run_with_display_has_no_trailing_blank_line(self):
+        """With the live status display active (--verbose forces it even
+        without a real tty) and zero alerts, there's nothing for a
+        separator blank line to separate the status board from — it
+        shouldn't be there."""
+        self.iso_dir.mkdir()
+        (self.iso_dir / 'status.txt').write_text('Sum: 1')
+
+        def noop_run(self_inner):
+            return set()
+
+        checker_patches = [patch.object(cls, 'run', noop_run) for cls in nt.CHECKERS]
+        for p in checker_patches:
+            p.start()
+        try:
+            buf = io.StringIO()
+            with patch('subprocess.run', return_value=self._rsync_ok()), \
+                 patch('sys.stderr', buf), \
+                 patch.object(sys, 'argv', ['new-torrents.py', '--verbose']):
+                ret = self._run_main()
+        finally:
+            for p in checker_patches:
+                p.stop()
+
+        self.assertEqual(ret, 0)
+        self.assertFalse(
+            buf.getvalue().endswith('\n\n'),
+            f'Unexpected trailing blank line: {buf.getvalue()!r}',
+        )
+
+    def test_alerts_run_with_display_still_separates_alerts(self):
+        """With the display active and real alerts, the status board
+        should still get a blank line separating it from the alert list
+        that follows on stdout."""
+        self.iso_dir.mkdir()
+        (self.iso_dir / 'status.txt').write_text('Sum: 1')
+
+        def alert_run(self_inner):
+            return {'NEW:something'}
+
+        checker_patches = [patch.object(cls, 'run', alert_run) for cls in nt.CHECKERS]
+        for p in checker_patches:
+            p.start()
+        try:
+            buf = io.StringIO()
+            with patch('subprocess.run', return_value=self._rsync_ok()), \
+                 patch('sys.stderr', buf), \
+                 patch.object(sys, 'argv', ['new-torrents.py', '--verbose']):
+                ret = self._run_main()
+        finally:
+            for p in checker_patches:
+                p.stop()
+
+        self.assertEqual(ret, 1)
+        self.assertTrue(
+            buf.getvalue().endswith('\n\n'),
+            f'Expected a separating blank line before the alerts: {buf.getvalue()!r}',
+        )
 
 
 class TestVerKey(unittest.TestCase):
