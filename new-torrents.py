@@ -114,7 +114,7 @@ class StatusDisplay:
       yellow - running
       green  - finished, no alerts
       cyan   - finished with alerts
-      red    - reserved for future error/exception states
+      red    - finished via an unhandled exception in check()
     """
 
     _ERASE_LINE = '\x1b[2K'   # noqa: E221
@@ -127,12 +127,13 @@ class StatusDisplay:
     _RED        = '\x1b[31m'  # noqa: E221
 
     def __init__(self, names: list[str]) -> None:
-        self._names                   = names                          # noqa: E221
-        self._lock                    = threading.Lock()               # noqa: E221
-        self._status: dict[str, str]  = {n: 'waiting' for n in names}  # noqa: E221
-        self._start: dict[str, float] = {}                             # noqa: E221
-        self._alerts: dict[str, int]  = {}                             # noqa: E221
-        self._done: dict[str, bool]   = {n: False for n in names}      # noqa: E221
+        self._names                    = names                          # noqa: E221
+        self._lock                     = threading.Lock()               # noqa: E221
+        self._status: dict[str, str]   = {n: 'waiting' for n in names}  # noqa: E221
+        self._start: dict[str, float]  = {}                             # noqa: E221
+        self._alerts: dict[str, int]   = {}                             # noqa: E221
+        self._done: dict[str, bool]    = {n: False for n in names}      # noqa: E221
+        self._errored: dict[str, bool] = {}                             # noqa: E221
 
         # Measure terminal width once; used to compute physical row count when
         # a rendered line wraps. Falls back to 80 if stderr is not a tty.
@@ -179,6 +180,20 @@ class StatusDisplay:
             elapsed = time.monotonic() - self._start.get(name, time.monotonic())
             noun = 'alert' if alert_count == 1 else 'alerts'
             self._status[name] = f'done in {elapsed:.1f}s — {alert_count} {noun}'
+            self._redraw()
+
+    def error(self, name: str) -> None:
+        """Mark a checker as having raised an unhandled exception in check().
+
+        Distinct from finish(): this is for genuine bugs (a checker's own
+        parsing logic blowing up), not the anticipated fetch()/rsync failure
+        modes, which still route through finish() via a normal alert.
+        """
+        with self._lock:
+            self._done[name] = True
+            self._errored[name] = True
+            elapsed = time.monotonic() - self._start.get(name, time.monotonic())
+            self._status[name] = f'error after {elapsed:.1f}s'
             self._redraw()
 
     def close(self) -> None:
@@ -229,7 +244,10 @@ class StatusDisplay:
     def _render_line(self, name: str) -> str:
         status = self._status[name]
         if self._done[name]:
-            color  = self._CYAN if self._alerts.get(name, 0) else self._GREEN  # noqa: E221
+            if self._errored.get(name):
+                color = self._RED
+            else:
+                color = self._CYAN if self._alerts.get(name, 0) else self._GREEN
             timing = ''
         elif name in self._start:
             color  = self._YELLOW                                              # noqa: E221
@@ -358,10 +376,27 @@ class Checker(ABC):
             self.alert(f'NEW:{directory}')
 
     def run(self) -> set[str]:
-        """Run the check and return accumulated alerts."""
+        """Run the check and return accumulated alerts.
+
+        An unexpected exception inside check() — a bug in a checker's own
+        parsing logic, distinct from the anticipated fetch()/rsync failure
+        modes that already alert and return normally — is caught here
+        rather than left to propagate. Uncaught, it would surface via
+        future.result() in main(), aborting the whole threaded run: every
+        other checker's results get dropped, failures.save() never runs,
+        and display.close() never runs, leaving a half-drawn status board.
+        Converting it into an alert keeps this checker's failure isolated
+        and visible in the normal report instead of a bare traceback.
+        """
         if self._display:
             self._display.start(self._name)
-        self.check()
+        try:
+            self.check()
+        except Exception as e:
+            self.alert(f'EXCEPTION:{self._name}: {e}')
+            if self._display:
+                self._display.error(self._name)
+            return self.updates
         if self._display:
             self._display.finish(self._name, len(self.updates))
         return self.updates
@@ -804,10 +839,15 @@ class UbuntuChecker(Checker):
                 # Superseded within its line, or the whole line is gone from
                 # the tracker; either way, group instead of one alert per file.
                 stale_versions.add(ver)
-            else:
+            elif path.name.startswith('ubuntu-'):
                 # Current-version (or unparseable) file dropped from the tracker;
-                # unusual enough to keep visible individually.
+                # unusual enough to keep visible individually. Scoped to plain
+                # ubuntu-*.iso, the only flavor tracker_index actually reports on.
                 self.alert(f'STALE:{path.name}')
+            # else: some other *buntu* flavor (kubuntu, xubuntu, ...) picked up
+            # by the broad glob. The tracker has no data on it, so we can't
+            # tell whether it's actually current or stale -- skip rather than
+            # guess and risk a permanent false STALE.
 
         for ver in sorted(stale_versions, key=ver_key):
             self.alert(f'STALE:Ubuntu-{ver}')
@@ -914,6 +954,7 @@ class DebianChecker(Checker):
             return
 
         if result.returncode != 0:
+            self._debug(f'rsync failed (exit {result.returncode})')
             self._failures.increment('Debian')
             # Check threshold against in-memory state; no disk read needed
             if self._failures.at_threshold('Debian'):
@@ -969,7 +1010,7 @@ class DebianChecker(Checker):
                 # Whole prior release superseded; group instead of one alert per file.
                 stale_versions.add(ver)
             else:
-                # Current-version (or unparseable) file dropped from the tracker;
+                # Current-version (or unparseable) local ISO dropped from the tracker;
                 # unusual enough to keep visible individually.
                 self.alert(f'STALE:{path.name}')
 

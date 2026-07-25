@@ -197,6 +197,26 @@ class TestStatusDisplay(unittest.TestCase):
             d.close()
         self.assertIn('CheckerA', buf.getvalue())
 
+    def test_error_marks_done_and_errored(self):
+        """error() is distinct from finish(): it's for a checker crashing,
+        not for a normal completion (with or without alerts)."""
+        d = self._display(names=('CheckerA',))
+        with patch('sys.stderr', io.StringIO()):
+            d.error('CheckerA')
+        self.assertTrue(d._done['CheckerA'])
+        self.assertTrue(d._errored.get('CheckerA'))
+
+    def test_error_uses_red_not_green_or_cyan(self):
+        """The RED color was previously reserved but unused; error() should
+        actually render with it, not fall through to the finish() colors."""
+        d = self._display(names=('CheckerA',))
+        with patch('sys.stderr', io.StringIO()):
+            d.error('CheckerA')
+        rendered = d._render_line('CheckerA')
+        self.assertIn(nt.StatusDisplay._RED, rendered)
+        self.assertNotIn(nt.StatusDisplay._GREEN, rendered)
+        self.assertNotIn(nt.StatusDisplay._CYAN, rendered)
+
 
 class TestCheckerBase(unittest.TestCase):
 
@@ -373,6 +393,47 @@ class TestCheckerBase(unittest.TestCase):
         c._page = 'x' * 50
         self.assertFalse(c.body_ok('test-domain', min_len=100))
         self.assertIn('test-domain', c.updates)
+
+
+class TestCheckerRunExceptionSafety(unittest.TestCase):
+    """Checker.run() must not let an unexpected exception in check() escape.
+
+    Uncaught, it would surface via future.result() in main(), aborting the
+    whole threaded run: every other checker's results get dropped,
+    failures.save() never runs, and display.close() never runs. run()
+    catches it, turns it into its own alert, and marks the display with
+    the (previously unused) red error state instead."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.ftrack = nt.FailureTracker(self.tmp / 'f.json', 3)
+
+    def test_exception_becomes_alert_not_crash(self):
+        c = make_checker(nt.AlmaChecker, self.tmp, failures=self.ftrack)
+        c.check = MagicMock(side_effect=KeyError('name'))
+        updates = c.run()  # must not raise
+        self.assertTrue(
+            any(u.startswith('EXCEPTION:AlmaChecker') for u in updates),
+            f'Expected an EXCEPTION: alert, got: {updates}',
+        )
+
+    def test_exception_marks_display_errored_not_finished(self):
+        display = MagicMock()
+        c = make_checker(nt.AlmaChecker, self.tmp, failures=self.ftrack, display=display)
+        c.check = MagicMock(side_effect=RuntimeError('boom'))
+        c.run()
+        display.error.assert_called_once_with('AlmaChecker')
+        display.finish.assert_not_called()
+
+    def test_clean_run_still_uses_finish_not_error(self):
+        """A normal (non-crashing) run must still go through finish(), not
+        error() -- the try/except shouldn't change behavior on the happy path."""
+        display = MagicMock()
+        c = make_checker(nt.AlmaChecker, self.tmp, failures=self.ftrack, display=display)
+        c.fetch = fake_fetch_fn(c, '<html>no isos links</html>')
+        c.run()
+        display.finish.assert_called_once()
+        display.error.assert_not_called()
 
 
 # MintChecker
@@ -684,6 +745,31 @@ class TestUbuntuChecker(unittest.TestCase):
         p.write_bytes(b'x' * 100)
         updates = self._run(status=' '.join(UBUNTU_ISOS))
         self.assertNotIn('MISSING:*buntu*.iso', updates)
+
+    def test_current_version_kubuntu_not_falsely_staled(self):
+        """The *buntu* glob is intentionally broad (see test_kubuntu_matches_glob
+        above), but torrent.ubuntu.com only ever reports on plain ubuntu-*.iso.
+        A correctly-mirrored, CURRENT-version Kubuntu file used to fall through
+        to the per-file STALE branch every run, since it can never appear in
+        upstream_set — a permanent false positive. It should be left alone."""
+        p = self.tmp / 'kubuntu-24.04-desktop-amd64.iso'
+        p.write_bytes(b'x' * 100)
+        updates = self._run(status=' '.join(UBUNTU_ISOS))
+        self.assertFalse(
+            any(u.startswith('STALE:kubuntu') for u in updates),
+            f'Unexpected false STALE for a current-version kubuntu file: {updates}',
+        )
+
+    def test_old_version_kubuntu_still_grouped_stale(self):
+        """A non-current-version Kubuntu file should still be swept into the
+        grouped STALE:Ubuntu-VER alert alongside its plain-ubuntu sibling —
+        the fix only needs to silence the per-file branch, not the grouping."""
+        for name in ('ubuntu-20.04-desktop-amd64.iso', 'kubuntu-20.04-desktop-amd64.iso'):
+            (self.tmp / name).write_bytes(b'x' * 100)
+        for name in UBUNTU_ISOS:
+            (self.tmp / name).write_bytes(b'x' * 100)
+        updates = self._run(status=' '.join(UBUNTU_ISOS))
+        self.assertEqual(updates, {'STALE:Ubuntu-20.04'})
 
     def test_malformed_page_alerts(self):
         updates = self._run(page='<html>nothing here</html>')
@@ -1031,6 +1117,20 @@ class TestDebianChecker(unittest.TestCase):
             c.check()
         self.assertEqual(ftrack._counts.get('Debian', 0), 1)
 
+    def test_rsync_failure_updates_display(self):
+        """A plain nonzero-exit rsync failure should update the live status
+        board too, matching the timeout branch's self._debug() call --
+        previously only the timeout path did this, leaving --verbose mode
+        silent about an ordinary rsync failure."""
+        ftrack_path = self.tmp / 'f.json'
+        ftrack_path.write_text('{}')
+        ftrack = nt.FailureTracker(ftrack_path, 3)
+        display = MagicMock()
+        c = make_checker(nt.DebianChecker, self.tmp, failures=ftrack, display=display)
+        with patch('subprocess.run', return_value=self._rsync(returncode=11)):
+            c.check()
+        display.update.assert_any_call('DebianChecker', 'rsync failed (exit 11)')
+
     def test_rsync_failure_at_threshold_alerts(self):
         ftrack_path = self.tmp / 'f.json'
         ftrack_path.write_text(json.dumps({'Debian': 2}))
@@ -1175,6 +1275,34 @@ class TestMain(unittest.TestCase):
             for p in checker_patches:
                 p.stop()
 
+        self.assertEqual(ret, 1)
+
+    def test_one_checker_crashing_does_not_abort_the_run(self):
+        """An unexpected exception in one checker's check() (patched here,
+        not run() -- the real, unpatched run() is what contains the fix)
+        must not crash main() or prevent it from finishing cleanly."""
+        self.iso_dir.mkdir()
+        (self.iso_dir / 'status.txt').write_text('Sum: 1')
+
+        def ok_check(self_inner):
+            pass  # no alerts
+
+        def raise_check(self_inner):
+            raise RuntimeError('boom')
+
+        checker_patches = [patch.object(cls, 'check', ok_check) for cls in nt.CHECKERS[1:]]
+        checker_patches.append(patch.object(nt.CHECKERS[0], 'check', raise_check))
+        for p in checker_patches:
+            p.start()
+        try:
+            with patch('subprocess.run', return_value=self._rsync_ok()):
+                ret = self._run_main()  # must not raise
+        finally:
+            for p in checker_patches:
+                p.stop()
+
+        # Non-zero because of the crashing checker's own EXCEPTION: alert,
+        # not because main() itself blew up.
         self.assertEqual(ret, 1)
 
     def test_clean_run_with_display_has_no_trailing_blank_line(self):
