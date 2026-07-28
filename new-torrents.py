@@ -348,12 +348,24 @@ class Checker(ABC):
             return False
         return True
 
+    def _known_to_transmission(self, name: str) -> bool:
+        """True if name appears in status_content as a whole token, not
+        merely as a prefix of some longer, unrelated name. A plain
+        substring test would treat e.g. 'Fedora-Workstation-Live-x86_64-42'
+        as already known if only '...-420' were actually present --
+        silently hiding a genuinely missing release. status_content's
+        Name column entries are whitespace-delimited, so requiring
+        non-\\S boundaries on both sides is sufficient.
+        """
+        pattern = r'(?<!\S)' + re.escape(name) + r'(?!\S)'
+        return re.search(pattern, self.status_content) is not None
+
     def check_iso(self, iso: str, new_alert: str = '') -> None:
         """Check a flat ISO file against transmission status and local disk."""
         if not new_alert:
             new_alert = f'NEW:{iso}'
         # Transmission knows about this ISO; nothing to do
-        if iso in self.status_content:
+        if self._known_to_transmission(iso):
             return
         path = self.iso_dir / iso
         # ISO is on disk but transmission has no record of it
@@ -366,7 +378,7 @@ class Checker(ABC):
     def check_dir(self, directory: str) -> None:
         """Check a torrent directory against transmission status and local disk."""
         # Transmission knows about this directory; nothing to do
-        if directory in self.status_content:
+        if self._known_to_transmission(directory):
             return
         # Directory is on disk but transmission has no record of it
         if (self.iso_dir / directory).is_dir():
@@ -431,7 +443,18 @@ class MintChecker(Checker):
       MALFORMED:Linux-Mint-VER - version directory returned no ISOs
     """
 
-    _VERSION_RE = re.compile(r'(\d+\.\d+(?:\.\d+)*)')
+    # pub.linuxmint.io ships the very first release of a major with a bare,
+    # dot-less filename too (e.g. linuxmint-22-cinnamon-64bit.iso, confirmed
+    # against a live mirror) -- point releases within that major then use a
+    # dotted version (linuxmint-22.1-cinnamon-64bit.iso). Anchored right
+    # after "linuxmint-" rather than searched anywhere in the string, so it
+    # can't mistake a stray digit run elsewhere in the filename (e.g.
+    # "64bit") for the version if the real version segment were ever
+    # missing -- the plain [0-9]+\.[0-9]+ search here originally couldn't
+    # see the bare-major case at all, which meant a fully-mirrored new
+    # major release would loop forever reporting NEW:Linux-Mint-VER since
+    # local_current could never match it.
+    _VERSION_RE = re.compile(r'^linuxmint-(\d+(?:\.\d+)*)-')
 
     def _version_of(self, filename: str) -> str | None:
         m = self._VERSION_RE.search(filename)
@@ -443,7 +466,13 @@ class MintChecker(Checker):
         if not self.body_ok('pub.linuxmint.io'):
             return
 
-        versions = re.findall(r'href="([0-9]+\.[0-9]+)/"', self._page)
+        # pub.linuxmint.io/stable/ lists a brand-new major as a bare,
+        # dot-less directory (e.g. "23/") before its first point release
+        # ("23.1/") exists -- [0-9]+\.[0-9]+ alone can't see that entry at
+        # all, so the newest major would be silently invisible to this
+        # checker until its first point release ships, potentially months
+        # later. The trailing (?:\.[0-9]+)* makes the dotted part optional.
+        versions = re.findall(r'href="([0-9]+(?:\.[0-9]+)*)/"', self._page)
         # Stable index structure could change; alert and bail if it does
         if not versions:
             self.alert('MALFORMED:Linux-Mint')
@@ -536,7 +565,20 @@ class CachyChecker(Checker):
             for iso in upstream_isos
             for m in re.findall(r'cachyos-[^-]+-linux-(\d+)\.iso', iso)
         })
-        current_release = release_dates[-1] if release_dates else ''
+        # upstream_isos parsed fine, but if none of those names also yielded
+        # a release date (e.g. a compound edition name like "desktop-gnome"
+        # defeats the single-segment [^-]+ here), don't silently fall back
+        # to an empty version string in the alert. Unlike the upstream_isos
+        # guard above, this doesn't return early: the per-file ORPHAN/STALE
+        # checks below only need real filenames, which we do have, so
+        # bailing out entirely would throw away detection they can still
+        # correctly do. UNKNOWN keeps any resulting NEW: alert honest about
+        # why, rather than blank.
+        if not release_dates:
+            self.alert('MALFORMED:cachyos.org')
+            current_release = 'UNKNOWN'
+        else:
+            current_release = release_dates[-1]
 
         for iso in upstream_isos:
             self.check_iso(iso, f'NEW:CachyOS-{current_release}')
@@ -839,15 +881,15 @@ class UbuntuChecker(Checker):
                 # Superseded within its line, or the whole line is gone from
                 # the tracker; either way, group instead of one alert per file.
                 stale_versions.add(ver)
-            elif path.name.startswith('ubuntu-'):
+            else:
                 # Current-version (or unparseable) file dropped from the tracker;
-                # unusual enough to keep visible individually. Scoped to plain
-                # ubuntu-*.iso, the only flavor tracker_index actually reports on.
+                # unusual enough to keep visible individually. torrent.ubuntu.com
+                # tracks all official flavors (kubuntu, xubuntu, lubuntu,
+                # edubuntu, ubuntu-mate/budgie/gnome/unity/cinnamon/kylin/studio,
+                # ubuntu-mini-iso, mythbuntu, ...), confirmed directly against
+                # the live tracker_index -- not just plain ubuntu-*.iso -- so
+                # there's no reason to special-case the prefix here.
                 self.alert(f'STALE:{path.name}')
-            # else: some other *buntu* flavor (kubuntu, xubuntu, ...) picked up
-            # by the broad glob. The tracker has no data on it, so we can't
-            # tell whether it's actually current or stale -- skip rather than
-            # guess and risk a permanent false STALE.
 
         for ver in sorted(stale_versions, key=ver_key):
             self.alert(f'STALE:Ubuntu-{ver}')

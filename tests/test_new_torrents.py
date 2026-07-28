@@ -284,6 +284,27 @@ class TestCheckerBase(unittest.TestCase):
         c.check_dir('Fedora-Workstation-42')
         self.assertIn('ORPHAN:Fedora-Workstation-42', c.updates)
 
+    def test_check_dir_prefix_of_unrelated_entry_not_treated_as_known(self):
+        """A raw substring test on status_content would treat
+        'Fedora-Workstation-Live-x86_64-42' as already known if only the
+        unrelated, longer 'Fedora-Workstation-Live-x86_64-420' (a
+        different Fedora major) were actually present -- directory names
+        have no trailing extension to act as a natural boundary the way
+        *.iso filenames do, so a version number that's an exact numeric
+        prefix of another silently masks a genuinely missing release.
+        Requires a whole-token match instead of a plain substring test."""
+        c = self._checker(status='Fedora-Workstation-Live-x86_64-420')
+        c.check_dir('Fedora-Workstation-Live-x86_64-42')
+        self.assertIn('NEW:Fedora-Workstation-Live-x86_64-42', c.updates)
+
+    def test_check_dir_still_matches_known_entry_with_trailing_whitespace(self):
+        """The whole-token fix must not regress the common case: a real
+        status_content entry followed by whitespace/newline (as in real
+        transmission-remote -l output) still counts as known."""
+        c = self._checker(status='Fedora-Workstation-Live-x86_64-42\n')
+        c.check_dir('Fedora-Workstation-Live-x86_64-42')
+        self.assertEqual(c.updates, set())
+
     def test_fetch_failure_increments_counter(self):
         c = self._checker()
         with patch('urllib.request.urlopen',
@@ -534,6 +555,79 @@ class TestMintChecker(unittest.TestCase):
         c.check()
         self.assertIn('MALFORMED:Linux-Mint-22.0', c.updates)
 
+    def test_bare_major_directory_detected_as_current(self):
+        """pub.linuxmint.io/stable/ lists a brand-new major as a bare,
+        dot-less directory (e.g. '23/') before its first point release
+        exists -- confirmed against the real, live index, which still
+        shows this pattern historically (20/, 21/, 22/ each preceded
+        their first dotted point release). The old [0-9]+\\.[0-9]+-only
+        regex couldn't see that entry at all, so a fully-mirrored old
+        major would report a clean run with zero alerts even though an
+        entire new major release existed and nothing had been mirrored
+        for it -- the exact silent-failure case this script exists to
+        catch. Verifies the new major is picked as current once it has
+        its own ISOs listed."""
+        bare_major_index = (
+            '<a href="22.1/">22.1/</a>'
+            '<a href="22.2/">22.2/</a>'
+            '<a href="22.3/">22.3/</a>'
+            '<a href="23/">23/</a>'
+        )
+        v23_page = '<a href="linuxmint-23-cinnamon-64bit.iso">linuxmint-23-cinnamon-64bit.iso</a>'
+        for iso in ('linuxmint-22.3-cinnamon-64bit.iso', 'linuxmint-22.3-mate-64bit.iso'):
+            (self.tmp / iso).write_bytes(b'x' * 100)
+        updates = self._run(
+            status='linuxmint-22.3-cinnamon-64bit.iso linuxmint-22.3-mate-64bit.iso',
+            pages=[bare_major_index, v23_page],
+        )
+        self.assertIn(
+            'NEW:Linux-Mint-23', updates,
+            f'New bare-major release 23 went undetected: {updates}',
+        )
+
+    def test_bare_major_directory_with_no_isos_yet_alerts_rather_than_silence(self):
+        """Even in the narrower window where the new major's own directory
+        genuinely has no ISOs published yet, the checker should say
+        something (MALFORMED, matching the same convention used
+        everywhere else in this codebase for 'found the structure but not
+        the expected content') rather than silently staying locked onto
+        the previous major forever."""
+        bare_major_index = (
+            '<a href="22.1/">22.1/</a>'
+            '<a href="22.2/">22.2/</a>'
+            '<a href="22.3/">22.3/</a>'
+            '<a href="23/">23/</a>'
+        )
+        for iso in ('linuxmint-22.3-cinnamon-64bit.iso', 'linuxmint-22.3-mate-64bit.iso'):
+            (self.tmp / iso).write_bytes(b'x' * 100)
+        updates = self._run(
+            status='linuxmint-22.3-cinnamon-64bit.iso linuxmint-22.3-mate-64bit.iso',
+            pages=[bare_major_index, '<html>nothing published yet</html>'],
+        )
+        self.assertEqual(updates, {'MALFORMED:Linux-Mint-23'})
+
+    def test_bare_major_filenames_also_recognized_not_just_the_directory(self):
+        """Confirmed against a live Mint mirror: the very first release of
+        a major uses BARE filenames too (linuxmint-22-cinnamon-64bit.iso,
+        no dot), not just a bare directory. _version_of() originally still
+        required a dot, so even after the directory-listing fix correctly
+        identified a new bare major as current, local_current could never
+        match its own (also bare) filenames -- a fully-mirrored, fully-
+        known release would report NEW:Linux-Mint-VER on every single run
+        forever, the opposite failure from the original silence bug."""
+        bare_major_index = '<a href="22.3/">22.3/</a><a href="23/">23/</a>'
+        v23_page = (
+            '<a href="linuxmint-23-cinnamon-64bit.iso">linuxmint-23-cinnamon-64bit.iso</a>'
+            '<a href="linuxmint-23-mate-64bit.iso">linuxmint-23-mate-64bit.iso</a>'
+        )
+        for iso in ('linuxmint-23-cinnamon-64bit.iso', 'linuxmint-23-mate-64bit.iso'):
+            (self.tmp / iso).write_bytes(b'x' * 100)
+        updates = self._run(
+            status='linuxmint-23-cinnamon-64bit.iso linuxmint-23-mate-64bit.iso',
+            pages=[bare_major_index, v23_page],
+        )
+        self.assertEqual(updates, set())
+
 
 # ArchChecker
 
@@ -617,6 +711,42 @@ class TestCachyChecker(unittest.TestCase):
     def test_malformed_page_alerts(self):
         updates = self._run(page='<html>no torrents here</html>')
         self.assertIn('MALFORMED:cachyos.org', updates)
+
+    def test_unparseable_edition_name_alerts_malformed_not_empty_version(self):
+        """A compound edition name with an internal hyphen (e.g. a
+        hypothetical 'desktop-gnome' spin) is captured fine by the
+        torrent_url regex ([^&]+, any non-& char), but defeats the
+        release_dates regex's single-segment [^-]+. This used to silently
+        produce 'NEW:CachyOS-' with an empty version suffix instead of
+        flagging the page as unparseable."""
+        page = (
+            'torrent_url&quot;:[0,&quot;https://cdn.cachyos.org/ISO/241201/'
+            'cachyos-desktop-gnome-linux-241201.torrent&quot;\n'
+        )
+        updates = self._run(page=page)
+        self.assertIn('MALFORMED:cachyos.org', updates)
+        self.assertFalse(
+            any(u == 'NEW:CachyOS-' for u in updates),
+            f'Unexpected empty-version alert: {updates}',
+        )
+
+    def test_unparseable_edition_name_still_catches_orphan(self):
+        """The MALFORMED guard above must not throw away detection it
+        doesn't need to sacrifice: upstream_isos itself parsed fine (real
+        filenames), only the release-date extraction failed, so a
+        genuinely orphaned local file for that same edition should still
+        be caught -- alongside the MALFORMED signal, not instead of it."""
+        page = (
+            'torrent_url&quot;:[0,&quot;https://cdn.cachyos.org/ISO/241201/'
+            'cachyos-desktop-gnome-linux-241201.torrent&quot;\n'
+        )
+        local = self.tmp / 'cachyos-desktop-gnome-linux-241201.iso'
+        local.write_bytes(b'x' * 100)
+        updates = self._run(page=page)  # empty status -> nothing known to transmission
+        self.assertEqual(
+            updates,
+            {'MALFORMED:cachyos.org', 'ORPHAN:cachyos-desktop-gnome-linux-241201.iso'},
+        )
 
     def test_zero_byte_stale_not_alerted(self):
         old = self.tmp / 'cachyos-kde-linux-231101.iso'
@@ -746,24 +876,45 @@ class TestUbuntuChecker(unittest.TestCase):
         updates = self._run(status=' '.join(UBUNTU_ISOS))
         self.assertNotIn('MISSING:*buntu*.iso', updates)
 
-    def test_current_version_kubuntu_not_falsely_staled(self):
-        """The *buntu* glob is intentionally broad (see test_kubuntu_matches_glob
-        above), but torrent.ubuntu.com only ever reports on plain ubuntu-*.iso.
-        A correctly-mirrored, CURRENT-version Kubuntu file used to fall through
-        to the per-file STALE branch every run, since it can never appear in
-        upstream_set — a permanent false positive. It should be left alone."""
-        p = self.tmp / 'kubuntu-24.04-desktop-amd64.iso'
-        p.write_bytes(b'x' * 100)
-        updates = self._run(status=' '.join(UBUNTU_ISOS))
-        self.assertFalse(
-            any(u.startswith('STALE:kubuntu') for u in updates),
-            f'Unexpected false STALE for a current-version kubuntu file: {updates}',
+    def test_current_version_kubuntu_tracked_like_plain_ubuntu(self):
+        """torrent.ubuntu.com tracks all official flavors, not just plain
+        ubuntu-*.iso -- confirmed directly against the live tracker_index,
+        which lists kubuntu, xubuntu, lubuntu, edubuntu, ubuntu-mate, and
+        others alongside plain ubuntu. A prior fix here assumed the tracker
+        was Ubuntu-only and special-cased plain ubuntu-*.iso in the per-file
+        STALE branch; that assumption was wrong and silently suppressed
+        legitimate STALE alerts for any other flavor genuinely dropped from
+        the tracker (see test_dropped_flavor_file_still_alerts_stale below).
+        This test locks in the corrected behavior: a current-version Kubuntu
+        file that IS present upstream is recognized as known, same as any
+        plain ubuntu file would be."""
+        page = (
+            '<td>ubuntu-24.04-desktop-amd64.iso</td>\n'
+            '<td>kubuntu-24.04-desktop-amd64.iso</td>\n'
         )
+        status = 'ubuntu-24.04-desktop-amd64.iso kubuntu-24.04-desktop-amd64.iso'
+        for name in ('ubuntu-24.04-desktop-amd64.iso', 'kubuntu-24.04-desktop-amd64.iso'):
+            (self.tmp / name).write_bytes(b'x' * 100)
+        updates = self._run(status=status, page=page)
+        self.assertEqual(updates, set())
+
+    def test_dropped_flavor_file_still_alerts_stale(self):
+        """A current-version flavor file (Kubuntu here) that has genuinely
+        been dropped from the tracker -- absent from upstream_isos on this
+        scrape, unlike its still-tracked plain-ubuntu sibling -- must still
+        alert STALE individually, exactly like a plain ubuntu-*.iso file
+        would in the same situation. This is the real-world scenario the
+        prior fix's 'skip anything not prefixed ubuntu-' logic got wrong."""
+        page = '<td>ubuntu-24.04-desktop-amd64.iso</td>\n'
+        status = 'ubuntu-24.04-desktop-amd64.iso kubuntu-24.04-desktop-amd64.iso'
+        for name in ('ubuntu-24.04-desktop-amd64.iso', 'kubuntu-24.04-desktop-amd64.iso'):
+            (self.tmp / name).write_bytes(b'x' * 100)
+        updates = self._run(status=status, page=page)
+        self.assertIn('STALE:kubuntu-24.04-desktop-amd64.iso', updates)
 
     def test_old_version_kubuntu_still_grouped_stale(self):
         """A non-current-version Kubuntu file should still be swept into the
-        grouped STALE:Ubuntu-VER alert alongside its plain-ubuntu sibling —
-        the fix only needs to silence the per-file branch, not the grouping."""
+        grouped STALE:Ubuntu-VER alert alongside its plain-ubuntu sibling."""
         for name in ('ubuntu-20.04-desktop-amd64.iso', 'kubuntu-20.04-desktop-amd64.iso'):
             (self.tmp / name).write_bytes(b'x' * 100)
         for name in UBUNTU_ISOS:
