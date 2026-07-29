@@ -5,6 +5,7 @@
 # This script runs once an hour via cron and raises alerts via healthchecks.io
 # We send the output as a POST to /fail in the event of a non-zero exit.
 
+import fcntl
 import gzip
 import http.client
 import json
@@ -32,6 +33,13 @@ STATUS_FILE = ISO_DIR / 'status.txt'
 FAIL_THRESHOLD = 3
 # XDG-compliant config dir; created on first run if absent
 FAIL_FILE = Path.home() / '.config' / 'new-torrents' / 'failures.json'
+# Prevents two overlapping invocations (e.g. a manual run colliding with
+# cron, or a prior run stuck far longer than expected) from racing on
+# FAIL_FILE and doubling up on every upstream fetch. Uses flock() rather
+# than a PID file: the lock lives in the kernel, tied to this process's
+# open file descriptor, so it can never go stale across a crash, kill -9,
+# or reboot -- there's no on-disk "locked" state to clean up.
+LOCK_FILE = Path.home() / '.config' / 'new-torrents' / 'lock'
 
 
 ###########
@@ -1076,7 +1084,10 @@ CHECKERS: list[type[Checker]] = [
 ]
 
 
-def main() -> int:
+def _run() -> int:
+    """The actual check logic. Split out from main() so main() can focus
+    purely on the lockfile, and so this can be called only once the lock
+    is safely held."""
     # Bail early if the download directory is missing
     if not ISO_DIR.is_dir():
         print(f'ERROR: transmission download directory {ISO_DIR} is missing. Exiting.')
@@ -1127,6 +1138,35 @@ def main() -> int:
 
     # All checks passed
     return 0
+
+
+def main() -> int:
+    """Acquire the lockfile, then run the actual checks.
+
+    A held lock means either a legitimate overlap (a manual run colliding
+    with cron) or a prior invocation stuck far longer than it should be --
+    either way worth surfacing rather than silently no-op'ing, since a
+    silent 0 here would mean healthchecks.io never fires and a genuinely
+    stuck run could go unnoticed indefinitely. flock() ties the lock to
+    this process's open file descriptor rather than the lock file's
+    on-disk content, so it can't go stale across a crash, kill -9, or
+    reboot the way a hand-rolled PID file could.
+    """
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(LOCK_FILE, 'w')
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_fd.close()
+        print(f'ERROR: another instance is already running (lock held on {LOCK_FILE}). Exiting.')
+        return 1
+
+    lock_fd.write(str(os.getpid()))
+    lock_fd.flush()
+    try:
+        return _run()
+    finally:
+        lock_fd.close()
 
 
 if __name__ == '__main__':

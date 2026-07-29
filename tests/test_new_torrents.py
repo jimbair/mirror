@@ -11,6 +11,7 @@ No external dependencies required. The script under test is imported directly;
 adjust SCRIPT_PATH below if you rename or move files.
 """
 
+import fcntl
 import http.client
 import importlib.util
 import io
@@ -19,6 +20,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -1336,6 +1338,7 @@ class TestMain(unittest.TestCase):
             'ISO_DIR': self.iso_dir,
             'STATUS_FILE': self.iso_dir / 'status.txt',
             'FAIL_FILE': self.tmp / 'failures.json',
+            'LOCK_FILE': self.tmp / 'lock',
         }
         if extra_patches:
             patches.update(extra_patches)
@@ -1353,6 +1356,89 @@ class TestMain(unittest.TestCase):
         m = MagicMock()
         m.returncode = 0
         return m
+
+    def test_lock_held_by_another_open_prevents_run(self):
+        """A distinct open() of the lock file already holding flock() must
+        make main() return 1 without touching ISO_DIR/STATUS_FILE at all --
+        two separate open() calls on the same file conflict via flock()
+        even within one process (verified directly: this isn't relying on
+        an assumption about cross-process semantics)."""
+        lock_path = self.tmp / 'lock'
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        holder_fd = open(lock_path, 'w')
+        fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            # Deliberately do NOT create iso_dir/status.txt -- if main()
+            # incorrectly proceeded past the lock check, it would fail for
+            # a DIFFERENT reason (missing ISO_DIR) and still return 1,
+            # which would make this test pass for the wrong reason. Check
+            # stdout instead to confirm it's actually the lock message.
+            buf = io.StringIO()
+            with patch('sys.stdout', buf):
+                ret = self._run_main()
+            self.assertEqual(ret, 1)
+            self.assertIn('another instance is already running', buf.getvalue())
+        finally:
+            holder_fd.close()
+
+    def test_lock_released_after_clean_run_allows_next_invocation(self):
+        """The lock must not leak past a single run -- a second, later
+        invocation needs to succeed normally once the first has finished."""
+        self.iso_dir.mkdir()
+        (self.iso_dir / 'status.txt').write_text('Sum: 1')
+
+        def noop_run(self_inner):
+            return set()
+
+        checker_patches = [patch.object(cls, 'run', noop_run) for cls in nt.CHECKERS]
+        for p in checker_patches:
+            p.start()
+        try:
+            with patch('subprocess.run', return_value=self._rsync_ok()):
+                first = self._run_main()
+                second = self._run_main()
+        finally:
+            for p in checker_patches:
+                p.stop()
+
+        self.assertEqual(first, 0)
+        self.assertEqual(second, 0)
+
+    def test_lock_prevents_concurrent_run_across_real_processes(self):
+        """End-to-end confirmation with an actual separate OS process
+        holding the lock, not just a second file descriptor in this same
+        test process -- the scenario this exists for (a real overlapping
+        invocation) rather than just the mechanism in isolation."""
+        lock_path = self.tmp / 'lock'
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen([
+            sys.executable, '-c',
+            'import fcntl, time, sys\n'
+            'f = open(sys.argv[1], "w")\n'
+            'fcntl.flock(f, fcntl.LOCK_EX)\n'
+            'time.sleep(5)\n',
+            str(lock_path),
+        ])
+        try:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                probe = open(lock_path, 'w')
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(probe, fcntl.LOCK_UN)
+                except BlockingIOError:
+                    break  # the child process now holds the lock
+                finally:
+                    probe.close()
+                time.sleep(0.05)
+            else:
+                self.fail('child process never acquired the lock in time')
+
+            ret = self._run_main()
+            self.assertEqual(ret, 1)
+        finally:
+            holder.terminate()
+            holder.wait(timeout=5)
 
     def test_missing_iso_dir_returns_1(self):
         ret = self._run_main()
