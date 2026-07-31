@@ -228,6 +228,17 @@ class StatusDisplay:
         return max(1, (len(visible) + self._term_width - 1) // self._term_width)
 
     def _redraw(self) -> None:
+        # Re-measure on every redraw rather than trusting the width from
+        # __init__: if the user resizes the terminal mid-run, a stale
+        # width here would make _physical_rows() estimate a row count
+        # that no longer matches how the real terminal actually wraps the
+        # line it's about to print, corrupting the cursor-up math on
+        # every subsequent redraw from that point on.
+        try:
+            self._term_width = os.get_terminal_size(sys.stderr.fileno()).columns
+        except OSError:
+            self._term_width = 80
+
         rendered = [self._render_line(name) for name in self._names]
 
         # Move up to the top of the block as it currently exists on screen
@@ -368,6 +379,26 @@ class Checker(ABC):
         pattern = r'(?<!\S)' + re.escape(name) + r'(?!\S)'
         return re.search(pattern, self.status_content) is not None
 
+    def _safe_path(self, name: str) -> Path | None:
+        """Resolve name against iso_dir, or None if the result would
+        escape iso_dir entirely. name is never opened or read -- only
+        checked for existence/size/is_dir -- but a compromised or simply
+        misbehaving upstream page could still use a crafted name to probe
+        for the existence of arbitrary files on the host: a relative
+        '../../etc/passwd'-style name climbs out via '..' segments, and
+        an absolute name like '/etc/passwd' exploits Path's own '/'
+        operator semantics, where an absolute right-hand side replaces
+        the left side entirely rather than being appended to it. Neither
+        is a currently expected shape for any of these checkers' scraped
+        names, so treat either as suspicious rather than silently
+        resolving somewhere unintended.
+        """
+        path = (self.iso_dir / name).resolve()
+        iso_dir_resolved = self.iso_dir.resolve()
+        if not path.is_relative_to(iso_dir_resolved):
+            return None
+        return path
+
     def check_iso(self, iso: str, new_alert: str = '') -> None:
         """Check a flat ISO file against transmission status and local disk."""
         if not new_alert:
@@ -375,7 +406,10 @@ class Checker(ABC):
         # Transmission knows about this ISO; nothing to do
         if self._known_to_transmission(iso):
             return
-        path = self.iso_dir / iso
+        path = self._safe_path(iso)
+        if path is None:
+            self.alert(f'UNSAFE:{iso}')
+            return
         # ISO is on disk but transmission has no record of it
         if path.exists() and path.stat().st_size > 0:
             self.alert(f'ORPHAN:{iso}')
@@ -388,8 +422,12 @@ class Checker(ABC):
         # Transmission knows about this directory; nothing to do
         if self._known_to_transmission(directory):
             return
+        path = self._safe_path(directory)
+        if path is None:
+            self.alert(f'UNSAFE:{directory}')
+            return
         # Directory is on disk but transmission has no record of it
-        if (self.iso_dir / directory).is_dir():
+        if path.is_dir():
             self.alert(f'ORPHAN:{directory}')
         # Directory is not on disk and not known to transmission
         else:

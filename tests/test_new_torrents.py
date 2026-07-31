@@ -144,17 +144,37 @@ class TestFailureTracker(unittest.TestCase):
         self.assertFalse(t.at_threshold('x'))  # no crash, empty state
 
 
+class _FakeTTY(io.StringIO):
+    """A StringIO that also has a working fileno(). Plain StringIO's
+    fileno() raises io.UnsupportedOperation, which is itself an OSError
+    subclass -- _redraw()'s `except OSError` swallows it and silently
+    falls back to width 80 before os.get_terminal_size() is ever reached,
+    which would mask any os.get_terminal_size mock in these tests
+    regardless of what it's set to return."""
+
+    def fileno(self) -> int:
+        return 1
+
+
 class TestStatusDisplay(unittest.TestCase):
     """StatusDisplay writes ANSI cursor-control codes to stderr; these tests
     capture that output rather than parsing it visually."""
 
     def _display(self, names=('CheckerA',), term_width=80):
-        with patch('sys.stderr', io.StringIO()):
+        # _redraw() now re-measures the terminal on every call (to catch a
+        # mid-run resize), so simulating a width means patching
+        # os.get_terminal_size for the test's whole lifetime, not just
+        # poking _term_width once after construction.
+        fake_size = type('R', (), {'columns': term_width})()
+        size_patcher = patch('os.get_terminal_size', return_value=fake_size)
+        size_patcher.start()
+        self.addCleanup(size_patcher.stop)
+
+        with patch('sys.stderr', _FakeTTY()):
             d = nt.StatusDisplay(list(names))
-        d._term_width = term_width
 
         def _cleanup():
-            with patch('sys.stderr', io.StringIO()):
+            with patch('sys.stderr', _FakeTTY()):
                 d.close()
         self.addCleanup(_cleanup)
         return d
@@ -165,7 +185,7 @@ class TestStatusDisplay(unittest.TestCase):
 
     def test_last_rows_updates_after_redraw(self):
         d = self._display(names=('CheckerA',))
-        with patch('sys.stderr', io.StringIO()):
+        with patch('sys.stderr', _FakeTTY()):
             d.start('CheckerA')
         self.assertEqual(d._last_rows, [1])
 
@@ -176,11 +196,11 @@ class TestStatusDisplay(unittest.TestCase):
         of the content about to be printed — otherwise the live display
         drifts out of alignment with what's really there."""
         d = self._display(names=('CheckerA',), term_width=50)
-        with patch('sys.stderr', io.StringIO()):
+        with patch('sys.stderr', _FakeTTY()):
             d.update('CheckerA', 'x' * 40)  # wraps to 2 rows at width 50
         self.assertEqual(d._last_rows, [2])
 
-        buf = io.StringIO()
+        buf = _FakeTTY()
         with patch('sys.stderr', buf):
             d.update('CheckerA', 'short')  # fits in 1 row
         cursor_up_amounts = [int(n) for n in re.findall(r'\x1b\[(\d+)A', buf.getvalue())]
@@ -190,11 +210,38 @@ class TestStatusDisplay(unittest.TestCase):
         )
         self.assertEqual(d._last_rows, [1])
 
+    def test_term_width_refreshed_on_resize_mid_run(self):
+        """A terminal resize between two redraws must be picked up by the
+        next one, not left using the width measured at __init__. The
+        rendered line (name prefix + status, 63 visible chars for this
+        status text) wraps differently depending on which width is
+        actually in effect: 1 row at 80 columns, 2 rows at 40."""
+        d = self._display(names=('CheckerA',), term_width=80)
+        with patch('sys.stderr', _FakeTTY()):
+            d.update('CheckerA', 'x' * 40)
+        self.assertEqual(d._term_width, 80)
+        self.assertEqual(d._last_rows, [1])
+
+        # Simulate the user narrowing their terminal mid-run.
+        narrower = type('R', (), {'columns': 40})()
+        with patch('os.get_terminal_size', return_value=narrower):
+            with patch('sys.stderr', _FakeTTY()):
+                d.update('CheckerA', 'x' * 40)
+        self.assertEqual(
+            d._term_width, 40,
+            'Expected _redraw() to re-measure and pick up the new width',
+        )
+        self.assertEqual(
+            d._last_rows, [2],
+            'The same rendered line should now be computed as wrapping '
+            'to 2 rows at the new, narrower width',
+        )
+
     def test_close_leaves_final_state_visible(self):
         d = self._display(names=('CheckerA',))
-        with patch('sys.stderr', io.StringIO()):
+        with patch('sys.stderr', _FakeTTY()):
             d.finish('CheckerA', 0)
-        buf = io.StringIO()
+        buf = _FakeTTY()
         with patch('sys.stderr', buf):
             d.close()
         self.assertIn('CheckerA', buf.getvalue())
@@ -203,7 +250,7 @@ class TestStatusDisplay(unittest.TestCase):
         """error() is distinct from finish(): it's for a checker crashing,
         not for a normal completion (with or without alerts)."""
         d = self._display(names=('CheckerA',))
-        with patch('sys.stderr', io.StringIO()):
+        with patch('sys.stderr', _FakeTTY()):
             d.error('CheckerA')
         self.assertTrue(d._done['CheckerA'])
         self.assertTrue(d._errored.get('CheckerA'))
@@ -212,7 +259,7 @@ class TestStatusDisplay(unittest.TestCase):
         """The RED color was previously reserved but unused; error() should
         actually render with it, not fall through to the finish() colors."""
         d = self._display(names=('CheckerA',))
-        with patch('sys.stderr', io.StringIO()):
+        with patch('sys.stderr', _FakeTTY()):
             d.error('CheckerA')
         rendered = d._render_line('CheckerA')
         self.assertIn(nt.StatusDisplay._RED, rendered)
@@ -306,6 +353,38 @@ class TestCheckerBase(unittest.TestCase):
         c = self._checker(status='Fedora-Workstation-Live-x86_64-42\n')
         c.check_dir('Fedora-Workstation-Live-x86_64-42')
         self.assertEqual(c.updates, set())
+
+    def test_check_iso_blocks_relative_path_traversal(self):
+        """A scraped name is never opened or read, only checked for
+        existence/size -- but a crafted '../'-laden name could otherwise
+        be used to probe for the existence of arbitrary files on the host,
+        entirely outside iso_dir. Must alert UNSAFE, not ORPHAN/NEW."""
+        c = self._checker()
+        c.check_iso('../../../../../../etc/passwd')
+        self.assertEqual(c.updates, {'UNSAFE:../../../../../../etc/passwd'})
+
+    def test_check_iso_blocks_absolute_path_injection(self):
+        """Path's own '/' operator replaces the left side entirely when
+        the right side is absolute, so a name like '/etc/passwd' escapes
+        iso_dir just as effectively as a relative traversal -- and more
+        directly, since it needs no '../' at all."""
+        c = self._checker()
+        c.check_iso('/etc/passwd')
+        self.assertEqual(c.updates, {'UNSAFE:/etc/passwd'})
+
+    def test_check_dir_blocks_path_traversal(self):
+        """Same protection applies to check_dir(), used by the Fedora and
+        AlmaLinux checkers."""
+        c = self._checker()
+        c.check_dir('../../../../etc')
+        self.assertEqual(c.updates, {'UNSAFE:../../../../etc'})
+
+    def test_check_iso_normal_names_unaffected_by_safety_check(self):
+        """The safety check must not false-positive on any legitimate,
+        ordinary filename."""
+        c = self._checker()
+        c.check_iso('archlinux-2025.06.01-x86_64.iso')
+        self.assertEqual(c.updates, {'NEW:archlinux-2025.06.01-x86_64.iso'})
 
     def test_fetch_failure_increments_counter(self):
         c = self._checker()
