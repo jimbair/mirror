@@ -295,6 +295,14 @@ class Checker(ABC):
                  display: 'StatusDisplay | None' = None) -> None:
         self.iso_dir = iso_dir
         self.status_content = status_content
+        # Precomputed once here rather than re-deriving per _known_to_transmission()
+        # call: status_content's Name column entries are whitespace-delimited,
+        # so splitting on whitespace once up front gives the exact same set
+        # of "whole token" candidates a per-call regex search would find,
+        # but as an O(1) membership test instead of re-compiling and
+        # re-scanning the whole blob for every single ISO/directory checked
+        # (hundreds of times per run for checkers like Debian).
+        self._status_tokens = set(status_content.split())
         self.updates: set[str] = set()
         self._page: str = ''
         self._failures = failures
@@ -331,7 +339,18 @@ class Checker(ABC):
                 if ce == 'gzip':
                     raw = gzip.decompress(raw)
                 elif ce == 'deflate':
-                    raw = zlib.decompress(raw)
+                    # RFC 1950 (zlib-wrapped) is the correct interpretation
+                    # of "deflate", but some servers actually send raw,
+                    # headerless RFC 1951 deflate despite the label.
+                    # zlib.decompress()'s default wbits expects the zlib
+                    # wrapper and raises on raw deflate; retry with
+                    # negative wbits (raw deflate, no header/trailer) if
+                    # the first attempt fails, rather than treating a
+                    # merely-mislabeled body as a fetch failure.
+                    try:
+                        raw = zlib.decompress(raw)
+                    except zlib.error:
+                        raw = zlib.decompress(raw, -zlib.MAX_WBITS)
                 self._page = raw.decode(encoding, errors='replace')
 
             self._debug(f'fetch ok ({len(self._page)} bytes)')
@@ -373,11 +392,12 @@ class Checker(ABC):
         substring test would treat e.g. 'Fedora-Workstation-Live-x86_64-42'
         as already known if only '...-420' were actually present --
         silently hiding a genuinely missing release. status_content's
-        Name column entries are whitespace-delimited, so requiring
-        non-\\S boundaries on both sides is sufficient.
+        Name column entries are whitespace-delimited, so an exact match
+        against the whitespace-split token set (precomputed once in
+        __init__) is equivalent to a whole-token regex search, without
+        recompiling and rescanning per call.
         """
-        pattern = r'(?<!\S)' + re.escape(name) + r'(?!\S)'
-        return re.search(pattern, self.status_content) is not None
+        return name in self._status_tokens
 
     def _safe_path(self, name: str) -> Path | None:
         """Resolve name against iso_dir, or None if the result would
@@ -629,10 +649,11 @@ class CachyChecker(Checker):
         for iso in upstream_isos:
             self.check_iso(iso, f'NEW:CachyOS-{current_release}')
 
+        upstream_set = set(upstream_isos)
         for path in self.iso_dir.glob('cachyos-*.iso'):
             if not path.stat().st_size:
                 continue
-            if path.name not in set(upstream_isos):
+            if path.name not in upstream_set:
                 self.alert(f'STALE:{path.name}')
 
 

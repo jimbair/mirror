@@ -442,6 +442,29 @@ class TestCheckerBase(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual(self.ftrack._counts.get('svc', 0), 1)
 
+    def test_fetch_handles_raw_headerless_deflate(self):
+        """RFC 1950 (zlib-wrapped) is the correct interpretation of a
+        Content-Encoding: deflate response, but some servers actually send
+        raw, headerless RFC 1951 deflate despite the label. zlib.decompress()
+        with default wbits expects the zlib wrapper and raises on this --
+        must fall back to raw deflate (negative wbits) rather than treating
+        a merely-mislabeled-but-valid body as a fetch failure."""
+        import zlib as _zlib
+        c = self._checker()
+        co = _zlib.compressobj(wbits=-15)
+        raw_deflate_body = co.compress(b'hello world' * 50) + co.flush()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = raw_deflate_body
+        mock_resp.headers.get_content_charset.return_value = 'utf-8'
+        mock_resp.headers.get.return_value = 'deflate'
+        with patch('urllib.request.urlopen', return_value=mock_resp):
+            result = c.fetch('https://example.com/x', 'svc')
+        self.assertTrue(result)
+        self.assertIn('hello world', c._page)
+        self.assertEqual(self.ftrack._counts.get('svc', 0), 0)
+
     def test_fetch_handles_unknown_charset(self):
         """LookupError from a garbage charset name in Content-Type must not
         escape fetch() either."""
