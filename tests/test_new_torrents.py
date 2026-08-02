@@ -153,7 +153,11 @@ class _FakeTTY(io.StringIO):
     regardless of what it's set to return."""
 
     def fileno(self) -> int:
-        return 1
+        return 2  # stderr's real fd; StatusDisplay always writes to
+        # sys.stderr, never sys.stdout. os.get_terminal_size is itself
+        # mocked in every test that uses this, so the actual value
+        # returned here is never used for anything -- but it should
+        # still say what it claims to stand in for.
 
 
 class TestStatusDisplay(unittest.TestCase):
@@ -277,6 +281,16 @@ class TestCheckerBase(unittest.TestCase):
         # Use AlmaChecker as a concrete stand-in for the abstract base
         return make_checker(nt.AlmaChecker, self.tmp, status_content=status,
                             failures=self.ftrack)
+
+    @staticmethod
+    def _content_encoding(value):
+        """A headers.get() side_effect scoped to the one real call fetch()
+        makes (headers.get('Content-Encoding', '')), falling back to the
+        caller's own default for any other header. A blanket
+        `.return_value = value` would return that same value for ANY
+        header lookup, silently masking a future refactor that reads a
+        different header through the same mock."""
+        return lambda key, default='': value if key == 'Content-Encoding' else default
 
     def test_check_iso_in_status_no_alert(self):
         """ISO already known to transmission → no alert."""
@@ -402,7 +416,7 @@ class TestCheckerBase(unittest.TestCase):
         mock_resp.__exit__ = MagicMock(return_value=False)
         mock_resp.read.return_value = b'hello world' * 50
         mock_resp.headers.get_content_charset.return_value = 'utf-8'
-        mock_resp.headers.get.return_value = ''
+        mock_resp.headers.get.side_effect = self._content_encoding('')
         with patch('urllib.request.urlopen', return_value=mock_resp):
             c.fetch('https://example.com/x', 'example')
         self.assertEqual(self.ftrack._counts.get('example', 0), 0)
@@ -436,7 +450,7 @@ class TestCheckerBase(unittest.TestCase):
         mock_resp.__exit__ = MagicMock(return_value=False)
         mock_resp.read.return_value = b'not valid zlib data at all'
         mock_resp.headers.get_content_charset.return_value = 'utf-8'
-        mock_resp.headers.get.return_value = 'deflate'
+        mock_resp.headers.get.side_effect = self._content_encoding('deflate')
         with patch('urllib.request.urlopen', return_value=mock_resp):
             result = c.fetch('https://example.com/x', 'svc')
         self.assertFalse(result)
@@ -458,7 +472,7 @@ class TestCheckerBase(unittest.TestCase):
         mock_resp.__exit__ = MagicMock(return_value=False)
         mock_resp.read.return_value = raw_deflate_body
         mock_resp.headers.get_content_charset.return_value = 'utf-8'
-        mock_resp.headers.get.return_value = 'deflate'
+        mock_resp.headers.get.side_effect = self._content_encoding('deflate')
         with patch('urllib.request.urlopen', return_value=mock_resp):
             result = c.fetch('https://example.com/x', 'svc')
         self.assertTrue(result)
@@ -474,7 +488,7 @@ class TestCheckerBase(unittest.TestCase):
         mock_resp.__exit__ = MagicMock(return_value=False)
         mock_resp.read.return_value = b'hello world' * 50
         mock_resp.headers.get_content_charset.return_value = 'totally-bogus-charset'
-        mock_resp.headers.get.return_value = ''
+        mock_resp.headers.get.side_effect = self._content_encoding('')
         with patch('urllib.request.urlopen', return_value=mock_resp):
             result = c.fetch('https://example.com/x', 'svc')
         self.assertFalse(result)
@@ -1145,6 +1159,22 @@ class TestFedoraChecker(unittest.TestCase):
         (self.tmp / 'Fedora-Workstation-Live-x86_64-40').mkdir()
         updates = self._run()
         self.assertIn('DROPPED:Fedora-40', updates)
+
+    def test_stray_directory_without_version_suffix_not_treated_as_dropped(self):
+        """Fedora-*-*/ matches a directory even if its last hyphen-segment
+        isn't actually a version number (e.g. a partial rename leaving
+        behind 'Fedora-Workstation-Live-x86_64', with no trailing -42).
+        rsplit('-', 1)[-1] would extract 'x86_64' and, since that never
+        matches any real tracker version, produce a spurious
+        DROPPED:Fedora-x86_64. Fedora versions are always bare integers
+        (confirmed against the live tracker), so anything non-digit
+        should be silently ignored instead."""
+        (self.tmp / 'Fedora-Workstation-Live-x86_64').mkdir()
+        updates = self._run()
+        self.assertFalse(
+            any(u.startswith('DROPPED:Fedora-x86_64') for u in updates),
+            f'Unexpected spurious DROPPED alert: {updates}',
+        )
 
     def test_stale_directory_alerted(self):
         # Version 41 Workstation exists locally but was removed from the tracker
