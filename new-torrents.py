@@ -377,9 +377,14 @@ class Checker(ABC):
             return False
 
     def body_ok(self, alert_name: str, min_len: int = 250) -> bool:
-        """Return False and alert if self._page is empty or below min_len bytes.
-        A short response usually means a transient error page or a CDN block
-        rather than real content; 250 bytes is safely below any valid index page.
+        """Return False and alert if self._page is empty or below min_len
+        characters. self._page is already decoded to str by this point, so
+        this counts characters, not raw bytes -- for non-ASCII content the
+        two diverge, making this marginally stricter than a byte count
+        would be, but the purpose is just to catch empty/error responses,
+        so that's harmless. A short response usually means a transient
+        error page or a CDN block rather than real content; 250 is safely
+        below any valid index page.
         """
         if not self._page or len(self._page) < min_len:
             self.alert(alert_name)
@@ -725,10 +730,17 @@ class FedoraChecker(Checker):
 
         # Collect versions present in local directories. The trailing slash in
         # the glob pattern ensures we only match directories, not ISO files.
+        # Fedora versions are always bare integers (confirmed against the
+        # real tracker: '42', '43', '44', never dotted or lettered) --
+        # filter to digit-only here so a stray directory missing its
+        # trailing version number (e.g. a partial rename leaving behind
+        # "Fedora-Workstation-Live-x86_64") can't have its last
+        # hyphen-segment ("x86_64") mistaken for a version and produce a
+        # spurious DROPPED:Fedora-x86_64 alert.
         local_versions = {
             dirpath.name.rsplit('-', 1)[-1]
             for dirpath in self.iso_dir.glob('Fedora-*-*/')
-            if dirpath.is_dir()
+            if dirpath.is_dir() and dirpath.name.rsplit('-', 1)[-1].isdigit()
         }
 
         for ver in tracker_versions:
