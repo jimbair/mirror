@@ -11,6 +11,7 @@ import http.client
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -1165,7 +1166,7 @@ def _run() -> int:
         return 1
 
     # Bail early if rsync is missing
-    if subprocess.run(['rsync', '--version'], capture_output=True).returncode != 0:
+    if shutil.which('rsync') is None:
         print('ERROR: Please install rsync to proceed. Exiting.')
         return 1
 
