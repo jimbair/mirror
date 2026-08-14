@@ -976,12 +976,16 @@ class UbuntuChecker(Checker):
 
 
 class ProxmoxChecker(Checker):
-    """Proxmox VE — scrapes the downloads page for ISO version strings.
+    """Proxmox VE — scrapes the downloads page for offered ISO filenames.
+
+    Filenames are taken verbatim from the enterprise.proxmox.com/iso/*.iso
+    download hrefs rather than reconstructed from version strings, so every
+    architecture the page offers (x86_64, arm64) is tracked as its own ISO.
 
     Alerts:
-      NEW:Proxmox-X.Y-Z           - version on page but no local ISO exists
+      NEW:Proxmox-X.Y-Z[-ARCH]    - ISO on page but no local copy exists
       ORPHAN:proxmox-ve_X.Y-Z.iso - ISO on disk but unknown to transmission
-      STALE:proxmox-ve_X.Y-Z.iso  - local ISO superseded by a newer point release
+      STALE:proxmox-ve_X.Y-Z.iso  - local ISO superseded within its major series
       DROPPED:Proxmox-MAJOR       - local ISOs exist for a major absent from the page
     """
 
@@ -992,8 +996,14 @@ class ProxmoxChecker(Checker):
         if not self.body_ok('www.proxmox.com'):
             return
 
-        versions = sorted(
-            set(re.findall(r'\d+\.\d+-\d+', self._page)),
+        # The page's download buttons link the exact ISO filenames, e.g.
+        # https://enterprise.proxmox.com/iso/proxmox-ve_9.2-1-arm64.iso
+        # (plus a sibling .iso.torrent per entry, which the .iso$ anchor
+        # excludes). Parsing hrefs instead of reconstructing names from
+        # version strings keeps every offered architecture in scope.
+        versions = sorted(set(re.findall(
+            r'enterprise\.proxmox\.com/iso/(proxmox-ve_[\w.\-]+\.iso)"',
+            self._page)),
             key=ver_key,
         )
         # Page structure could change; alert and bail if it does
@@ -1001,22 +1011,23 @@ class ProxmoxChecker(Checker):
             self.alert('MALFORMED:Proxmox-Downloads')
             return
 
-        page_majors = {v.split('.')[0] for v in versions}
+        # The extraction regex above guarantees the proxmox-ve_<N> prefix
+        page_majors = {re.match(r'proxmox-ve_(\d+)', v).group(1) for v in versions}
 
-        for ver in versions:
-            self.check_iso(f'proxmox-ve_{ver}.iso', f'NEW:Proxmox-{ver}')
+        for iso in versions:
+            self.check_iso(iso, f'NEW:Proxmox-{iso.removesuffix(".iso")}')
 
         for path in self.iso_dir.glob('proxmox-ve_*.iso'):
             if not path.stat().st_size:
                 continue
-            ver = path.name.removeprefix('proxmox-ve_').removesuffix('.iso')
-            if ver in versions:
+            if path.name in versions:
                 continue
-            major = ver.split('.')[0]
-            if major in page_majors:
+            m = re.match(r'proxmox-ve_(\d+)', path.name)
+            major = m.group(1) if m else None
+            if major and major in page_majors:
                 self.alert(f'STALE:{path.name}')
             else:
-                self.alert(f'DROPPED:Proxmox-{major}')
+                self.alert(f'DROPPED:Proxmox-{major or "unknown"}')
 
 
 class DebianChecker(Checker):
