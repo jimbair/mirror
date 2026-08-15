@@ -1051,7 +1051,13 @@ class TestUbuntuChecker(unittest.TestCase):
 
 # ProxmoxChecker
 
-PROXMOX_PAGE = 'Download Proxmox VE 8.2-1 ISO\nDownload Proxmox VE 8.2-2 ISO\n'
+# The checker scrapes the exact ISO filenames from the download hrefs on the
+# Proxmox downloads page, so the fixture mirrors that real structure
+# (enterprise.proxmox.com/iso/*.iso links) rather than prose.
+PROXMOX_PAGE = (
+    '<a href="https://enterprise.proxmox.com/iso/proxmox-ve_8.2-1.iso">proxmox-ve_8.2-1.iso</a>\n'
+    '<a href="https://enterprise.proxmox.com/iso/proxmox-ve_8.2-2.iso">proxmox-ve_8.2-2.iso</a>\n'
+)
 
 
 class TestProxmoxChecker(unittest.TestCase):
@@ -1067,12 +1073,12 @@ class TestProxmoxChecker(unittest.TestCase):
 
     def test_new_version_alerts(self):
         updates = self._run()
-        self.assertIn('NEW:Proxmox-8.2-1', updates)
-        self.assertIn('NEW:Proxmox-8.2-2', updates)
+        self.assertIn('NEW:Proxmox-proxmox-ve_8.2-1', updates)
+        self.assertIn('NEW:Proxmox-proxmox-ve_8.2-2', updates)
 
     def test_no_alert_when_in_status(self):
         updates = self._run(status='proxmox-ve_8.2-2.iso')
-        self.assertNotIn('NEW:Proxmox-8.2-2', updates)
+        self.assertNotIn('NEW:Proxmox-proxmox-ve_8.2-2', updates)
 
     def test_stale_same_major_alerts(self):
         old = self.tmp / 'proxmox-ve_8.1-1.iso'
