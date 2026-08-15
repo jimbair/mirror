@@ -1073,12 +1073,12 @@ class TestProxmoxChecker(unittest.TestCase):
 
     def test_new_version_alerts(self):
         updates = self._run()
-        self.assertIn('NEW:Proxmox-proxmox-ve_8.2-1', updates)
-        self.assertIn('NEW:Proxmox-proxmox-ve_8.2-2', updates)
+        self.assertIn('NEW:proxmox-ve_8.2-1', updates)
+        self.assertIn('NEW:proxmox-ve_8.2-2', updates)
 
     def test_no_alert_when_in_status(self):
         updates = self._run(status='proxmox-ve_8.2-2.iso')
-        self.assertNotIn('NEW:Proxmox-proxmox-ve_8.2-2', updates)
+        self.assertNotIn('NEW:proxmox-ve_8.2-2', updates)
 
     def test_stale_same_major_alerts(self):
         old = self.tmp / 'proxmox-ve_8.1-1.iso'

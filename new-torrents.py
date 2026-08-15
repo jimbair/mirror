@@ -983,10 +983,10 @@ class ProxmoxChecker(Checker):
     architecture the page offers (x86_64, arm64) is tracked as its own ISO.
 
     Alerts:
-      NEW:Proxmox-proxmox-ve_X.Y-Z[-ARCH] - ISO on page but no local copy exists
-      ORPHAN:proxmox-ve_X.Y-Z.iso        - ISO on disk but unknown to transmission
-      STALE:proxmox-ve_X.Y-Z.iso         - local ISO superseded within its major series
-      DROPPED:Proxmox-MAJOR              - local ISOs exist for a major absent from the page
+      NEW:proxmox-ve_X.Y-Z[-ARCH]  - ISO on page but no local copy exists
+      ORPHAN:proxmox-ve_X.Y-Z.iso - ISO on disk but unknown to transmission
+      STALE:proxmox-ve_X.Y-Z.iso  - local ISO superseded within its major series
+      DROPPED:Proxmox-MAJOR       - local ISOs exist for a major absent from the page
     """
 
     def check(self) -> None:
@@ -1015,7 +1015,7 @@ class ProxmoxChecker(Checker):
         page_majors = {re.match(r'proxmox-ve_(\d+)', v).group(1) for v in versions}
 
         for iso in versions:
-            self.check_iso(iso, f'NEW:Proxmox-{iso.removesuffix(".iso")}')
+            self.check_iso(iso, f'NEW:{iso.removesuffix(".iso")}')
 
         for path in self.iso_dir.glob('proxmox-ve_*.iso'):
             if not path.stat().st_size:
