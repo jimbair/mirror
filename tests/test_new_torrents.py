@@ -1465,7 +1465,7 @@ class TestMain(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.iso_dir = self.tmp / 'Downloads'
 
-    def _run_main(self, extra_patches=None):
+    def _run_main(self, rsync_present=True, extra_patches=None):
         patches = {
             'ISO_DIR': self.iso_dir,
             'STATUS_FILE': self.iso_dir / 'status.txt',
@@ -1475,6 +1475,14 @@ class TestMain(unittest.TestCase):
         if extra_patches:
             patches.update(extra_patches)
         ctx_managers = [patch.object(nt, k, v) for k, v in patches.items()]
+        # _run() bails out early when rsync is absent, so pin shutil.which to a
+        # deterministic value: the suite must behave identically whether or not
+        # the CI image happens to ship rsync (the almalinux:10 container does
+        # not). Default to present so these tests reach the checks under test;
+        # test_missing_rsync_returns_1 opts out with rsync_present=False.
+        ctx_managers.append(patch.object(
+            nt.shutil, 'which',
+            return_value=('/usr/bin/rsync' if rsync_present else None)))
         for ctx in ctx_managers:
             ctx.start()
         try:
@@ -1483,11 +1491,6 @@ class TestMain(unittest.TestCase):
             for ctx in ctx_managers:
                 ctx.stop()
         return ret
-
-    def _rsync_ok(self):
-        m = MagicMock()
-        m.returncode = 0
-        return m
 
     def test_lock_held_by_another_open_prevents_run(self):
         """A distinct open() of the lock file already holding flock() must
@@ -1526,9 +1529,8 @@ class TestMain(unittest.TestCase):
         for p in checker_patches:
             p.start()
         try:
-            with patch('subprocess.run', return_value=self._rsync_ok()):
-                first = self._run_main()
-                second = self._run_main()
+            first = self._run_main()
+            second = self._run_main()
         finally:
             for p in checker_patches:
                 p.stop()
@@ -1578,32 +1580,27 @@ class TestMain(unittest.TestCase):
 
     def test_missing_status_file_returns_1(self):
         self.iso_dir.mkdir()
-        with patch('subprocess.run', return_value=self._rsync_ok()):
-            ret = self._run_main()
+        ret = self._run_main()
         self.assertEqual(ret, 1)
 
     def test_empty_status_file_returns_1(self):
         self.iso_dir.mkdir()
         (self.iso_dir / 'status.txt').write_text('')
-        with patch('subprocess.run', return_value=self._rsync_ok()):
-            ret = self._run_main()
+        ret = self._run_main()
         self.assertEqual(ret, 1)
 
     def test_malformed_status_file_returns_1(self):
         """status.txt without 'Sum:' is rejected."""
         self.iso_dir.mkdir()
         (self.iso_dir / 'status.txt').write_text('some content but no sum line')
-        with patch('subprocess.run', return_value=self._rsync_ok()):
-            ret = self._run_main()
+        ret = self._run_main()
         self.assertEqual(ret, 1)
 
     def test_missing_rsync_returns_1(self):
+        """When rsync is not installed, main() bails out and returns 1."""
         self.iso_dir.mkdir()
         (self.iso_dir / 'status.txt').write_text('Sum: 1')
-        failed = MagicMock()
-        failed.returncode = 1
-        with patch('subprocess.run', return_value=failed):
-            ret = self._run_main()
+        ret = self._run_main(rsync_present=False)
         self.assertEqual(ret, 1)
 
     def test_clean_run_returns_0(self):
@@ -1618,8 +1615,7 @@ class TestMain(unittest.TestCase):
         for p in checker_patches:
             p.start()
         try:
-            with patch('subprocess.run', return_value=self._rsync_ok()):
-                ret = self._run_main()
+            ret = self._run_main()
         finally:
             for p in checker_patches:
                 p.stop()
@@ -1638,8 +1634,7 @@ class TestMain(unittest.TestCase):
         for p in checker_patches:
             p.start()
         try:
-            with patch('subprocess.run', return_value=self._rsync_ok()):
-                ret = self._run_main()
+            ret = self._run_main()
         finally:
             for p in checker_patches:
                 p.stop()
@@ -1664,8 +1659,7 @@ class TestMain(unittest.TestCase):
         for p in checker_patches:
             p.start()
         try:
-            with patch('subprocess.run', return_value=self._rsync_ok()):
-                ret = self._run_main()  # must not raise
+            ret = self._run_main()  # must not raise
         finally:
             for p in checker_patches:
                 p.stop()
@@ -1690,8 +1684,7 @@ class TestMain(unittest.TestCase):
             p.start()
         try:
             buf = io.StringIO()
-            with patch('subprocess.run', return_value=self._rsync_ok()), \
-                 patch('sys.stderr', buf), \
+            with patch('sys.stderr', buf), \
                  patch.object(sys, 'argv', ['new-torrents.py', '--verbose']):
                 ret = self._run_main()
         finally:
@@ -1719,8 +1712,7 @@ class TestMain(unittest.TestCase):
             p.start()
         try:
             buf = io.StringIO()
-            with patch('subprocess.run', return_value=self._rsync_ok()), \
-                 patch('sys.stderr', buf), \
+            with patch('sys.stderr', buf), \
                  patch.object(sys, 'argv', ['new-torrents.py', '--verbose']):
                 ret = self._run_main()
         finally:
