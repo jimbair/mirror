@@ -871,20 +871,26 @@ class UbuntuChecker(Checker):
     moment any other line advances. Each X.Y line is tracked and grouped
     independently instead.
 
-    Canonical keeps every release it has ever served on the tracker,
-    long-dead ones included (12.04.5 has sat there since 2017), so a dead
-    line's unmirrored point release would alert NEW:Ubuntu-VER on every
-    run forever. Each line is therefore cross-checked against Canonical's
-    support schedule (ubuntu.com/project/docs/release-team/list-of-
-    releases/) and lines whose support has ended per _EOL_MODE are dropped
-    before alerting. When the schedule page is unfetchable or unparseable
-    the checker fails open and tracks every line the tracker lists.
+    Canonical keeps past-EOL releases on the tracker (12.04.5 has sat
+    there since 2017), so a past-EOL line's unmirrored point release
+    would alert NEW:Ubuntu-VER on every run. Each line is therefore
+    cross-checked against Canonical's support schedule (ubuntu.com/
+    project/docs/release-team/list-of-releases/) and lines whose support
+    has ended per _EOL_MODE are dropped before alerting. Local ISOs for
+    a past-EOL line that is still listed on the tracker would otherwise
+    be skipped by the stale scan as if they were current, so they are
+    surfaced as EOL:Ubuntu-X.Y instead. When the schedule page is
+    unfetchable or unparseable the checker fails open and tracks every
+    line the tracker lists.
 
     Version-level alerts:
       NEW:Ubuntu-VER   - a line's current point release has no local ISOs yet
       STALE:Ubuntu-VER - local ISOs exist for a point release no longer
                           current within its line (superseded, or the whole
                           line dropped from the tracker)
+      EOL:Ubuntu-X.Y   - local ISOs exist for a release line past EOL per
+                          _EOL_MODE; repeats every run until the local
+                          files are removed
 
     Per-file alerts (only once at least one local ISO matches that line's current version):
       NEW:ISO    - tracker ISO absent from disk and unknown to transmission
@@ -1081,8 +1087,11 @@ class UbuntuChecker(Checker):
 
         # Drop lines whose support has ended per _EOL_MODE; _eol_lines()
         # returns None when the schedule page is unusable, in which case
-        # fail open and track everything.
-        eol_lines = self._eol_lines()
+        # fail open and track everything. `or set()` normalizes that None
+        # to an empty set so the stale scan below can test membership
+        # unconditionally (no EOL flagging when the schedule is unusable
+        # or the mode is 'off').
+        eol_lines = self._eol_lines() or set()
         if eol_lines:
             upstream_versions = {
                 v for v in upstream_versions
@@ -1131,10 +1140,18 @@ class UbuntuChecker(Checker):
 
         upstream_set = set(upstream_isos)
         stale_versions: set[str] = set()
+        eol_lines_present: set[str] = set()
         for path in local_isos:
+            ver = self._version_of(path.name)
+            line = self._line_of(ver) if ver is not None else None
+            if line is not None and line in eol_lines:
+                # Canonical keeps past-EOL ISOs on the tracker, so the
+                # upstream_set skip below would hide them; flag the line
+                # (grouped) until the local files are removed.
+                eol_lines_present.add(line)
+                continue
             if path.name in upstream_set:
                 continue
-            ver = self._version_of(path.name)
             if ver is not None and ver not in current_versions:
                 # Superseded within its line, or the whole line is gone from
                 # the tracker; either way, group instead of one alert per file.
@@ -1151,6 +1168,8 @@ class UbuntuChecker(Checker):
 
         for ver in sorted(stale_versions, key=ver_key):
             self.alert(f'STALE:Ubuntu-{ver}')
+        for line in sorted(eol_lines_present, key=ver_key):
+            self.alert(f'EOL:Ubuntu-{line}')
 
 
 class ProxmoxChecker(Checker):

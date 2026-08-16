@@ -1058,6 +1058,77 @@ class TestUbuntuChecker(unittest.TestCase):
         self.assertEqual(fetched, ['Ubuntu'])
         self.assertIn('NEW:Ubuntu-12.04.5', c.updates)
 
+    def test_local_eol_line_files_alert_grouped(self):
+        """Canonical keeps past-EOL ISOs on the tracker, so local files
+        for a past-EOL line (12.04 in the fixture) are in upstream_set and
+        the stale scan's skip hid them entirely. They must surface as one
+        grouped EOL:Ubuntu-X.Y per line instead -- here both local 12.04.5
+        files collapse into a single alert while the active, fully-mirrored
+        24.04 line stays silent."""
+        page = ('<td>ubuntu-12.04.5-dvd-amd64.iso</td>\n'
+                '<td>ubuntu-12.04.5-dvd-i386.iso</td>\n'
+                '<td>ubuntu-24.04-desktop-amd64.iso</td>\n')
+        for name in ('ubuntu-12.04.5-dvd-amd64.iso',
+                     'ubuntu-12.04.5-dvd-i386.iso',
+                     'ubuntu-24.04-desktop-amd64.iso'):
+            (self.tmp / name).write_bytes(b'x' * 100)
+        updates = self._run(page=page,
+                            status='ubuntu-12.04.5-dvd-amd64.iso '
+                                   'ubuntu-12.04.5-dvd-i386.iso '
+                                   'ubuntu-24.04-desktop-amd64.iso')
+        self.assertEqual(updates, {'EOL:Ubuntu-12.04'})
+
+    def test_local_eol_line_files_not_flagged_when_schedule_unavailable(self):
+        """Fail-open: when the schedule page can't be fetched, _eol_lines()
+        is None, nothing is EOL, and past-EOL local files that are still on
+        the tracker raise nothing -- exactly the pre-filter behavior."""
+        page = ('<td>ubuntu-12.04.5-dvd-amd64.iso</td>\n'
+                '<td>ubuntu-24.04-desktop-amd64.iso</td>\n')
+        for name in ('ubuntu-12.04.5-dvd-amd64.iso',
+                     'ubuntu-24.04-desktop-amd64.iso'):
+            (self.tmp / name).write_bytes(b'x' * 100)
+        c = make_checker(nt.UbuntuChecker, self.tmp,
+                         status_content='ubuntu-12.04.5-dvd-amd64.iso '
+                                        'ubuntu-24.04-desktop-amd64.iso')
+
+        def _fetch(url, name):
+            if name == 'Ubuntu-EOL':
+                return False
+            c._page = page + _PAD
+            return True
+
+        c.fetch = _fetch
+        c.check()
+        self.assertEqual(c.updates, set())
+
+    def test_local_eol_line_files_not_flagged_in_off_mode(self):
+        """'off' mode disables the filter entirely: past-EOL local files
+        that are still on the tracker raise nothing."""
+        nt.UbuntuChecker._EOL_MODE = 'off'
+        self.addCleanup(setattr, nt.UbuntuChecker, '_EOL_MODE', 'hard')
+        page = ('<td>ubuntu-12.04.5-dvd-amd64.iso</td>\n'
+                '<td>ubuntu-24.04-desktop-amd64.iso</td>\n')
+        for name in ('ubuntu-12.04.5-dvd-amd64.iso',
+                     'ubuntu-24.04-desktop-amd64.iso'):
+            (self.tmp / name).write_bytes(b'x' * 100)
+        updates = self._run(page=page,
+                            status='ubuntu-12.04.5-dvd-amd64.iso '
+                                   'ubuntu-24.04-desktop-amd64.iso')
+        self.assertEqual(updates, set())
+
+    def test_local_eol_line_file_off_tracker_alerts_eol_not_stale(self):
+        """If Canonical has also removed a past-EOL line from the tracker,
+        the local file is subsumed into EOL:Ubuntu-X.Y rather than reported
+        as STALE -- same action (delete the files), one fewer alert."""
+        page = '<td>ubuntu-24.04-desktop-amd64.iso</td>\n'
+        for name in ('ubuntu-12.04.5-dvd-amd64.iso',
+                     'ubuntu-24.04-desktop-amd64.iso'):
+            (self.tmp / name).write_bytes(b'x' * 100)
+        updates = self._run(page=page,
+                            status='ubuntu-12.04.5-dvd-amd64.iso '
+                                   'ubuntu-24.04-desktop-amd64.iso')
+        self.assertEqual(updates, {'EOL:Ubuntu-12.04'})
+
     def test_new_release_grouped_per_line_when_nothing_local(self):
         """Ubuntu runs multiple release lines at once (an LTS plus the
         current interim release) — each line's current point release gets
