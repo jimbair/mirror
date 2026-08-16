@@ -21,6 +21,7 @@ import urllib.error
 import zlib
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date
 from pathlib import Path
 
 # Where transmission stores downloaded torrents
@@ -868,8 +869,16 @@ class UbuntuChecker(Checker):
     global "current version" to group around; grouping by the overall max
     would misclassify a perfectly current, unrelated line as stale the
     moment any other line advances. Each X.Y line is tracked and grouped
-    independently instead. Which lines currently exist is read entirely off
-    the tracker page — nothing about LTS/interim status is hardcoded.
+    independently instead.
+
+    Canonical keeps every release it has ever served on the tracker,
+    long-dead ones included (12.04.5 has sat there since 2017), so a dead
+    line's unmirrored point release would alert NEW:Ubuntu-VER on every
+    run forever. Each line is therefore cross-checked against Canonical's
+    support schedule (ubuntu.com/project/docs/release-team/list-of-
+    releases/) and lines whose support has ended per _EOL_MODE are dropped
+    before alerting. When the schedule page is unfetchable or unparseable
+    the checker fails open and tracks every line the tracker lists.
 
     Version-level alerts:
       NEW:Ubuntu-VER   - a line's current point release has no local ISOs yet
@@ -885,9 +894,37 @@ class UbuntuChecker(Checker):
       MISSING:*buntu*.iso      - no Ubuntu-family ISOs found on our disk at all
       MALFORMED:Ubuntu-Tracker - tracker page returned no ISOs, or none had a
                                   parseable version
+      MALFORMED:Ubuntu-EOL     - support-schedule page returned no usable dates
     """
 
     _VERSION_RE = re.compile(r'(\d+\.\d+(?:\.\d+)*)')
+    # Month-year dates as written on the support-schedule page: "Apr 2019",
+    # "Jul 2026", and the day-bearing variants older rows use ("Apr 28,
+    # 2017", "Apr 13th, 2009"). Only month and year are kept; the day is
+    # noise for comparing support windows.
+    _SCHED_DATE_RE = re.compile(
+        r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*'
+        r'(?:\s+\d{1,2}(?:st|nd|rd|th)?\s*,?\s+)?\s*(\d{4})\b',
+        re.IGNORECASE)
+    _SCHED_TABLE_RE = re.compile(r'<table[^>]*>(.*?)</table>',
+                                 re.DOTALL | re.IGNORECASE)
+    _SCHED_ROW_RE   = re.compile(r'<tr[^>]*>(.*?)</tr>',
+                                 re.DOTALL | re.IGNORECASE)
+    _SCHED_CELL_RE  = re.compile(r'<t[dh][^>]*>(.*?)</t[dh]>',
+                                 re.DOTALL | re.IGNORECASE)
+    _SCHED_MONTHS = {
+        'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+        'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+    }
+    # Which tier of Canonical support expiring marks a release line as EOL:
+    #   'standard' - end of standard support (9 months for interim releases)
+    #   'esm'      - end of Expanded Security Maintenance (Ubuntu Pro);
+    #                interims never get ESM and use their standard end
+    #   'hard'     - the last of all tiers, including the paid legacy
+    #                add-on; a line is dropped only when Canonical no
+    #                longer supports it in any form
+    #   'off'      - no filtering; track every line the tracker lists
+    _EOL_MODE = 'hard'
 
     def _version_of(self, filename: str) -> str | None:
         m = self._VERSION_RE.search(filename)
@@ -896,6 +933,128 @@ class UbuntuChecker(Checker):
     def _line_of(self, version: str) -> str:
         """Reduce a full X.Y(.Z) version to its X.Y release line."""
         return '.'.join(version.split('.')[:2])
+
+    # Support-schedule parsing. The page is server-rendered static HTML; the
+    # four tables we care about are identified by their header cells rather
+    # than their position, so a re-ordered layout still parses:
+    #   LTS     - Version|...|End of Standard Support|End of Life
+    #             (one row per point release; the End of Life column is the
+    #             last tier of any kind, i.e. the legacy add-on end)
+    #   ESM     - Version|Detailed ESM coverage|...|End of Life
+    #   LEGACY  - Version|Detailed Legacy coverage|...|End of Life
+    #   PAST    - Version|Code name|...|End of Life
+    #             (interims, whose End of Life is their 9-month standard
+    #             end, plus 12.04's rows, which the LTS table doesn't carry)
+
+    def _sched_cells(self, row_html: str) -> list[str]:
+        """Cell texts of one <tr> row: inner tags stripped, whitespace collapsed."""
+        return [' '.join(re.sub(r'<[^>]+>', ' ', cell).split())
+                for cell in self._SCHED_CELL_RE.findall(row_html)]
+
+    def _sched_ym(self, cell: str) -> tuple[int, int] | None:
+        """First (year, month) found in a schedule cell, else None."""
+        m = self._SCHED_DATE_RE.search(cell)
+        if not m:
+            return None
+        return (int(m.group(2)), self._SCHED_MONTHS[m.group(1).lower()[:3]])
+
+    def _sched_update(self, ends: dict[str, tuple[int, int]], line: str,
+                      ym: tuple[int, int] | None) -> None:
+        """Keep the latest (year, month) per line in ends."""
+        if ym is not None and (line not in ends or ym > ends[line]):
+            ends[line] = ym
+
+    def _eol_lines(self) -> set[str] | None:
+        """Release lines (X.Y) whose Canonical support has ended per
+        _EOL_MODE, parsed off the support-schedule page.
+
+        Returns None when the schedule is unusable (fetch failure or no
+        parseable dates) so the caller falls back to tracking every line
+        the tracker lists. Lines the schedule doesn't mention (upcoming
+        releases, or a restructured page) count as still active — we never
+        drop a line we can't place.
+        """
+        if self._EOL_MODE == 'off':
+            return set()
+        if not self.fetch('https://ubuntu.com/project/docs/release-team/'
+                          'list-of-releases/', 'Ubuntu-EOL'):
+            return None
+
+        std_end: dict[str, tuple[int, int]] = {}  # standard support
+        esm_end: dict[str, tuple[int, int]] = {}  # ESM / Ubuntu Pro
+        max_end: dict[str, tuple[int, int]] = {}  # last tier of any kind
+        lts_lines: set[str] = set()
+
+        for table in self._SCHED_TABLE_RE.findall(self._page):
+            rows = self._SCHED_ROW_RE.findall(table)
+            if not rows:
+                continue
+            header = ' '.join(self._sched_cells(rows[0]))
+            hcols = [' '.join(c.split()).lower()
+                     for c in self._sched_cells(rows[0])]
+            std_col = next((i for i, c in enumerate(hcols)
+                            if 'end of standard support' in c), None)
+            eol_col = next((i for i, c in enumerate(hcols)
+                            if c == 'end of life'), None)
+            if 'End of Standard Support' in header and 'End of Life' in header:
+                kind = 'LTS'
+            elif 'Detailed ESM coverage' in header:
+                kind = 'ESM'
+            elif 'Detailed Legacy coverage' in header:
+                kind = 'LEGACY'
+            elif 'Code name' in header and 'End of Life' in header:
+                kind = 'PAST'
+            else:
+                continue
+            for row in rows[1:]:
+                cells = self._sched_cells(row)
+                if eol_col is None or eol_col >= len(cells):
+                    continue
+                m = re.search(r'(\d{1,2}\.\d{2})', cells[0])
+                if not m:
+                    continue
+                line = m.group(1)
+                eol_ym = self._sched_ym(cells[eol_col])
+                if kind == 'LTS':
+                    lts_lines.add(line)
+                    if std_col is not None and std_col < len(cells):
+                        self._sched_update(std_end, line,
+                                           self._sched_ym(cells[std_col]))
+                    self._sched_update(max_end, line, eol_ym)
+                elif kind == 'ESM':
+                    lts_lines.add(line)
+                    self._sched_update(esm_end, line, eol_ym)
+                    self._sched_update(max_end, line, eol_ym)
+                elif kind == 'LEGACY':
+                    lts_lines.add(line)
+                    self._sched_update(max_end, line, eol_ym)
+                else:  # PAST
+                    self._sched_update(std_end, line, eol_ym)
+                    self._sched_update(max_end, line, eol_ym)
+
+        if not (std_end or esm_end or max_end):
+            # The page yielded no dates at all: structure change (or a
+            # short error shell that still passed fetch()). Alert rather
+            # than silently disabling the filter.
+            self.alert('MALFORMED:Ubuntu-EOL')
+            return None
+
+        now_ym = (date.today().year, date.today().month)
+        eol: set[str] = set()
+        for line in set(std_end) | set(esm_end) | set(max_end):
+            if self._EOL_MODE == 'standard':
+                end = std_end.get(line)
+            elif self._EOL_MODE == 'esm':
+                end = esm_end.get(line)
+                if end is None and line not in lts_lines:
+                    # Interims get no ESM; their standard end is their
+                    # only support window.
+                    end = std_end.get(line)
+            else:  # 'hard'
+                end = max_end.get(line)
+            if end is not None and end < now_ym:
+                eol.add(line)
+        return eol
 
     def check(self) -> None:
         if not self.fetch('https://torrent.ubuntu.com/tracker_index', 'Ubuntu'):
@@ -919,6 +1078,25 @@ class UbuntuChecker(Checker):
         if not upstream_versions:
             self.alert('MALFORMED:Ubuntu-Tracker')
             return
+
+        # Drop lines whose support has ended per _EOL_MODE; _eol_lines()
+        # returns None when the schedule page is unusable, in which case
+        # fail open and track everything.
+        eol_lines = self._eol_lines()
+        if eol_lines:
+            upstream_versions = {
+                v for v in upstream_versions
+                if self._line_of(v) not in eol_lines
+            }
+            if not upstream_versions:
+                # A healthy schedule always leaves the current release
+                # active. If filtering removed every line, the schedule
+                # data is suspect (e.g. a restructured page shifted our
+                # columns); track everything rather than go silent.
+                upstream_versions = {
+                    v for v in (self._version_of(iso) for iso in upstream_isos)
+                    if v is not None
+                }
 
         # Independently find the current (max) point release within each
         # release line — e.g. 24.04.3 and 25.10 can both be current at once.

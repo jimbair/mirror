@@ -892,17 +892,171 @@ UBUNTU_ISOS = [
     'ubuntu-22.04.4-desktop-amd64.iso',
 ]
 
+# Minimal version of Canonical's support-schedule page (ubuntu.com/project/
+# docs/release-team/list-of-releases/), carrying the four table headers
+# _eol_lines() keys on and only the rows the tests need. Dates are the real
+# ones, so the assertions hold regardless of when the suite runs:
+#   26.04 - active in every mode (standard support runs to May 2031)
+#   20.04 - standard ended May 2025, ESM runs to Apr 2030
+#   16.04 - standard and ESM over, legacy add-on runs to Apr 2031
+#   12.04 - past every tier (ESM ended Apr 2019)
+#   24.10 - interim; 9-month standard support ended Jul 2025
+UBUNTU_SCHEDULE_PAGE = (
+    '<table>'
+    '<tr><th>Version</th><th>Code name</th><th>Docs</th><th>Release</th>'
+    '<th>End of Standard Support</th><th>End of Life</th></tr>'
+    '<tr><td>Ubuntu 26.04 LTS</td><td>Resolute Raccoon</td><td>Release notes</td>'
+    '<td>Apr 23, 2026</td><td>May 2031</td><td>Apr 2041</td></tr>'
+    '<tr><td>Ubuntu 20.04 LTS</td><td>Focal Fossa</td><td>Release notes</td>'
+    '<td>Apr 23, 2020</td><td>May 2025</td><td>Apr 2035</td></tr>'
+    '<tr><td>Ubuntu 16.04 LTS</td><td>Xenial Xerus</td><td>Release notes</td>'
+    '<td>Apr 21, 2016</td><td>Apr 2021</td><td>Apr 2031</td></tr>'
+    '</table>'
+    '<table>'
+    '<tr><th>Version</th><th>Detailed ESM coverage</th><th>Start of ESM</th>'
+    '<th># of years</th><th>End of Life</th></tr>'
+    '<tr><td>Ubuntu 20.04 ESM</td><td>SecurityTeam/ESM/20.04</td><td>Jun 2025</td>'
+    '<td>5 years</td><td>Apr 2030</td></tr>'
+    '<tr><td>Ubuntu 16.04 ESM</td><td>SecurityTeam/ESM/16.04</td><td>Apr 2021</td>'
+    '<td>5 years</td><td>Apr 2026</td></tr>'
+    '<tr><td>Ubuntu 12.04 ESM</td><td>SecurityTeam/ESM/12.04</td><td>Apr 28, 2017</td>'
+    '<td>2 years</td><td>Apr 2019</td></tr>'
+    '</table>'
+    '<table>'
+    '<tr><th>Version</th><th>Detailed Legacy coverage</th><th>Start of Legacy</th>'
+    '<th># of years</th><th>End of Life</th></tr>'
+    '<tr><td>Ubuntu 16.04 ESM</td><td>SecurityTeam/ESM/16.04</td><td>Apr 2026</td>'
+    '<td>5 years</td><td>Apr 2031</td></tr>'
+    '</table>'
+    '<table>'
+    '<tr><th>Version</th><th>Code name</th><th>Docs</th><th>Release</th>'
+    '<th>End of Life</th></tr>'
+    '<tr><td>Ubuntu 24.10</td><td>Orchid Ocelot</td><td>Release notes</td>'
+    '<td>Oct 10, 2024</td><td>Jul 2025</td></tr>'
+    '<tr><td>Ubuntu 12.04 LTS</td><td>Precise Pangolin</td><td>Release Notes</td>'
+    '<td>Apr 26, 2012</td><td>Apr 28, 2017</td></tr>'
+    '</table>'
+)
+
 
 class TestUbuntuChecker(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
 
-    def _run(self, status='', page=UBUNTU_PAGE):
+    def _run(self, status='', page=UBUNTU_PAGE, schedule=UBUNTU_SCHEDULE_PAGE):
         c = make_checker(nt.UbuntuChecker, self.tmp, status_content=status)
-        c.fetch = fake_fetch_fn(c, page)
+        # check() fetches twice: tracker page, then the support schedule.
+        c.fetch = fake_fetch_seq(c, [page, schedule])
         c.check()
         return c.updates
+
+    def test_eol_line_not_alerted(self):
+        """A line past the end of every support tier (12.04 in the
+        fixture) is dropped before alerting: its unmirrored point release
+        must not raise NEW:Ubuntu-VER, while a still-active line (26.04)
+        must."""
+        page = ('<td>ubuntu-12.04.5-desktop-i386.iso</td>\n'
+                '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
+        updates = self._run(page=page)
+        self.assertIn('NEW:Ubuntu-26.04', updates)
+        self.assertNotIn('NEW:Ubuntu-12.04.5', updates)
+        self.assertNotIn('MALFORMED:Ubuntu-EOL', updates)
+
+    def test_esm_active_line_not_dropped_in_hard_mode(self):
+        """'hard' mode (the default) only drops a line once every tier,
+        including the paid ESM/legacy add-ons, has ended. In the fixture
+        16.04's standard support and ESM are over but its legacy add-on
+        runs to Apr 2031, so it must stay tracked."""
+        page = ('<td>ubuntu-16.04.7-desktop-amd64.iso</td>\n'
+                '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
+        updates = self._run(page=page)
+        self.assertIn('NEW:Ubuntu-16.04.7', updates)
+        self.assertIn('NEW:Ubuntu-26.04', updates)
+
+    def test_standard_mode_drops_line_past_standard_end(self):
+        """'standard' mode drops 20.04 (standard support ended May 2025 in
+        the fixture) even though its ESM runs to Apr 2030."""
+        nt.UbuntuChecker._EOL_MODE = 'standard'
+        self.addCleanup(setattr, nt.UbuntuChecker, '_EOL_MODE', 'hard')
+        page = ('<td>ubuntu-20.04.6-desktop-amd64.iso</td>\n'
+                '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
+        updates = self._run(page=page)
+        self.assertIn('NEW:Ubuntu-26.04', updates)
+        self.assertNotIn('NEW:Ubuntu-20.04.6', updates)
+
+    def test_esm_mode_drops_line_past_esm_end(self):
+        """'esm' mode drops 16.04 (ESM ended Apr 2026 in the fixture) but
+        keeps 20.04 (ESM to Apr 2030); the interim 24.10 never gets ESM
+        and is dropped at its 9-month standard end (Jul 2025)."""
+        nt.UbuntuChecker._EOL_MODE = 'esm'
+        self.addCleanup(setattr, nt.UbuntuChecker, '_EOL_MODE', 'hard')
+        page = ('<td>ubuntu-16.04.7-desktop-amd64.iso</td>\n'
+                '<td>ubuntu-20.04.6-desktop-amd64.iso</td>\n'
+                '<td>ubuntu-24.10-desktop-amd64.iso</td>\n'
+                '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
+        updates = self._run(page=page)
+        self.assertIn('NEW:Ubuntu-20.04.6', updates)
+        self.assertIn('NEW:Ubuntu-26.04', updates)
+        self.assertNotIn('NEW:Ubuntu-16.04.7', updates)
+        self.assertNotIn('NEW:Ubuntu-24.10', updates)
+
+    def test_schedule_fetch_failure_tracks_everything(self):
+        """When the schedule page can't be fetched the checker fails open:
+        EOL lines are tracked exactly as if the filter didn't exist."""
+        page = ('<td>ubuntu-12.04.5-desktop-i386.iso</td>\n'
+                '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
+        c = make_checker(nt.UbuntuChecker, self.tmp)
+
+        def _fetch(url, name):
+            if name == 'Ubuntu-EOL':
+                return False
+            c._page = page + _PAD
+            return True
+
+        c.fetch = _fetch
+        c.check()
+        self.assertIn('NEW:Ubuntu-12.04.5', c.updates)
+        self.assertIn('NEW:Ubuntu-26.04', c.updates)
+
+    def test_malformed_schedule_alerts_and_fails_open(self):
+        """A schedule page with no parseable tables alerts
+        MALFORMED:Ubuntu-EOL and fails open rather than silently disabling
+        the filter."""
+        page = ('<td>ubuntu-12.04.5-desktop-i386.iso</td>\n'
+                '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
+        updates = self._run(page=page,
+                            schedule='<html><body>no tables here</body></html>')
+        self.assertIn('MALFORMED:Ubuntu-EOL', updates)
+        self.assertIn('NEW:Ubuntu-12.04.5', updates)
+        self.assertIn('NEW:Ubuntu-26.04', updates)
+
+    def test_all_lines_eol_fails_open(self):
+        """If the schedule data ever marked every tracked line EOL -- only
+        possible with corrupt data, since the current release is never
+        EOL -- the checker must track everything rather than go silent."""
+        page = '<td>ubuntu-12.04.5-desktop-i386.iso</td>\n'
+        updates = self._run(page=page)
+        self.assertIn('NEW:Ubuntu-12.04.5', updates)
+
+    def test_off_mode_never_fetches_schedule(self):
+        """'off' mode must not even fetch the schedule page."""
+        nt.UbuntuChecker._EOL_MODE = 'off'
+        self.addCleanup(setattr, nt.UbuntuChecker, '_EOL_MODE', 'hard')
+        page = ('<td>ubuntu-12.04.5-desktop-i386.iso</td>\n'
+                '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
+        c = make_checker(nt.UbuntuChecker, self.tmp)
+        fetched = []
+
+        def _fetch(url, name):
+            fetched.append(name)
+            c._page = page + _PAD
+            return True
+
+        c.fetch = _fetch
+        c.check()
+        self.assertEqual(fetched, ['Ubuntu'])
+        self.assertIn('NEW:Ubuntu-12.04.5', c.updates)
 
     def test_new_release_grouped_per_line_when_nothing_local(self):
         """Ubuntu runs multiple release lines at once (an LTS plus the
