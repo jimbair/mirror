@@ -658,7 +658,7 @@ class CachyChecker(Checker):
 
         upstream_set = set(upstream_isos)
         for path in self.iso_dir.glob('cachyos-*.iso'):
-            if not path.stat().st_size:
+            if not (path.exists() and path.stat().st_size > 0):
                 continue
             if path.name not in upstream_set:
                 self.alert(f'STALE:{path.name}')
@@ -691,7 +691,9 @@ class ArchChecker(Checker):
         self.check_iso(current_iso, f'NEW:Arch-{current_release}')
 
         for path in self.iso_dir.glob('archlinux-*.iso'):
-            if path.stat().st_size and path.name != current_iso:
+            if not (path.exists() and path.stat().st_size > 0):
+                continue
+            if path.name != current_iso:
                 self.alert(f'STALE:{path.name}')
 
 
@@ -1224,7 +1226,7 @@ class ProxmoxChecker(Checker):
             self.check_iso(iso, f'NEW:{iso.removesuffix(".iso")}')
 
         for path in self.iso_dir.glob('proxmox-ve_*.iso'):
-            if not path.stat().st_size:
+            if not (path.exists() and path.stat().st_size > 0):
                 continue
             if path.name in versions:
                 continue

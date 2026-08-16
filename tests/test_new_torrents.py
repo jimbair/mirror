@@ -788,6 +788,15 @@ class TestArchChecker(unittest.TestCase):
         updates = self._run(status='archlinux-2025.06.01-x86_64.iso')
         self.assertNotIn('STALE:archlinux-2024.01.01-x86_64.iso', updates)
 
+    def test_broken_symlink_stale_not_alerted(self):
+        """A dangling symlink is skipped like a zero-byte file: glob()
+        returns it, but stat() would follow the missing target and raise
+        FileNotFoundError, killing the checker mid-scan."""
+        old = self.tmp / 'archlinux-2024.01.01-x86_64.iso'
+        old.symlink_to('no-such-target.iso')
+        updates = self._run(status='archlinux-2025.06.01-x86_64.iso')
+        self.assertNotIn('STALE:archlinux-2024.01.01-x86_64.iso', updates)
+
 
 # CachyChecker
 
@@ -869,6 +878,15 @@ class TestCachyChecker(unittest.TestCase):
     def test_zero_byte_stale_not_alerted(self):
         old = self.tmp / 'cachyos-kde-linux-231101.iso'
         old.write_bytes(b'')
+        updates = self._run(status=' '.join(CACHY_ISOS))
+        self.assertNotIn('STALE:cachyos-kde-linux-231101.iso', updates)
+
+    def test_broken_symlink_stale_not_alerted(self):
+        """A dangling symlink is skipped like a zero-byte file: glob()
+        returns it, but stat() would follow the missing target and raise
+        FileNotFoundError, killing the checker mid-scan."""
+        old = self.tmp / 'cachyos-kde-linux-231101.iso'
+        old.symlink_to('no-such-target.iso')
         updates = self._run(status=' '.join(CACHY_ISOS))
         self.assertNotIn('STALE:cachyos-kde-linux-231101.iso', updates)
 
@@ -1321,6 +1339,15 @@ class TestProxmoxChecker(unittest.TestCase):
     def test_zero_byte_not_alerted(self):
         old = self.tmp / 'proxmox-ve_8.1-1.iso'
         old.write_bytes(b'')
+        updates = self._run(status='proxmox-ve_8.2-2.iso')
+        self.assertNotIn('STALE:proxmox-ve_8.1-1.iso', updates)
+
+    def test_broken_symlink_not_alerted(self):
+        """A dangling symlink is skipped like a zero-byte file: glob()
+        returns it, but stat() would follow the missing target and raise
+        FileNotFoundError, killing the checker mid-scan."""
+        old = self.tmp / 'proxmox-ve_8.1-1.iso'
+        old.symlink_to('no-such-target.iso')
         updates = self._run(status='proxmox-ve_8.2-2.iso')
         self.assertNotIn('STALE:proxmox-ve_8.1-1.iso', updates)
 
