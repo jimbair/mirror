@@ -80,11 +80,18 @@ class FailureTracker:
         return self._counts.get(name, 0) >= self._threshold
 
     def save(self) -> None:
-        """Write counts to disk if they changed. Called once after all checkers finish."""
+        """Write counts to disk if they changed. Called once after all
+        checkers finish, via a same-directory temp file + os.replace()
+        (atomic rename on POSIX): a crash mid-write would otherwise leave
+        a truncated JSON file that _load() silently discards, wiping the
+        very outage counters this file exists to preserve.
+        """
         if not self._dirty:
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(self._counts, indent=2))
+        tmp = self._path.with_name(self._path.name + '.tmp')
+        tmp.write_text(json.dumps(self._counts, indent=2))
+        os.replace(tmp, self._path)
 
     # Internal
 

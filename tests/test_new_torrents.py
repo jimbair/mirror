@@ -143,6 +143,47 @@ class TestFailureTracker(unittest.TestCase):
         t = self._tracker()
         self.assertFalse(t.at_threshold('x'))  # no crash, empty state
 
+    def test_save_leaves_no_temp_file(self):
+        """A successful save cleans up after itself: no temp file
+        remains next to failures.json."""
+        t = self._tracker()
+        t.increment('svc')
+        t.save()
+        self.assertFalse((self.path.parent / (self.path.name + '.tmp')).exists())
+
+    def test_save_replaces_atomically_in_same_directory(self):
+        """save() must commit via os.replace() from a temp file in the
+        target's own directory: rename(2) is atomic on POSIX, and a
+        temp file on another filesystem (e.g. /tmp) would not be."""
+        t = self._tracker()
+        t.increment('svc')
+        with patch('os.replace') as replace:
+            t.save()
+        replace.assert_called_once()
+        tmp, target = replace.call_args[0]
+        self.assertEqual(target, self.path)
+        self.assertEqual(tmp.parent, self.path.parent)
+
+    def test_crash_before_replace_preserves_previous_file(self):
+        """Simulated crash between the temp write and the rename: the
+        previous good file must survive intact. The old code wrote the
+        main file directly, so a mid-write crash truncated it and
+        _load() silently started fresh -- wiping the very outage
+        counters this file exists to preserve."""
+        t = self._tracker()
+        t.increment('svc')
+        t.save()
+        t.increment('svc')
+        with patch('os.replace', side_effect=OSError('simulated crash')):
+            with self.assertRaises(OSError):
+                t.save()
+        self.assertEqual(json.loads(self.path.read_text()), {'svc': 1})
+        # The stale temp from the crashed save is harmless: the next
+        # successful save overwrites it and leaves no trace.
+        t.save()
+        self.assertEqual(json.loads(self.path.read_text()), {'svc': 2})
+        self.assertFalse((self.path.parent / (self.path.name + '.tmp')).exists())
+
 
 class _FakeTTY(io.StringIO):
     """A StringIO that also has a working fileno(). Plain StringIO's
