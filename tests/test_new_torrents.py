@@ -1103,6 +1103,19 @@ class TestProxmoxChecker(unittest.TestCase):
         updates = self._run(page='<html>no versions</html>')
         self.assertIn('MALFORMED:Proxmox-Downloads', updates)
 
+    def test_non_numeric_page_version_does_not_crash(self):
+        """The extraction regex also matches a letter after 'proxmox-ve_',
+        so a malformed upstream filename must be skipped when building
+        page_majors instead of crashing the checker on None.group(1); its
+        own NEW: alert must still fire, and so must the numeric version's."""
+        page = (
+            '<a href="https://enterprise.proxmox.com/iso/proxmox-ve_9.1-1.iso">proxmox-ve_9.1-1.iso</a>\n'
+            '<a href="https://enterprise.proxmox.com/iso/proxmox-ve_beta.iso">proxmox-ve_beta.iso</a>\n'
+        )
+        updates = self._run(page=page)
+        self.assertIn('NEW:proxmox-ve_9.1-1', updates)
+        self.assertIn('NEW:proxmox-ve_beta', updates)
+
 
 # FedoraChecker
 

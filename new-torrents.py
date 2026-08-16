@@ -1011,8 +1011,17 @@ class ProxmoxChecker(Checker):
             self.alert('MALFORMED:Proxmox-Downloads')
             return
 
-        # The extraction regex above guarantees the proxmox-ve_<N> prefix
-        page_majors = {re.match(r'proxmox-ve_(\d+)', v).group(1) for v in versions}
+        # The extraction regex above only guarantees the "proxmox-ve_"
+        # prefix, not a digit right after it (its character class also
+        # matches letters), so a malformed upstream filename (e.g.
+        # "proxmox-ve_beta.iso") must be skipped for major purposes rather
+        # than crash the whole checker on None.group(1) -- the same
+        # tolerance the local-file branch below applies to disk files.
+        page_majors = set()
+        for v in versions:
+            match = re.match(r'proxmox-ve_(\d+)', v)
+            if match:
+                page_majors.add(match.group(1))
 
         for iso in versions:
             self.check_iso(iso, f'NEW:{iso.removesuffix(".iso")}')
