@@ -503,24 +503,38 @@ class Checker(ABC):
 ####################
 
 class MintChecker(Checker):
-    """Linux Mint — scrapes pub.linuxmint.io/stable/ for the current version directory.
+    """Linux Mint — scrapes pub.linuxmint.io/stable/ plus the support page.
 
-    Only one version is ever current (the previous one is retired once a new
-    one ships), so unlike Ubuntu this can group around a single version —
-    same shape as DebianChecker.
+    pub.linuxmint.io/stable/ is a never-pruned archive (every release
+    from 19.3 on is still listed), so it says nothing about which versions
+    are supported; download_all.php is the one-stop anchor, listing only
+    currently supported releases. Each supported version is therefore
+    tracked independently, the same shape as Ubuntu's per-line tracking:
+    a listed version with no local ISOs yet alerts NEW:Linux-Mint-VER,
+    and once any local file exists for it, per-file checks run against
+    its own directory listing (fetched lazily, only when needed). Local
+    ISOs of a version the support page doesn't list are past EOL and are
+    surfaced as EOL:Linux-Mint-VER, repeating every run until the local
+    files are removed. When the support page is unfetchable or
+    unparseable the checker fails open: only the newest version is
+    tracked and nothing counts as past EOL.
 
     Version-level alerts:
-      NEW:Linux-Mint-VER   - current version has no matching ISOs on disk yet
-      STALE:Linux-Mint-VER - local ISOs exist for a version no longer current
+      NEW:Linux-Mint-VER   - a tracked version has no matching ISOs on disk yet
+      EOL:Linux-Mint-VER   - local ISOs exist for a version not listed on
+                             download_all.php; repeats every run until the
+                             local files are removed
 
-    Per-file alerts (only once at least one local ISO matches the current version):
-      NEW:ISO    - current-version ISO absent from disk and unknown to transmission
-      ORPHAN:ISO - current-version ISO present on disk but unknown to transmission
-      STALE:ISO  - current-version (or unparseable) local ISO no longer listed
+    Per-file alerts (only once at least one local ISO matches that version):
+      NEW:ISO    - version ISO absent from disk and unknown to transmission
+      ORPHAN:ISO - version ISO present on disk but unknown to transmission
+      STALE:ISO  - local ISO dropped from its version's listing, or
+                   unparseable
 
       MISSING:linuxmint-*.iso  - no Linux Mint ISOs found on our disk at all
       MALFORMED:Linux-Mint     - stable index returned no version directories
       MALFORMED:Linux-Mint-VER - version directory returned no ISOs
+      MALFORMED:Linux-Mint-Supported - support page returned no version cells
     """
 
     # pub.linuxmint.io ships the very first release of a major with a bare,
@@ -535,6 +549,15 @@ class MintChecker(Checker):
     # major release would loop forever reporting NEW:Linux-Mint-VER since
     # local_current could never match it.
     _VERSION_RE = re.compile(r'^linuxmint-(\d+(?:\.\d+)*)-')
+
+    # download_all.php lists only currently supported releases; each
+    # version sits in its own table cell, e.g. <td rowspan="3">22.3</td>
+    # (a brand-new major uses the bare form, e.g. "21", matching the pub
+    # index and the filenames). The page also carries an LMDE row
+    # (version "7"), which is not a linuxmint release -- its artifacts
+    # are lmde-*.iso under a different archive path -- so check()
+    # intersects the parsed versions with the pub index to drop it.
+    _SUPPORTED_RE = re.compile(r'<td rowspan="\d+">(\d+(?:\.\d+)*)</td>')
 
     def _version_of(self, filename: str) -> str | None:
         m = self._VERSION_RE.search(filename)
@@ -592,21 +615,76 @@ class MintChecker(Checker):
                 self.check_iso(iso)
 
         upstream_set = set(upstream_isos)
-        stale_versions: set[str] = set()
+
+        # download_all.php is the one-stop support anchor: it lists only
+        # currently supported releases. Each listed version is tracked:
+        # one with no local ISOs yet alerts NEW:Linux-Mint-VER, and once
+        # any local file exists for it, per-file checks run against its
+        # own directory (fetched lazily, so an unmirrored version costs
+        # no extra request). Local ISOs of a version the page doesn't
+        # list are past EOL and surface as EOL:Linux-Mint-VER, repeating
+        # every run until the local files are removed.
+        supported: set[str] | None = None
+        if self.fetch('https://linuxmint.com/download_all.php',
+                      'Linux-Mint-Supported'):
+            found = set(re.findall(self._SUPPORTED_RE, self._page))
+            if found:
+                # Intersect with the pub index: the page also carries an
+                # LMDE row (version "7"), which is not a linuxmint
+                # release and would otherwise loop reporting
+                # NEW:Linux-Mint-7 on every run.
+                supported = found & set(versions)
+            else:
+                self.alert('MALFORMED:Linux-Mint-Supported')
+        # supported stays None when the page is unusable: fail open --
+        # only current is tracked and nothing counts as past EOL.
+
+        if supported is not None:
+            for ver in sorted(supported - {current}, key=ver_key):
+                local_ver = [p for p in local_isos
+                             if self._version_of(p.name) == ver]
+                if not local_ver:
+                    # Supported, but nothing mirrored for it yet.
+                    self.alert(f'NEW:Linux-Mint-{ver}')
+                    continue
+                if not self.fetch(f'https://pub.linuxmint.io/stable/{ver}/',
+                                  'Linux-Mint-VER'):
+                    continue
+                if not self.body_ok('pub.linuxmint.io'):
+                    continue
+                isos = sorted(re.findall(r'href="(linuxmint-[^"]+\.iso)"',
+                                         self._page))
+                if not isos:
+                    # Directory exists but lists no ISOs; structure drift.
+                    self.alert(f'MALFORMED:Linux-Mint-{ver}')
+                    continue
+                for iso in isos:
+                    self.check_iso(iso)
+                listed = set(isos)
+                for path in local_ver:
+                    if path.name not in listed:
+                        # Dropped from this version's listing; keep visible
+                        # individually.
+                        self.alert(f'STALE:{path.name}')
+
+        eol_versions: set[str] = set()
         for path in local_isos:
             if path.name in upstream_set:
                 continue
             ver = self._version_of(path.name)
-            if ver is not None and ver != current:
-                # Whole prior release superseded; group instead of one alert per file.
-                stale_versions.add(ver)
-            else:
-                # Current-version (or unparseable) file dropped from the listing;
-                # unusual enough to keep visible individually.
+            if ver is None:
+                # Unparseable local file; keep visible individually.
                 self.alert(f'STALE:{path.name}')
+            elif ver == current:
+                # Current-version file dropped from the listing; unusual
+                # enough to keep visible individually.
+                self.alert(f'STALE:{path.name}')
+            elif supported is not None and ver not in supported:
+                # Past EOL per download_all.php; group per version.
+                eol_versions.add(ver)
 
-        for ver in sorted(stale_versions, key=ver_key):
-            self.alert(f'STALE:Linux-Mint-{ver}')
+        for ver in sorted(eol_versions, key=ver_key):
+            self.alert(f'EOL:Linux-Mint-{ver}')
 
 
 class CachyChecker(Checker):

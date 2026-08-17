@@ -630,6 +630,25 @@ MINT_VER = (
 
 MINT_ISOS = ['linuxmint-22.0-cinnamon-64bit.iso', 'linuxmint-22.0-mate-64bit.iso']
 
+# download_all.php support-page fixtures. Each supported release takes
+# one table row; the version cell is <td rowspan="3">X.Y</td> (bare
+# form for a brand-new major). The codename cells are not parsed.
+MINT_SUPPORTED = '<td rowspan="3">22.0</td><td rowspan="3">Wilma</td>'
+MINT_SUPPORTED_BOTH = (
+    '<td rowspan="3">22.0</td><td rowspan="3">Wilma</td>'
+    '<td rowspan="3">21.3</td><td rowspan="3">Uma</td>'
+)
+# The same page also carries an LMDE row (version "7"); "7" never
+# appears in the pub index, so check() must filter it out.
+MINT_SUPPORTED_LMDE = (
+    '<td rowspan="3">22.0</td><td rowspan="3">Wilma</td>'
+    '<td rowspan="3">7</td><td rowspan="3">Gigi</td>'
+)
+MINT_VER_21_3 = (
+    '<a href="linuxmint-21.3-cinnamon-64bit.iso">linuxmint-21.3-cinnamon-64bit.iso</a>'
+    '<a href="linuxmint-21.3-mate-64bit.iso">linuxmint-21.3-mate-64bit.iso</a>'
+)
+
 
 class TestMintChecker(unittest.TestCase):
 
@@ -638,19 +657,25 @@ class TestMintChecker(unittest.TestCase):
 
     def _run(self, status='', pages=None):
         if pages is None:
-            pages = [MINT_INDEX, MINT_VER]
+            # Default: index, current version's directory, then the
+            # support page. Tests exercising per-version tracking pass a
+            # longer sequence; each listed version with local files
+            # appends its own directory page in ascending version order.
+            pages = [MINT_INDEX, MINT_VER, MINT_SUPPORTED]
         c = make_checker(nt.MintChecker, self.tmp, status_content=status)
         c.fetch = fake_fetch_seq(c, pages)
         c.check()
         return c.updates
 
     def test_version_bump_grouped_not_per_file(self):
-        """A version bump collapses to one grouped NEW/STALE instead of one
-        per edition."""
+        """A version bump collapses to one grouped NEW for the new
+        release plus one grouped EOL for the old release's local files
+        (unlisted on the support page), instead of one alert per
+        edition."""
         for ed in ('cinnamon', 'mate'):
             (self.tmp / f'linuxmint-21.3-{ed}-64bit.iso').write_bytes(b'x' * 100)
         updates = self._run()
-        self.assertEqual(updates, {'NEW:Linux-Mint-22.0', 'STALE:Linux-Mint-21.3'})
+        self.assertEqual(updates, {'NEW:Linux-Mint-22.0', 'EOL:Linux-Mint-21.3'})
 
     def test_no_alert_when_current_version_fully_present(self):
         for iso in MINT_ISOS:
@@ -733,16 +758,24 @@ class TestMintChecker(unittest.TestCase):
             '<a href="23/">23/</a>'
         )
         v23_page = '<a href="linuxmint-23-cinnamon-64bit.iso">linuxmint-23-cinnamon-64bit.iso</a>'
+        # The support page still lists 22.3 alongside the new bare
+        # major; 22.3's own directory page lists the two local files, so
+        # the per-version scan finds nothing new or dropped.
+        support_22_3_and_23 = (
+            '<td rowspan="3">22.3</td><td rowspan="3">Tessa</td>'
+            '<td rowspan="3">23</td><td rowspan="3">Vera</td>'
+        )
+        v22_3_page = (
+            '<a href="linuxmint-22.3-cinnamon-64bit.iso">linuxmint-22.3-cinnamon-64bit.iso</a>'
+            '<a href="linuxmint-22.3-mate-64bit.iso">linuxmint-22.3-mate-64bit.iso</a>'
+        )
         for iso in ('linuxmint-22.3-cinnamon-64bit.iso', 'linuxmint-22.3-mate-64bit.iso'):
             (self.tmp / iso).write_bytes(b'x' * 100)
         updates = self._run(
             status='linuxmint-22.3-cinnamon-64bit.iso linuxmint-22.3-mate-64bit.iso',
-            pages=[bare_major_index, v23_page],
+            pages=[bare_major_index, v23_page, support_22_3_and_23, v22_3_page],
         )
-        self.assertIn(
-            'NEW:Linux-Mint-23', updates,
-            f'New bare-major release 23 went undetected: {updates}',
-        )
+        self.assertEqual(updates, {'NEW:Linux-Mint-23'})
 
     def test_bare_major_directory_with_no_isos_yet_alerts_rather_than_silence(self):
         """Even in the narrower window where the new major's own directory
@@ -781,9 +814,163 @@ class TestMintChecker(unittest.TestCase):
         )
         for iso in ('linuxmint-23-cinnamon-64bit.iso', 'linuxmint-23-mate-64bit.iso'):
             (self.tmp / iso).write_bytes(b'x' * 100)
+        # The support page lists only the new major; a 22.3 row would
+        # add a NEW:Linux-Mint-22.3 alert (no local 22.3 files here).
+        support_23_only = '<td rowspan="3">23</td><td rowspan="3">Vera</td>'
         updates = self._run(
             status='linuxmint-23-cinnamon-64bit.iso linuxmint-23-mate-64bit.iso',
-            pages=[bare_major_index, v23_page],
+            pages=[bare_major_index, v23_page, support_23_only],
+        )
+        self.assertEqual(updates, set())
+
+    def test_unlisted_version_locals_alert_grouped_eol(self):
+        """Local ISOs for a version the support page no longer lists are
+        past EOL: one grouped alert per version, not one per file."""
+        for iso in MINT_ISOS:
+            (self.tmp / iso).write_bytes(b'x' * 100)
+        for ed in ('cinnamon', 'mate'):
+            (self.tmp / f'linuxmint-20.3-{ed}-64bit.iso').write_bytes(b'x' * 100)
+        updates = self._run(status=' '.join(MINT_ISOS))
+        self.assertEqual(updates, {'EOL:Linux-Mint-20.3'})
+
+    def test_still_supported_version_fully_mirrored_is_silent(self):
+        """Regression for the old grouped STALE: a version still listed
+        on the support page used to alert STALE:Linux-Mint-VER the
+        moment a newer current shipped, even with every local file
+        present and tracked; it is now tracked per-version and reports
+        nothing."""
+        local = MINT_ISOS + [
+            'linuxmint-21.3-cinnamon-64bit.iso',
+            'linuxmint-21.3-mate-64bit.iso',
+        ]
+        for iso in local:
+            (self.tmp / iso).write_bytes(b'x' * 100)
+        updates = self._run(
+            status=' '.join(local),
+            pages=[MINT_INDEX, MINT_VER, MINT_SUPPORTED_BOTH, MINT_VER_21_3],
+        )
+        self.assertEqual(updates, set())
+
+    def test_supported_version_not_yet_mirrored_alerts_new_without_fetch(self):
+        """A listed version with no local ISOs alerts NEW:Linux-Mint-VER
+        and must not fetch its directory; the page sequence deliberately
+        ends at the support page, so any over-fetch raises StopIteration."""
+        for iso in MINT_ISOS:
+            (self.tmp / iso).write_bytes(b'x' * 100)
+        updates = self._run(
+            status=' '.join(MINT_ISOS),
+            pages=[MINT_INDEX, MINT_VER, MINT_SUPPORTED_BOTH],
+        )
+        self.assertEqual(updates, {'NEW:Linux-Mint-21.3'})
+
+    def test_supported_version_partially_mirrored_checks_per_file(self):
+        """Once any local file exists for a listed version, its directory
+        is fetched lazily and per-file checks run against it: the
+        missing edition surfaces by name instead of waiting on the
+        group."""
+        local = MINT_ISOS + ['linuxmint-21.3-cinnamon-64bit.iso']
+        for iso in local:
+            (self.tmp / iso).write_bytes(b'x' * 100)
+        updates = self._run(
+            status=' '.join(local),
+            pages=[MINT_INDEX, MINT_VER, MINT_SUPPORTED_BOTH, MINT_VER_21_3],
+        )
+        self.assertEqual(updates, {'NEW:linuxmint-21.3-mate-64bit.iso'})
+
+    def test_supported_version_dir_fetch_failure_stays_silent(self):
+        """A failed directory fetch for one supported version skips only
+        that version (fail-open per version); the other versions' alerts
+        still fire and the run does not crash. The interception is by URL
+        because every version directory shares the 'Linux-Mint-VER'
+        failure-tracker name."""
+        index = (
+            '<a href="19.3/">19.3/</a>'
+            '<a href="20.3/">20.3/</a>'
+            '<a href="21.3/">21.3/</a>'
+            '<a href="22.0/">22.0/</a>'
+        )
+        support = (
+            '<td rowspan="3">22.0</td><td rowspan="3">Wilma</td>'
+            '<td rowspan="3">21.3</td><td rowspan="3">Uma</td>'
+            '<td rowspan="3">20.3</td><td rowspan="3">Diana</td>'
+        )
+        local = MINT_ISOS + [
+            'linuxmint-21.3-cinnamon-64bit.iso',
+            'linuxmint-19.3-cinnamon-64bit.iso',
+        ]
+        for iso in local:
+            (self.tmp / iso).write_bytes(b'x' * 100)
+        c = make_checker(nt.MintChecker, self.tmp,
+                         status_content=' '.join(local))
+        seq = fake_fetch_seq(c, [index, MINT_VER, support])
+
+        def _fetch(url, name):
+            if '21.3' in url:
+                return False
+            return seq(url, name)
+
+        c.fetch = _fetch
+        c.check()
+        self.assertEqual(
+            c.updates, {'NEW:Linux-Mint-20.3', 'EOL:Linux-Mint-19.3'})
+
+    def test_support_page_unparseable_alerts_and_fails_open(self):
+        """A support page with no version cells alerts MALFORMED and
+        fails open: only the current version is tracked and no local
+        file is flagged past EOL, since support is now unknown rather
+        than disproven."""
+        for iso in MINT_ISOS:
+            (self.tmp / iso).write_bytes(b'x' * 100)
+        (self.tmp / 'linuxmint-20.3-cinnamon-64bit.iso').write_bytes(b'x' * 100)
+        updates = self._run(
+            status=' '.join(MINT_ISOS),
+            pages=[MINT_INDEX, MINT_VER, '<html>no version cells here</html>'],
+        )
+        self.assertEqual(updates, {'MALFORMED:Linux-Mint-Supported'})
+
+    def test_support_page_fetch_failure_fails_open_silently(self):
+        """An unfetchable support page fails open without alerting:
+        nothing is flagged past EOL and the run does not crash. Keyed by
+        fetch name rather than URL because the support page has its own
+        'Linux-Mint-Supported' tracker name, unlike the version
+        directories which all share 'Linux-Mint-VER'."""
+        for iso in MINT_ISOS:
+            (self.tmp / iso).write_bytes(b'x' * 100)
+        (self.tmp / 'linuxmint-20.3-cinnamon-64bit.iso').write_bytes(b'x' * 100)
+        c = make_checker(nt.MintChecker, self.tmp,
+                         status_content=' '.join(MINT_ISOS))
+        seq = fake_fetch_seq(c, [MINT_INDEX, MINT_VER, MINT_SUPPORTED])
+
+        def _fetch(url, name):
+            if name == 'Linux-Mint-Supported':
+                return False
+            return seq(url, name)
+
+        c.fetch = _fetch
+        c.check()
+        self.assertEqual(c.updates, set())
+
+    def test_unparseable_local_file_alerts_stale_by_name(self):
+        """A local linuxmint-*.iso whose name carries no recognizable
+        version can't be attributed to any tracked version, so it
+        surfaces individually as STALE rather than being swallowed by a
+        version-level alert."""
+        for iso in MINT_ISOS:
+            (self.tmp / iso).write_bytes(b'x' * 100)
+        (self.tmp / 'linuxmint-broken.iso').write_bytes(b'x' * 100)
+        updates = self._run(status=' '.join(MINT_ISOS))
+        self.assertEqual(updates, {'STALE:linuxmint-broken.iso'})
+
+    def test_lmde_row_on_support_page_is_filtered_out(self):
+        """The support page also carries an LMDE row (version "7"); "7"
+        never appears in the pub index, so check() must drop it via the
+        intersection -- otherwise a new LMDE release would loop
+        reporting NEW:Linux-Mint-7 on every run."""
+        for iso in MINT_ISOS:
+            (self.tmp / iso).write_bytes(b'x' * 100)
+        updates = self._run(
+            status=' '.join(MINT_ISOS),
+            pages=[MINT_INDEX, MINT_VER, MINT_SUPPORTED_LMDE],
         )
         self.assertEqual(updates, set())
 
