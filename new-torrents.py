@@ -5,6 +5,7 @@
 # This script runs once an hour via cron and raises alerts via healthchecks.io
 # We send the output as a POST to /fail in the event of a non-zero exit.
 
+import argparse
 import fcntl
 import gzip
 import http.client
@@ -1460,10 +1461,77 @@ CHECKERS: list[type[Checker]] = [
 ]
 
 
-def _run() -> int:
+def _short_name(cls: type[Checker]) -> str:
+    """'MintChecker' -> 'mint': the short command-line selector for a
+    checker (the full class name is accepted as well)."""
+    return cls.__name__.removesuffix('Checker').lower()
+
+
+def _resolve_checker(name: str | None) -> type[Checker] | None:
+    """Map a command-line selector to its checker class.
+
+    None (no argument given) means the full suite. Otherwise name is
+    matched case-insensitively against the CHECKERS entries, accepting
+    either the full class name (MintChecker) or the short name (mint).
+    CHECKERS is the single source of truth, so a checker added there
+    becomes selectable without touching this. An unknown name raises
+    ValueError listing the valid selectors.
+    """
+    if name is None:
+        return None
+    wanted = name.lower()
+    for cls in CHECKERS:
+        if wanted in (cls.__name__.lower(), _short_name(cls)):
+            return cls
+    valid = ', '.join(_short_name(cls) for cls in CHECKERS)
+    raise ValueError(f"unknown checker '{name}' (choose from: {valid})")
+
+
+def _checkers_epilogue() -> str:
+    """The --help 'available checkers' list. Generated from CHECKERS and
+    each class docstring's first line so it can't drift from reality."""
+    lines = ['available checkers:']
+    for cls in CHECKERS:
+        first = (cls.__doc__ or '').strip().splitlines()[0]
+        lines.append(f'  {_short_name(cls):<8} {first}')
+    return '\n'.join(lines)
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    """Parse and validate the command line.
+
+    Returns a namespace with .checker_cls (None for the full suite) and
+    .verbose. Raises ValueError for an unknown checker name; argparse
+    itself raises SystemExit(2) on other usage errors and SystemExit(0)
+    after printing help for --help.
+    """
+    parser = argparse.ArgumentParser(
+        prog='new-torrents.py',
+        description='Check for new ISO torrents to mirror on mirror.tsue.net.',
+        epilog=_checkers_epilogue(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        'checker',
+        nargs='?',
+        metavar='CHECKER',
+        help='run only this checker (e.g. mint); default: run all of them',
+    )
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='show the live per-checker status display (default: on when '
+             'stderr is a terminal, off under cron)',
+    )
+    args = parser.parse_args(argv)
+    args.checker_cls = _resolve_checker(args.checker)
+    return args
+
+
+def _run(args: argparse.Namespace) -> int:
     """The actual check logic. Split out from main() so main() can focus
-    purely on the lockfile, and so this can be called only once the lock
-    is safely held."""
+    purely on argument parsing and the lockfile, and so this can be
+    called only once the lock is safely held."""
     # Bail early if the download directory is missing
     if not ISO_DIR.is_dir():
         print(f'ERROR: transmission download directory {ISO_DIR} is missing. Exiting.')
@@ -1486,13 +1554,17 @@ def _run() -> int:
         print(f'ERROR: status.txt appears malformed at {STATUS_FILE}. Exiting.')
         return 1
 
-    # Run all checkers concurrently. Show the live status display when running
-    # interactively or when --verbose is passed; cron gets quiet output.
-    interactive = sys.stderr.isatty() or '--verbose' in sys.argv
-    names = [cls.__name__ for cls in CHECKERS]
+    # Run the selected checker(s) concurrently. Show the live status
+    # display when running interactively or when --verbose is passed;
+    # cron gets quiet output.
+    checkers = [args.checker_cls] if args.checker_cls is not None else CHECKERS
+    interactive = sys.stderr.isatty() or args.verbose
+    names = [cls.__name__ for cls in checkers]
     display = StatusDisplay(names) if interactive else None
     failures = FailureTracker(FAIL_FILE, FAIL_THRESHOLD)
-    instances = [cls(ISO_DIR, status_content, failures, display) for cls in CHECKERS]
+    instances = [
+        cls(ISO_DIR, status_content, failures, display) for cls in checkers
+    ]
     all_updates: set[str] = set()
 
     with ThreadPoolExecutor(max_workers=len(instances)) as pool:
@@ -1516,8 +1588,13 @@ def _run() -> int:
     return 0
 
 
-def main() -> int:
-    """Acquire the lockfile, then run the actual checks.
+def main(argv: list[str] | None = None) -> int:
+    """Parse arguments, acquire the lockfile, then run the actual checks.
+
+    argv defaults to sys.argv[1:] when omitted; tests pass it explicitly
+    so they never inherit the test runner's own arguments. Arguments are
+    parsed before the lock is touched: --help and usage errors (e.g. an
+    unknown checker name) shouldn't need -- or create -- a lockfile.
 
     A held lock means either a legitimate overlap (a manual run colliding
     with cron) or a prior invocation stuck far longer than it should be --
@@ -1528,6 +1605,12 @@ def main() -> int:
     on-disk content, so it can't go stale across a crash, kill -9, or
     reboot the way a hand-rolled PID file could.
     """
+    try:
+        args = _parse_args(sys.argv[1:] if argv is None else argv)
+    except ValueError as e:
+        print(f'ERROR: {e}. Exiting.', file=sys.stderr)
+        return 2
+
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     lock_fd = open(LOCK_FILE, 'w')
     try:
@@ -1540,7 +1623,7 @@ def main() -> int:
     lock_fd.write(str(os.getpid()))
     lock_fd.flush()
     try:
-        return _run()
+        return _run(args)
     finally:
         lock_fd.close()
 

@@ -1964,7 +1964,7 @@ class TestMain(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.iso_dir = self.tmp / 'Downloads'
 
-    def _run_main(self, rsync_present=True, extra_patches=None):
+    def _run_main(self, rsync_present=True, argv=None, extra_patches=None):
         patches = {
             'ISO_DIR': self.iso_dir,
             'STATUS_FILE': self.iso_dir / 'status.txt',
@@ -1985,7 +1985,9 @@ class TestMain(unittest.TestCase):
         for ctx in ctx_managers:
             ctx.start()
         try:
-            ret = nt.main()
+            # Explicit argv (default []) so the test runner's own
+            # command line never leaks into argument parsing.
+            ret = nt.main(argv=argv if argv is not None else [])
         finally:
             for ctx in ctx_managers:
                 ctx.stop()
@@ -2183,9 +2185,8 @@ class TestMain(unittest.TestCase):
             p.start()
         try:
             buf = io.StringIO()
-            with patch('sys.stderr', buf), \
-                 patch.object(sys, 'argv', ['new-torrents.py', '--verbose']):
-                ret = self._run_main()
+            with patch('sys.stderr', buf):
+                ret = self._run_main(argv=['--verbose'])
         finally:
             for p in checker_patches:
                 p.stop()
@@ -2211,9 +2212,8 @@ class TestMain(unittest.TestCase):
             p.start()
         try:
             buf = io.StringIO()
-            with patch('sys.stderr', buf), \
-                 patch.object(sys, 'argv', ['new-torrents.py', '--verbose']):
-                ret = self._run_main()
+            with patch('sys.stderr', buf):
+                ret = self._run_main(argv=['--verbose'])
         finally:
             for p in checker_patches:
                 p.stop()
@@ -2223,6 +2223,81 @@ class TestMain(unittest.TestCase):
             buf.getvalue().endswith('\n\n'),
             f'Expected a separating blank line before the alerts: {buf.getvalue()!r}',
         )
+
+    def test_help_exits_zero_and_lists_all_checkers(self):
+        """--help prints usage plus the generated available-checkers
+        list (one entry per CHECKERS element) and exits 0, argparse's
+        convention for a successful help request."""
+        buf = io.StringIO()
+        with patch('sys.stdout', buf), \
+             self.assertRaises(SystemExit) as cm:
+            nt._parse_args(['--help'])
+        self.assertEqual(cm.exception.code, 0)
+        out = buf.getvalue()
+        self.assertIn('usage:', out)
+        for cls in nt.CHECKERS:
+            self.assertIn(cls.__name__.removesuffix('Checker').lower(), out)
+
+    def test_unknown_checker_name_is_usage_error_before_lock(self):
+        """An unknown checker name is a usage error (exit 2, valid
+        selectors listed) and must be rejected before the lock is
+        acquired -- a failed invocation must not create the lockfile."""
+        buf = io.StringIO()
+        with patch('sys.stderr', buf):
+            ret = nt.main(argv=['definitely-not-a-checker'])
+        self.assertEqual(ret, 2)
+        out = buf.getvalue()
+        self.assertIn("unknown checker 'definitely-not-a-checker'", out)
+        self.assertIn('choose from:', out)
+        self.assertFalse((self.tmp / 'lock').exists())
+
+    def test_resolve_checker_accepts_short_and_class_names(self):
+        """The selector is case-insensitive and accepts the short name
+        as well as the full class name; None selects the full suite."""
+        for name in ('mint', 'Mint', 'MintChecker', 'MINTCHECKER'):
+            self.assertIs(nt._resolve_checker(name), nt.MintChecker)
+        self.assertIs(nt._resolve_checker(None), None)
+
+    def test_resolve_checker_unknown_name_lists_valid_selectors(self):
+        """The ValueError message must name every valid selector so the
+        error alone tells the user what to type instead."""
+        with self.assertRaises(ValueError) as cm:
+            nt._resolve_checker('debian-edu')
+        for cls in nt.CHECKERS:
+            self.assertIn(
+                cls.__name__.removesuffix('Checker').lower(), str(cm.exception))
+
+    def test_single_checker_selector_runs_only_that_checker(self):
+        """'mint' selects only MintChecker: no other checker's run() is
+        invoked, and the selected checker's alerts still drive the exit
+        code and the alert output."""
+        self.iso_dir.mkdir()
+        (self.iso_dir / 'status.txt').write_text('Sum: 1')
+        called: list[str] = []
+
+        def run_for(cls):
+            def run(self_inner):
+                called.append(cls.__name__)
+                if cls is nt.MintChecker:
+                    return {'NEW:linuxmint-test.iso'}
+                return set()
+            return run
+
+        checker_patches = [
+            patch.object(cls, 'run', run_for(cls)) for cls in nt.CHECKERS]
+        for p in checker_patches:
+            p.start()
+        try:
+            out = io.StringIO()
+            with patch('sys.stdout', out):
+                ret = self._run_main(argv=['mint'])
+        finally:
+            for p in checker_patches:
+                p.stop()
+
+        self.assertEqual(ret, 1)
+        self.assertEqual(called, ['MintChecker'])
+        self.assertIn('NEW:linuxmint-test.iso', out.getvalue())
 
 
 class TestVerKey(unittest.TestCase):
