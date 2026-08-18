@@ -504,7 +504,7 @@ class Checker(ABC):
 ####################
 
 class MintChecker(Checker):
-    """Linux Mint — scrapes pub.linuxmint.io/stable/ plus the support page.
+    """Linux Mint — every supported release from download_all.php; local copies of past-EOL versions flagged EOL.
 
     pub.linuxmint.io/stable/ is a never-pruned archive (every release
     from 19.3 on is still listed), so it says nothing about which versions
@@ -689,7 +689,7 @@ class MintChecker(Checker):
 
 
 class CachyChecker(Checker):
-    """CachyOS — scrapes cachyos.org/download/ for HTML-entity-encoded torrent URLs.
+    """CachyOS — the current release from cachyos.org/download/; superseded local ISOs go stale.
 
     Alerts:
       NEW:CachyOS-YYMMDD          - current release not present on local disk
@@ -751,7 +751,7 @@ class CachyChecker(Checker):
 
 
 class ArchChecker(Checker):
-    """Arch Linux — scrapes archlinux.org/download/ for the current release date.
+    """Arch Linux — the current rolling release from archlinux.org/download/; superseded local ISOs go stale.
 
     Alerts:
       NEW:Arch-YYYY.MM.DD              - current release not present on local disk
@@ -784,7 +784,7 @@ class ArchChecker(Checker):
 
 
 class FedoraChecker(Checker):
-    """Fedora — fetches torrent.fedoraproject.org/torrents.json.
+    """Fedora — release versions and their torrent directories from torrent.fedoraproject.org/torrents.json.
 
     Version-level alerts:
       NEW:Fedora-VER     - version appeared in JSON but no local directories exist yet
@@ -863,7 +863,7 @@ class FedoraChecker(Checker):
 
 
 class AlmaChecker(Checker):
-    """AlmaLinux — scrapes mirrors.almalinux.org/isos.html.
+    """AlmaLinux — new point releases, superseded local directories, and dropped majors from mirrors.almalinux.org/isos.html.
 
     Version-level alerts:
       NEW:AlmaLinux-MAJOR   - new major on isos.html with no local directories
@@ -950,7 +950,7 @@ class AlmaChecker(Checker):
 
 
 class UbuntuChecker(Checker):
-    """Ubuntu — scrapes torrent.ubuntu.com/tracker_index.
+    """Ubuntu — active release lines from torrent.ubuntu.com/tracker_index; past-EOL lines excluded.
 
     Unlike Debian/Mint, Ubuntu runs multiple release lines (X.Y) at once —
     typically an LTS plus the current interim release — so there's no single
@@ -1261,7 +1261,7 @@ class UbuntuChecker(Checker):
 
 
 class ProxmoxChecker(Checker):
-    """Proxmox VE — scrapes the downloads page for offered ISO filenames.
+    """Proxmox VE — every ISO the proxmox.com downloads page offers, in all architectures.
 
     Filenames are taken verbatim from the enterprise.proxmox.com/iso/*.iso
     download hrefs rather than reconstructed from version strings, so every
@@ -1325,7 +1325,7 @@ class ProxmoxChecker(Checker):
 
 
 class DebianChecker(Checker):
-    """Debian — uses rsync --list-only against cdimage.debian.org.
+    """Debian — the current point release from cdimage.debian.org's torrent listing (via rsync).
 
     Every debian/debian-edu/debian-live/debian-mac filename (flat installer
     ISOs, live spins, and the 22-disc source set) carries the same point
@@ -1507,7 +1507,24 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     """
     parser = argparse.ArgumentParser(
         prog='new-torrents.py',
-        description='Check for new ISO torrents to mirror on mirror.tsue.net.',
+        description=(
+            'Check for new ISO torrents to mirror on mirror.tsue.net.\n'
+            '\n'
+            'Alerts print to stdout, one per line; any alert makes the run\n'
+            'exit non-zero so healthchecks.io fires. Each alert repeats\n'
+            'every run until the condition clears. Forms:\n'
+            '  NEW:<target>    upstream offers it, but no local copy exists yet\n'
+            '  ORPHAN:<target> on disk, but transmission has no record of it\n'
+            '  STALE:<target>  no longer offered upstream (superseded or removed)\n'
+            '  EOL:<line>      local ISOs exist for a release line past EOL\n'
+            '  DROPPED:<line>  local ISOs exist for a version no longer offered\n'
+            '  MISSING:<glob>  no ISOs of that distro found on disk at all\n'
+            '  MALFORMED:<src> upstream page or listing returned no usable data\n'
+            '  UNSAFE:<name>   upstream-supplied name would escape the download dir\n'
+            '  EXCEPTION:<cls> a checker crashed unexpectedly (details follow)\n'
+            '  <domain>        fetches from that upstream domain are failing:\n'
+            '                  repeated errors, or empty/error responses'
+        ),
         epilog=_checkers_epilogue(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
