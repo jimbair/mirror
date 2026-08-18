@@ -1507,7 +1507,8 @@ def _checkers_epilogue() -> str:
     each class docstring's first line so it can't drift from reality."""
     lines = ['available checkers:']
     for cls in CHECKERS:
-        first = (cls.__doc__ or '').strip().splitlines()[0]
+        doc_lines = (cls.__doc__ or '').strip().splitlines()
+        first = doc_lines[0] if doc_lines else _short_name(cls)
         lines.append(f'  {_short_name(cls):<8} {first}')
     return '\n'.join(lines)
 
