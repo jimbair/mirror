@@ -809,14 +809,35 @@ class FedoraChecker(Checker):
             self.alert('MALFORMED:Fedora-Tracker')
             return
 
-        tracker_versions = sorted(
-            (entry['name'] for entry in data),
-            key=ver_key,
-        )
-        # Empty version list means the JSON structure changed
-        if not tracker_versions:
+        # Normalize to version -> torrent names in one pass so the checks
+        # below never touch raw JSON. The tracker JSON could be a dict
+        # (a wrapped payload), carry non-dict entries, or have entries
+        # without a usable string 'name' or a list 'torrents' -- any of
+        # those would raise inside a bare comprehension and surface as an
+        # EXCEPTION alert instead of the clean MALFORMED alert the rest
+        # of the structure-change paths use. Malformed entries are skipped
+        # individually so one bad entry can't take down the versions the
+        # rest still describe; if nothing usable survives, the page has
+        # changed shape.
+        torrents_by_version: dict[str, list[str]] = {}
+        for entry in data if isinstance(data, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get('name')
+            torrents = entry.get('torrents', [])
+            if not isinstance(name, str) or not isinstance(torrents, list):
+                continue
+            torrents_by_version.setdefault(name, []).extend(
+                t['torrent'] for t in torrents
+                if isinstance(t, dict) and isinstance(t.get('torrent'), str)
+            )
+
+        # Empty version map means the JSON structure changed
+        if not torrents_by_version:
             self.alert('MALFORMED:Fedora-Tracker')
             return
+
+        tracker_versions = sorted(torrents_by_version, key=ver_key)
 
         # Collect versions present in local directories. The trailing slash in
         # the glob pattern ensures we only match directories, not ISO files.
@@ -839,13 +860,7 @@ class FedoraChecker(Checker):
                 self.alert(f'NEW:Fedora-{ver}')
                 continue
 
-            ver_torrents = sorted(
-                torrent['torrent']
-                for entry in data
-                if entry['name'] == ver
-                for torrent in entry.get('torrents', [])
-            )
-            self._check_version(ver, ver_torrents)
+            self._check_version(ver, sorted(torrents_by_version[ver]))
 
         for ver in local_versions:
             if ver not in tracker_versions:
