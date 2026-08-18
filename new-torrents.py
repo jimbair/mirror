@@ -100,9 +100,12 @@ class FailureTracker:
         if not self._path.exists():
             return {}
         try:
-            return json.loads(self._path.read_text())
+            data = json.loads(self._path.read_text())
         except (json.JSONDecodeError, OSError):
             return {}
+        # Valid JSON that isn't an object (e.g. a list) would raise at
+        # the per-checker counter accesses; treat it like a corrupt file
+        return data if isinstance(data, dict) else {}
 
 
 def ver_key(v: str) -> tuple[int, ...]:
