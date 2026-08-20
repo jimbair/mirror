@@ -374,12 +374,12 @@ class Checker(ABC):
         # are malformed-response failure modes that are just as much "this
         # fetch didn't work" but aren't OSError subclasses, so without them
         # a single bad response anywhere crashes the whole threaded run and
-        # silently drops every other checker's results: zlib.error from a
-        # corrupt "Content-Encoding: deflate" body, LookupError from a
-        # garbage charset name in the Content-Type header, and
-        # http.client.HTTPException (e.g. IncompleteRead) from a connection
-        # that drops mid-response.
-        except (urllib.error.URLError, OSError, zlib.error,
+        # silently drops every other checker's results: zlib.error or
+        # EOFError from a corrupt or truncated "Content-Encoding:
+        # gzip/deflate" body, LookupError from a garbage charset name in the
+        # Content-Type header, and http.client.HTTPException (e.g.
+        # IncompleteRead) from a connection that drops mid-response.
+        except (urllib.error.URLError, OSError, zlib.error, EOFError,
                 LookupError, http.client.HTTPException) as e:
             self._debug(f'fetch failed: {e}')
             self._page = ''

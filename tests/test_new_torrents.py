@@ -12,6 +12,7 @@ adjust SCRIPT_PATH below if you rename or move files.
 """
 
 import fcntl
+import gzip
 import http.client
 import importlib.util
 import io
@@ -492,6 +493,24 @@ class TestCheckerBase(unittest.TestCase):
         mock_resp.read.return_value = b'not valid zlib data at all'
         mock_resp.headers.get_content_charset.return_value = 'utf-8'
         mock_resp.headers.get.side_effect = self._content_encoding('deflate')
+        with patch('urllib.request.urlopen', return_value=mock_resp):
+            result = c.fetch('https://example.com/x', 'svc')
+        self.assertFalse(result)
+        self.assertEqual(self.ftrack._counts.get('svc', 0), 1)
+
+    def test_fetch_handles_truncated_gzip(self):
+        """EOFError from a truncated Content-Encoding: gzip body must not
+        escape fetch() — it's not an OSError subclass, so without explicit
+        handling it would crash the whole threaded run instead of being
+        treated as an ordinary fetch failure."""
+        c = self._checker()
+        full = gzip.compress(b'hello world' * 50)
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = full[:len(full)//2]
+        mock_resp.headers.get_content_charset.return_value = 'utf-8'
+        mock_resp.headers.get.side_effect = self._content_encoding('gzip')
         with patch('urllib.request.urlopen', return_value=mock_resp):
             result = c.fetch('https://example.com/x', 'svc')
         self.assertFalse(result)
