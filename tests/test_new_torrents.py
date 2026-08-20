@@ -24,6 +24,7 @@ import tempfile
 import time
 import unittest
 import urllib.error
+import zlib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -523,9 +524,8 @@ class TestCheckerBase(unittest.TestCase):
         with default wbits expects the zlib wrapper and raises on this --
         must fall back to raw deflate (negative wbits) rather than treating
         a merely-mislabeled-but-valid body as a fetch failure."""
-        import zlib as _zlib
         c = self._checker()
-        co = _zlib.compressobj(wbits=-15)
+        co = zlib.compressobj(wbits=-15)
         raw_deflate_body = co.compress(b'hello world' * 50) + co.flush()
         mock_resp = MagicMock()
         mock_resp.__enter__ = lambda s: s
