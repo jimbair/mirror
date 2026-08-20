@@ -901,7 +901,9 @@ class AlmaChecker(Checker):
             return
 
         # Extract (version, arch) pairs from /isos/ARCH/VERSION.html links;
-        # the regex captures (arch, version) so we swap on unpack
+        # the regex captures (arch, version) so we swap on unpack. Versions
+        # are exactly two numeric components: AlmaLinux follows the RHEL X.Y
+        # convention (as CentOS and Rocky) and has never used a third.
         raw = re.findall(r'/isos/([^/]+)/([0-9]+\.[0-9]+)\.html', self._page)
         pairs = sorted(
             {(ver, arch) for arch, ver in raw},
@@ -1329,6 +1331,11 @@ class ProxmoxChecker(Checker):
         for iso in versions:
             self.check_iso(iso, f'NEW:{iso.removesuffix(".iso")}')
 
+        # A local ISO *newer* than anything the page offers falls into the
+        # STALE/DROPPED branches below. That's intended: this mirror only
+        # ever fetches what the page currently lists, so local-newer can
+        # only mean upstream retracted a release -- exactly what we want
+        # surfaced, not suppressed.
         for path in self.iso_dir.glob('proxmox-ve_*.iso'):
             if not (path.exists() and path.stat().st_size > 0):
                 continue
