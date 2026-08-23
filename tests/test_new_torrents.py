@@ -533,6 +533,26 @@ class TestCheckerBase(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual(self.ftrack._counts.get('svc', 0), 1)
 
+    def test_fetch_handles_valid_gzip_body(self):
+        """The happy-path counterpart to test_fetch_handles_truncated_gzip:
+        a well-formed Content-Encoding: gzip body must be decompressed and
+        decoded into _page. Load-bearing: the script advertises gzip via
+        Accept-Encoding, so any server honoring it routes every successful
+        fetch through gzip.decompress() -- yet only the truncated failure
+        case was covered, leaving the primary decode path untested."""
+        c = self._checker()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = gzip.compress(b'<html>gzipped body</html>' * 10)
+        mock_resp.headers.get_content_charset.return_value = 'utf-8'
+        mock_resp.headers.get.side_effect = self._content_encoding('gzip')
+        with patch('urllib.request.urlopen', return_value=mock_resp):
+            result = c.fetch('https://example.com/x', 'svc')
+        self.assertTrue(result)
+        self.assertIn('<html>gzipped body</html>', c._page)
+        self.assertEqual(self.ftrack._counts.get('svc', 0), 0)
+
     def test_fetch_handles_raw_headerless_deflate(self):
         """RFC 1950 (zlib-wrapped) is the correct interpretation of a
         Content-Encoding: deflate response, but some servers actually send
