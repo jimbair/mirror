@@ -12,6 +12,7 @@ adjust SCRIPT_PATH below if you rename or move files.
 """
 
 import fcntl
+import functools
 import gzip
 import http.client
 import importlib.util
@@ -1160,7 +1161,8 @@ UBUNTU_ISOS = [
 # Minimal version of Canonical's support-schedule page (ubuntu.com/project/
 # docs/release-team/list-of-releases/), carrying the four table headers
 # _eol_lines() keys on and only the rows the tests need. Dates are the real
-# ones, so the assertions hold regardless of when the suite runs:
+# ones, interpreted relative to UBUNTU_FROZEN_NOW below, so the assertions
+# hold regardless of when the suite runs:
 #   26.04 - active in every mode (standard support runs to May 2031)
 #   20.04 - standard ended May 2025, ESM runs to Apr 2030
 #   16.04 - standard and ESM over, legacy add-on runs to Apr 2031
@@ -1204,15 +1206,35 @@ UBUNTU_SCHEDULE_PAGE = (
 )
 
 
+# Frozen (year, month) "today" for every date-sensitive Ubuntu test: all
+# fixture dates above were chosen relative to this instant, so the suite
+# no longer silently rots as real-world expirations pass.
+#
+# COUPLED TO THE FIXTURE DATES ABOVE. Do not bump this constant without
+# re-checking every future-dated fixture it must outrun:
+#   20.04 ESM end          Apr 2030  (governs test_esm_mode_drops_line_past_esm_end)
+#   16.04 legacy end       Apr 2031  (governs test_esm_active_line_not_dropped_in_hard_mode)
+#   26.04 standard end     May 2031  (governs test_standard_mode_drops_line_past_standard_end)
+#   20.04 LTS End of Life  Apr 2035  (governs the two grouped-STALE tests, hard mode)
+#   26.04 End of Life      Apr 2041  (governs test_eol_line_not_alerted)
+UBUNTU_FROZEN_NOW = (2026, 8)
+
+
 class TestUbuntuChecker(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
 
-    def _run(self, status='', page=UBUNTU_PAGE, schedule=UBUNTU_SCHEDULE_PAGE):
+    def _run(self, status='', page=UBUNTU_PAGE, schedule=UBUNTU_SCHEDULE_PAGE,
+             now=None):
         c = make_checker(nt.UbuntuChecker, self.tmp, status_content=status)
         # check() fetches twice: tracker page, then the support schedule.
         c.fetch = fake_fetch_seq(c, [page, schedule])
+        if now is not None:
+            # Pin the clock for this run: the instance attribute shadows
+            # the bound method, so check()'s self._eol_lines() sees it.
+            c._eol_lines = functools.partial(
+                nt.UbuntuChecker._eol_lines, c, now=now)
         c.check()
         return c.updates
 
@@ -1223,7 +1245,7 @@ class TestUbuntuChecker(unittest.TestCase):
         must."""
         page = ('<td>ubuntu-12.04.5-desktop-i386.iso</td>\n'
                 '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
-        updates = self._run(page=page)
+        updates = self._run(page=page, now=UBUNTU_FROZEN_NOW)
         self.assertIn('NEW:Ubuntu-26.04', updates)
         self.assertNotIn('NEW:Ubuntu-12.04.5', updates)
         self.assertNotIn('MALFORMED:Ubuntu-EOL', updates)
@@ -1235,7 +1257,7 @@ class TestUbuntuChecker(unittest.TestCase):
         runs to Apr 2031, so it must stay tracked."""
         page = ('<td>ubuntu-16.04.7-desktop-amd64.iso</td>\n'
                 '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
-        updates = self._run(page=page)
+        updates = self._run(page=page, now=UBUNTU_FROZEN_NOW)
         self.assertIn('NEW:Ubuntu-16.04.7', updates)
         self.assertIn('NEW:Ubuntu-26.04', updates)
 
@@ -1246,7 +1268,7 @@ class TestUbuntuChecker(unittest.TestCase):
         self.addCleanup(setattr, nt.UbuntuChecker, '_EOL_MODE', 'hard')
         page = ('<td>ubuntu-20.04.6-desktop-amd64.iso</td>\n'
                 '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
-        updates = self._run(page=page)
+        updates = self._run(page=page, now=UBUNTU_FROZEN_NOW)
         self.assertIn('NEW:Ubuntu-26.04', updates)
         self.assertNotIn('NEW:Ubuntu-20.04.6', updates)
 
@@ -1260,7 +1282,7 @@ class TestUbuntuChecker(unittest.TestCase):
                 '<td>ubuntu-20.04.6-desktop-amd64.iso</td>\n'
                 '<td>ubuntu-24.10-desktop-amd64.iso</td>\n'
                 '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
-        updates = self._run(page=page)
+        updates = self._run(page=page, now=UBUNTU_FROZEN_NOW)
         self.assertIn('NEW:Ubuntu-20.04.6', updates)
         self.assertIn('NEW:Ubuntu-26.04', updates)
         self.assertNotIn('NEW:Ubuntu-16.04.7', updates)
@@ -1301,7 +1323,7 @@ class TestUbuntuChecker(unittest.TestCase):
         possible with corrupt data, since the current release is never
         EOL -- the checker must track everything rather than go silent."""
         page = '<td>ubuntu-12.04.5-desktop-i386.iso</td>\n'
-        updates = self._run(page=page)
+        updates = self._run(page=page, now=UBUNTU_FROZEN_NOW)
         self.assertIn('NEW:Ubuntu-12.04.5', updates)
 
     def test_off_mode_never_fetches_schedule(self):
@@ -1340,7 +1362,8 @@ class TestUbuntuChecker(unittest.TestCase):
         updates = self._run(page=page,
                             status='ubuntu-12.04.5-dvd-amd64.iso '
                                    'ubuntu-12.04.5-dvd-i386.iso '
-                                   'ubuntu-24.04-desktop-amd64.iso')
+                                   'ubuntu-24.04-desktop-amd64.iso',
+                            now=UBUNTU_FROZEN_NOW)
         self.assertEqual(updates, {'EOL:Ubuntu-12.04'})
 
     def test_local_eol_line_files_not_flagged_when_schedule_unavailable(self):
@@ -1391,7 +1414,8 @@ class TestUbuntuChecker(unittest.TestCase):
             (self.tmp / name).write_bytes(b'x' * 100)
         updates = self._run(page=page,
                             status='ubuntu-12.04.5-dvd-amd64.iso '
-                                   'ubuntu-24.04-desktop-amd64.iso')
+                                   'ubuntu-24.04-desktop-amd64.iso',
+                            now=UBUNTU_FROZEN_NOW)
         self.assertEqual(updates, {'EOL:Ubuntu-12.04'})
 
     def test_new_release_grouped_per_line_when_nothing_local(self):
@@ -1459,7 +1483,8 @@ class TestUbuntuChecker(unittest.TestCase):
             (self.tmp / name).write_bytes(b'x' * 100)
         for name in UBUNTU_ISOS:
             (self.tmp / name).write_bytes(b'x' * 100)
-        updates = self._run(status=' '.join(UBUNTU_ISOS))
+        updates = self._run(status=' '.join(UBUNTU_ISOS),
+                            now=UBUNTU_FROZEN_NOW)
         self.assertEqual(updates, {'STALE:Ubuntu-20.04'})
 
     def test_stale_same_version_file_alerts_individually(self):
@@ -1527,7 +1552,8 @@ class TestUbuntuChecker(unittest.TestCase):
             (self.tmp / name).write_bytes(b'x' * 100)
         for name in UBUNTU_ISOS:
             (self.tmp / name).write_bytes(b'x' * 100)
-        updates = self._run(status=' '.join(UBUNTU_ISOS))
+        updates = self._run(status=' '.join(UBUNTU_ISOS),
+                            now=UBUNTU_FROZEN_NOW)
         self.assertEqual(updates, {'STALE:Ubuntu-20.04'})
 
     def test_malformed_page_alerts(self):
@@ -1537,6 +1563,31 @@ class TestUbuntuChecker(unittest.TestCase):
     def test_malformed_when_no_filename_has_parseable_version(self):
         updates = self._run(page='<td>ubuntu-README.iso</td>\n')
         self.assertIn('MALFORMED:Ubuntu-Tracker', updates)
+
+    def test_eol_clock_is_injectable_and_month_granular(self):
+        """_eol_lines() honors the injected now: the same schedule page
+        flips a line from active to EOL strictly after its tier-end month,
+        independent of the real date. Locks in the parameter and the strict
+        '<' comparison (a line is still active during its end month)."""
+        page = (
+            '<table>'
+            '<tr><th>Version</th><th>Code name</th><th>Docs</th><th>Release</th>'
+            '<th>End of Standard Support</th><th>End of Life</th></tr>'
+            '<tr><td>Ubuntu 20.04 LTS</td><td>Focal Fossa</td><td>Release notes</td>'
+            '<td>Apr 23, 2020</td><td>May 2025</td><td>Apr 2035</td></tr>'
+            '</table>'
+        )
+        c = make_checker(nt.UbuntuChecker, self.tmp)
+
+        def _fetch(url, name):
+            c._page = page + _PAD
+            return True
+
+        c.fetch = _fetch
+
+        # 'hard' mode keys on the last tier of any kind: End of Life Apr 2035.
+        self.assertEqual(c._eol_lines(now=(2035, 4)), set())
+        self.assertEqual(c._eol_lines(now=(2035, 5)), {'20.04'})
 
 
 # ProxmoxChecker

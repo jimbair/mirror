@@ -1078,9 +1078,15 @@ class UbuntuChecker(Checker):
         if ym is not None and (line not in ends or ym > ends[line]):
             ends[line] = ym
 
-    def _eol_lines(self) -> set[str] | None:
+    def _eol_lines(
+        self, now: tuple[int, int] | None = None
+    ) -> set[str] | None:
         """Release lines (X.Y) whose Canonical support has ended per
         _EOL_MODE, parsed off the support-schedule page.
+
+        now is an injectable (year, month) clock, defaulting to the real
+        current month. Tests pin it so date-sensitive assertions don't
+        rot as fixture expirations pass on the real calendar.
 
         Returns None when the schedule is unusable (fetch failure or no
         parseable dates) so the caller falls back to tracking every line
@@ -1153,7 +1159,9 @@ class UbuntuChecker(Checker):
             self.alert('MALFORMED:Ubuntu-EOL')
             return None
 
-        now_ym = (date.today().year, date.today().month)
+        if now is None:
+            now = (date.today().year, date.today().month)
+        now_ym = now
         eol: set[str] = set()
         for line in set(std_end) | set(esm_end) | set(max_end):
             if self._EOL_MODE == 'standard':
