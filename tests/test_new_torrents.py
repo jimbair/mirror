@@ -146,6 +146,21 @@ class TestFailureTracker(unittest.TestCase):
         t = self._tracker()
         self.assertFalse(t.at_threshold('x'))  # no crash, empty state
 
+    def test_non_int_values_are_discarded(self):
+        """A hand-edited failures.json carrying non-int values (e.g.
+        {"Debian": "2"} while debugging an outage) must not poison the
+        tracker: increment()/at_threshold() would otherwise raise
+        TypeError inside fetch()'s except-handler, turning every fetch
+        failure into a recurring EXCEPTION alert instead of a clean
+        counter. Bad entries start fresh; good ones survive intact."""
+        self.path.write_text(json.dumps(
+            {'bad': '2', 'null': None, 'list': [1], 'flag': True, 'good': 2}))
+        t = self._tracker(threshold=2)
+        self.assertEqual(t._counts, {'good': 2})
+        self.assertTrue(t.at_threshold('good'))
+        t.increment('bad')  # must not raise
+        self.assertFalse(t.at_threshold('bad'))  # counted from 0, not "21"
+
     def test_save_leaves_no_temp_file(self):
         """A successful save cleans up after itself: no temp file
         remains next to failures.json."""

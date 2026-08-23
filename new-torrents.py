@@ -104,8 +104,21 @@ class FailureTracker:
         except (json.JSONDecodeError, OSError):
             return {}
         # Valid JSON that isn't an object (e.g. a list) would raise at
-        # the per-checker counter accesses; treat it like a corrupt file
-        return data if isinstance(data, dict) else {}
+        # the per-checker counter accesses; treat it like a corrupt file.
+        # Values must be ints too: a hand-edited entry like
+        # {"Debian": "2"} would otherwise raise TypeError inside fetch()'s
+        # except-handler (str + int / str >= int), surfacing as a
+        # recurring EXCEPTION alert on every failed fetch until the file
+        # is repaired manually. Anything save() didn't write starts
+        # fresh; bools are excluded despite being an int subclass,
+        # since True/False aren't meaningful failure counts.
+        if not isinstance(data, dict):
+            return {}
+        return {
+            name: count
+            for name, count in data.items()
+            if isinstance(count, int) and not isinstance(count, bool)
+        }
 
 
 def ver_key(v: str) -> tuple[int, ...]:
