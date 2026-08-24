@@ -57,6 +57,14 @@ class FailureTracker:
     concurrent read/write races from the threaded checkers and skips unnecessary
     disk writes on clean runs. Surviving reboots prevents a reboot from silently
     resetting an ongoing outage counter.
+
+    Thread-safety: unsynchronized by design -- every counter name belongs
+    to exactly one checker thread (Mint owns Linux-Mint/-VER/-Supported,
+    Ubuntu owns Ubuntu/Ubuntu-EOL, the rest own their distro name), so no
+    two threads ever touch the same key, and save() runs once on the main
+    thread after the executor drains. If a future checker ever shares a
+    fetch-failure name with another thread, wrap
+    increment/clear/at_threshold in a lock first.
     """
 
     def __init__(self, path: Path, threshold: int) -> None:

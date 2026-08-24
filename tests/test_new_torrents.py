@@ -19,6 +19,7 @@ import importlib.util
 import io
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,11 @@ def make_checker(cls, iso_dir, status_content='', failures=None, display=None):
         fd.close()
         Path(fd.name).write_text('{}')
         failures = nt.FailureTracker(Path(fd.name), 3)
+        # Only __init__ ever reads this file (unit tests exercise save()
+        # through their own paths), so reclaim it immediately rather than
+        # leaking one stray JSON per make_checker() call. If a future
+        # test ever calls save(), it recreates the file from scratch.
+        Path(fd.name).unlink()
     return cls(iso_dir, status_content, failures, display)
 
 
@@ -88,6 +94,7 @@ class TestFailureTracker(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.path = self.tmp / 'failures.json'
 
     def _tracker(self, threshold=3):
@@ -334,6 +341,7 @@ class TestCheckerBase(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.ftrack = nt.FailureTracker(self.tmp / 'f.json', 3)
 
     def _checker(self, status=''):
@@ -641,6 +649,7 @@ class TestCheckerRunExceptionSafety(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.ftrack = nt.FailureTracker(self.tmp / 'f.json', 3)
 
     def test_exception_becomes_alert_not_crash(self):
@@ -709,6 +718,7 @@ class TestMintChecker(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def _run(self, status='', pages=None):
         if pages is None:
@@ -1039,6 +1049,7 @@ class TestArchChecker(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def _run(self, status='', page=ARCH_PAGE):
         c = make_checker(nt.ArchChecker, self.tmp, status_content=status)
@@ -1097,6 +1108,7 @@ class TestCachyChecker(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def _run(self, status='', page=CACHY_PAGE):
         c = make_checker(nt.CachyChecker, self.tmp, status_content=status)
@@ -1276,6 +1288,7 @@ class TestUbuntuChecker(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def _run(self, status='', page=UBUNTU_PAGE, schedule=UBUNTU_SCHEDULE_PAGE,
              now=None):
@@ -1657,6 +1670,7 @@ class TestProxmoxChecker(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def _run(self, status='', page=PROXMOX_PAGE):
         c = make_checker(nt.ProxmoxChecker, self.tmp, status_content=status)
@@ -1743,6 +1757,7 @@ class TestFedoraChecker(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def _run(self, status='', page=FEDORA_JSON):
         c = make_checker(nt.FedoraChecker, self.tmp, status_content=status)
@@ -1924,6 +1939,7 @@ class TestAlmaChecker(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def _run(self, status='', page=ALMA_PAGE):
         c = make_checker(nt.AlmaChecker, self.tmp, status_content=status)
@@ -2026,6 +2042,7 @@ class TestDebianChecker(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def _rsync(self, stdout=DEBIAN_RSYNC_OUTPUT, returncode=0):
         r = MagicMock()
@@ -2174,6 +2191,7 @@ class TestMain(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.iso_dir = self.tmp / 'Downloads'
 
     def _run_main(self, rsync_present=True, argv=None, extra_patches=None):
