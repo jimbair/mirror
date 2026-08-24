@@ -1122,6 +1122,23 @@ class TestCachyChecker(unittest.TestCase):
         updates = self._run(page='<html>no torrents here</html>')
         self.assertIn('MALFORMED:cachyos.org', updates)
 
+    def test_release_date_sorts_numerically_not_lexicographically(self):
+        """A bare sorted() over the extracted date strings matches
+        chronological order only while every release keeps the same-width
+        YYMMDD form: an 8-digit YYYYMMDD value compares BELOW every
+        existing 6-digit string ('20260101' < '241201' since '0' < '4'),
+        which would silently make the older release read as current and
+        stamp NEW alerts with a stale version. The numeric ver_key sort
+        survives any width change."""
+        page = (
+            'torrent_url&quot;:[0,&quot;https://cdn.cachyos.org/ISO/260101/'
+            'cachyos-kde-linux-20260101.torrent&quot;\n'
+            'torrent_url&quot;:[0,&quot;https://cdn.cachyos.org/ISO/241201/'
+            'cachyos-gnome-linux-241201.torrent&quot;\n'
+        )
+        updates = self._run(page=page)
+        self.assertEqual(updates, {'NEW:CachyOS-20260101'})
+
     def test_unparseable_edition_name_alerts_malformed_not_empty_version(self):
         """A compound edition name with an internal hyphen (e.g. a
         hypothetical 'desktop-gnome' spin) is captured fine by the

@@ -749,11 +749,16 @@ class CachyChecker(Checker):
         # bailing out entirely would throw away detection they can still
         # correctly do. UNKNOWN keeps any resulting NEW: alert honest about
         # why, rather than blank.
+        # Numeric sort key: bare sorted() compares these strings
+        # lexicographically, which only tracks chronology while every
+        # release shares the same-width YYMMDD form -- an 8-digit YYYYMMDD
+        # switch would sort BELOW every existing 6-digit value ('2026...'
+        # < '2412...'), silently making an older release read as current.
         if not release_dates:
             self.alert('MALFORMED:cachyos.org')
             current_release = 'UNKNOWN'
         else:
-            current_release = release_dates[-1]
+            current_release = max(release_dates, key=ver_key)
 
         for iso in upstream_isos:
             self.check_iso(iso, f'NEW:CachyOS-{current_release}')
