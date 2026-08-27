@@ -24,6 +24,7 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
+from typing import NamedTuple
 
 # Where transmission stores downloaded torrents
 ISO_DIR = Path('/var/lib/transmission/Downloads')
@@ -43,6 +44,16 @@ FAIL_FILE = Path.home() / '.config' / 'new-torrents' / 'failures.json'
 # open file descriptor, so it can never go stale across a crash, kill -9,
 # or reboot -- there's no on-disk "locked" state to clean up.
 LOCK_FILE = Path.home() / '.config' / 'new-torrents' / 'lock'
+# Last-known-good parsed Ubuntu support schedule (per-line support-end
+# dates, not a precomputed EOL verdict -- the verdict is re-derived from
+# the dates as the clock advances, so a cached schedule stays correct
+# after a line's tier ends). UbuntuChecker falls back to it when the
+# schedule page is unfetchable or unparseable: Canonical keeps past-EOL
+# releases on the tracker, so without the fallback every transient
+# outage re-alerts each of them as NEW (the domain-down alert needs 3
+# consecutive failures, so a one-off outage is only visible as those
+# false NEWs).
+UBUNTU_EOL_CACHE_FILE = Path.home() / '.config' / 'new-torrents' / 'ubuntu-eol.json'
 
 
 ###########
@@ -995,6 +1006,21 @@ class AlmaChecker(Checker):
             self.alert(f'STALE:AlmaLinux-{ver}')
 
 
+class ScheduleData(NamedTuple):
+    """Per-line support end dates parsed off the schedule page: one map
+    per support tier (line -> (year, month) the tier ends) plus the set
+    of lines that are LTS (ESM mode needs to tell them apart from
+    interims, which have no ESM tier of their own). Dates, not verdicts:
+    the EOL set is always derived from these at run time (see
+    _eol_from()), so cached data stays correct as the clock crosses each
+    tier's end month.
+    """
+    std_end: dict[str, tuple[int, int]]
+    esm_end: dict[str, tuple[int, int]]
+    max_end: dict[str, tuple[int, int]]
+    lts_lines: frozenset[str]
+
+
 class UbuntuChecker(Checker):
     """Ubuntu — active release lines from torrent.ubuntu.com/tracker_index; past-EOL lines excluded.
 
@@ -1014,8 +1040,12 @@ class UbuntuChecker(Checker):
     a past-EOL line that is still listed on the tracker would otherwise
     be skipped by the stale scan as if they were current, so they are
     surfaced as EOL:Ubuntu-X.Y instead. When the schedule page is
-    unfetchable or unparseable the checker fails open and tracks every
-    line the tracker lists.
+    unfetchable or unparseable the checker falls back to the last
+    successfully parsed schedule (cached on disk by a prior healthy run
+    — see UBUNTU_EOL_CACHE_FILE) and re-derives the EOL verdict from
+    its dates, so a transient outage doesn't re-alert every past-EOL
+    line Canonical keeps on the tracker; only when no such cache
+    exists yet does it fail open and track every line the tracker lists.
 
     Version-level alerts:
       NEW:Ubuntu-VER   - a line's current point release has no local ISOs yet
@@ -1065,6 +1095,11 @@ class UbuntuChecker(Checker):
     #                longer supports it in any form
     #   'off'      - no filtering; track every line the tracker lists
     _EOL_MODE = 'hard'
+    # Where the last-known-good parsed schedule is cached (see
+    # UBUNTU_EOL_CACHE_FILE). A class attribute like _EOL_MODE so tests
+    # can redirect it per-instance to a temp path without touching the
+    # real one.
+    _eol_cache_path: Path = UBUNTU_EOL_CACHE_FILE
 
     def _version_of(self, filename: str) -> str | None:
         m = self._VERSION_RE.search(filename)
@@ -1114,18 +1149,54 @@ class UbuntuChecker(Checker):
         current month. Tests pin it so date-sensitive assertions don't
         rot as fixture expirations pass on the real calendar.
 
-        Returns None when the schedule is unusable (fetch failure or no
-        parseable dates) so the caller falls back to tracking every line
-        the tracker lists. Lines the schedule doesn't mention (upcoming
-        releases, or a restructured page) count as still active — we never
-        drop a line we can't place.
+        The live page is parsed fresh every run and the parsed dates
+        are cached on disk as a side effect (_eol_cache_save); if the
+        page is unfetchable or yields no dates — which still alerts
+        MALFORMED:Ubuntu-EOL — the last-known-good cached schedule is
+        loaded and the verdict re-derived from its dates at the current
+        clock. The cache stores dates, not a verdict, so cached data
+        stays correct as each tier's end month passes.
+
+        Returns None only when the schedule is unusable AND no cached
+        schedule exists: the caller then fails open and tracks every
+        line the tracker lists. Lines the schedule doesn't mention
+        (upcoming releases, or a restructured page) count as still
+        active — we never drop a line we can't place.
         """
         if self._EOL_MODE == 'off':
             return set()
-        if not self.fetch('https://ubuntu.com/project/docs/release-team/'
-                          'list-of-releases/', 'Ubuntu-EOL'):
+        data: ScheduleData | None = None
+        if self.fetch('https://ubuntu.com/project/docs/release-team/'
+                      'list-of-releases/', 'Ubuntu-EOL'):
+            data = self._parse_schedule()
+            if data is not None:
+                # Side effect only: a later run whose fetch or parse
+                # fails falls back to this. Never blocks the verdict.
+                self._eol_cache_save(data)
+            else:
+                # The page yielded no dates at all: structure change (or
+                # a short error shell that still passed fetch()). Alert
+                # rather than silently disabling the filter, even though
+                # the cached schedule below rescues this run's verdict --
+                # the broken page is still worth surfacing.
+                self.alert('MALFORMED:Ubuntu-EOL')
+        if data is None:
+            data = self._eol_cache_load()
+            self._debug('EOL schedule from cache' if data is not None
+                        else 'EOL schedule unavailable')
+        if data is None:
             return None
+        if now is None:
+            now = (date.today().year, date.today().month)
+        return self._eol_from(data, now)
 
+    def _parse_schedule(self) -> ScheduleData | None:
+        """Parse the four support-schedule tables on self._page into the
+        per-line support end dates -- the raw material for the EOL
+        verdict, which _eol_from() derives itself at whatever clock it's
+        called with. Returns None when the page carries no usable dates
+        at all; the caller alerts MALFORMED:Ubuntu-EOL in that case.
+        """
         std_end: dict[str, tuple[int, int]] = {}  # standard support
         esm_end: dict[str, tuple[int, int]] = {}  # ESM / Ubuntu Pro
         max_end: dict[str, tuple[int, int]] = {}  # last tier of any kind
@@ -1180,29 +1251,117 @@ class UbuntuChecker(Checker):
 
         if not (std_end or esm_end or max_end):
             # The page yielded no dates at all: structure change (or a
-            # short error shell that still passed fetch()). Alert rather
-            # than silently disabling the filter.
-            self.alert('MALFORMED:Ubuntu-EOL')
+            # short error shell that still passed fetch()). The caller
+            # alerts MALFORMED:Ubuntu-EOL rather than silently disabling
+            # the filter.
             return None
+        return ScheduleData(std_end=std_end, esm_end=esm_end,
+                            max_end=max_end, lts_lines=frozenset(lts_lines))
 
-        if now is None:
-            now = (date.today().year, date.today().month)
-        now_ym = now
+    def _eol_from(self, data: ScheduleData,
+                  now: tuple[int, int]) -> set[str]:
+        """The EOL verdict for a parsed schedule: every line whose
+        _EOL_MODE tier ended strictly before now. A pure function of its
+        inputs -- no fetch, no cache, no clock read -- so the same
+        cached dates re-derive a fresh verdict as the clock advances.
+        """
         eol: set[str] = set()
-        for line in set(std_end) | set(esm_end) | set(max_end):
+        for line in set(data.std_end) | set(data.esm_end) | set(data.max_end):
             if self._EOL_MODE == 'standard':
-                end = std_end.get(line)
+                end = data.std_end.get(line)
             elif self._EOL_MODE == 'esm':
-                end = esm_end.get(line)
-                if end is None and line not in lts_lines:
+                end = data.esm_end.get(line)
+                if end is None and line not in data.lts_lines:
                     # Interims get no ESM; their standard end is their
                     # only support window.
-                    end = std_end.get(line)
+                    end = data.std_end.get(line)
             else:  # 'hard'
-                end = max_end.get(line)
-            if end is not None and end < now_ym:
+                end = data.max_end.get(line)
+            if end is not None and end < now:
                 eol.add(line)
         return eol
+
+    # The on-disk cache holds exactly what _eol_cache_save() writes:
+    # dates as [year, month] two-lists (JSON has no tuple), lts_lines as
+    # a list (JSON has no set; sorted order keeps the file stable and
+    # diff-friendly). _eol_cache_load() accepts only one of those
+    # outputs and discards everything else -- the same "anything save()
+    # didn't write starts fresh" stance as FailureTracker._load: a
+    # corrupt cache is worse than no cache, since a wrong date would
+    # silently misplace a line's EOL, whereas a missing one just fails
+    # open for one run (self-healed by the next healthy parse).
+
+    @staticmethod
+    def _eol_ym_map(raw: object) -> dict[str, tuple[int, int]] | None:
+        """Validate and convert one tier's raw JSON map of
+        line -> [year, month], or None on any shape deviation: a value
+        that isn't a two-element int list (bools rejected despite being
+        an int subclass), a month outside 1..12, or a year outside
+        1900..2100 (a zero or two-digit year would silently mark every
+        line EOL)."""
+        if not isinstance(raw, dict):
+            return None
+        out: dict[str, tuple[int, int]] = {}
+        for line, ym in raw.items():
+            if (not isinstance(ym, list) or len(ym) != 2
+                    or any(not isinstance(x, int) or isinstance(x, bool)
+                           for x in ym)
+                    or not 1900 <= ym[0] <= 2100
+                    or not 1 <= ym[1] <= 12):
+                return None
+            out[line] = (ym[0], ym[1])
+        return out
+
+    def _eol_cache_save(self, data: ScheduleData) -> None:
+        """Persist a healthy parse for future fallbacks: the parsed
+        dates, not the EOL verdict -- the verdict is a pure function of
+        dates + clock + _EOL_MODE (see _eol_from) and must re-derive per
+        run, else a line would stay "active" in the cache forever after
+        its tier ends. Written via a same-directory temp file +
+        os.replace() (atomic rename on POSIX), the same discipline as
+        FailureTracker.save(): a crash mid-write would otherwise leave a
+        truncated file for the next run to read.
+        """
+        self._eol_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            'std_end': {line: list(ym) for line, ym in data.std_end.items()},
+            'esm_end': {line: list(ym) for line, ym in data.esm_end.items()},
+            'max_end': {line: list(ym) for line, ym in data.max_end.items()},
+            'lts_lines': sorted(data.lts_lines),
+        }
+        tmp = self._eol_cache_path.with_name(self._eol_cache_path.name + '.tmp')
+        tmp.write_text(json.dumps(payload, indent=2))
+        os.replace(tmp, self._eol_cache_path)
+
+    def _eol_cache_load(self) -> ScheduleData | None:
+        """Load the last successfully parsed schedule, or None if the
+        cache is missing, unreadable, or in a shape _eol_cache_save()
+        didn't write.
+        """
+        if not self._eol_cache_path.exists():
+            return None
+        try:
+            raw = json.loads(self._eol_cache_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        std_end = self._eol_ym_map(raw.get('std_end'))
+        esm_end = self._eol_ym_map(raw.get('esm_end'))
+        max_end = self._eol_ym_map(raw.get('max_end'))
+        lts_raw = raw.get('lts_lines')
+        if (std_end is None or esm_end is None or max_end is None
+                or not isinstance(lts_raw, list)
+                or not all(isinstance(line, str) for line in lts_raw)):
+            return None
+        # _eol_cache_save() only ever persists a parse that found at
+        # least one date (a no-date page never gets cached), so an
+        # all-empty file is not one of its outputs: treat it as corrupt
+        # rather than as "nothing is EOL".
+        if not (std_end or esm_end or max_end):
+            return None
+        return ScheduleData(std_end=std_end, esm_end=esm_end,
+                            max_end=max_end, lts_lines=frozenset(lts_raw))
 
     def check(self) -> None:
         if not self.fetch('https://torrent.ubuntu.com/tracker_index', 'Ubuntu'):
@@ -1228,11 +1387,13 @@ class UbuntuChecker(Checker):
             return
 
         # Drop lines whose support has ended per _EOL_MODE; _eol_lines()
-        # returns None when the schedule page is unusable, in which case
-        # fail open and track everything. `or set()` normalizes that None
-        # to an empty set so the stale scan below can test membership
-        # unconditionally (no EOL flagging when the schedule is unusable
-        # or the mode is 'off').
+        # falls back to the last successfully parsed schedule (cached on
+        # disk by a prior healthy run) when the page is unfetchable or
+        # unparseable, and returns None only when no such cache exists --
+        # in which case fail open and track everything. `or set()`
+        # normalizes that None to an empty set so the stale scan below
+        # can test membership unconditionally (no EOL flagging when
+        # there is no usable schedule at all, or the mode is 'off').
         eol_lines = self._eol_lines() or set()
         if eol_lines:
             upstream_versions = {

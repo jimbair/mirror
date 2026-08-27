@@ -1270,6 +1270,20 @@ UBUNTU_SCHEDULE_PAGE = (
 )
 
 
+# UBUNTU_SCHEDULE_PAGE plus a PAST-table row for 25.10 (released Oct
+# 2025, standard support -- an interim's only tier -- ending Jul 2026),
+# for the cache tests that need a line whose EOL falls between two
+# pinned clocks: active at (2026, 6), past EOL at UBUNTU_FROZEN_NOW
+# (2026, 8). Appended to the last table (PAST, identified by its "Code
+# name" + "End of Life" header rather than its position), so the shared
+# fixture above stays untouched for every pre-existing test.
+SCHEDULE_WITH_2510 = UBUNTU_SCHEDULE_PAGE[:-len('</table>')] + (
+    '<tr><td>Ubuntu 25.10</td><td>Quest Quokka</td><td>Release notes</td>'
+    '<td>Oct 2025</td><td>Jul 2026</td></tr>'
+    '</table>'
+)
+
+
 # Frozen (year, month) "today" for every date-sensitive Ubuntu test: all
 # fixture dates above were chosen relative to this instant, so the suite
 # no longer silently rots as real-world expirations pass.
@@ -1289,10 +1303,17 @@ class TestUbuntuChecker(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        # Fresh EOL-schedule cache path per test: no cache leaks between
+        # tests, so tests premised on "no cached schedule exists" (the
+        # fail-open ones) keep holding on their first run.
+        self.eol_cache = self.tmp / 'ubuntu-eol.json'
 
     def _run(self, status='', page=UBUNTU_PAGE, schedule=UBUNTU_SCHEDULE_PAGE,
              now=None):
         c = make_checker(nt.UbuntuChecker, self.tmp, status_content=status)
+        # Redirect the cache off the real config dir: unit tests must
+        # never read or write the host's ubuntu-eol.json.
+        c._eol_cache_path = self.eol_cache
         # check() fetches twice: tracker page, then the support schedule.
         c.fetch = fake_fetch_seq(c, [page, schedule])
         if now is not None:
@@ -1354,11 +1375,14 @@ class TestUbuntuChecker(unittest.TestCase):
         self.assertNotIn('NEW:Ubuntu-24.10', updates)
 
     def test_schedule_fetch_failure_tracks_everything(self):
-        """When the schedule page can't be fetched the checker fails open:
-        EOL lines are tracked exactly as if the filter didn't exist."""
+        """When the schedule page can't be fetched — and no cached
+        schedule exists yet (fresh tmp in setUp, so this is the first-run
+        case) — the checker fails open: EOL lines are tracked exactly as
+        if the filter didn't exist."""
         page = ('<td>ubuntu-12.04.5-desktop-i386.iso</td>\n'
                 '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
         c = make_checker(nt.UbuntuChecker, self.tmp)
+        c._eol_cache_path = self.eol_cache
 
         def _fetch(url, name):
             if name == 'Ubuntu-EOL':
@@ -1398,6 +1422,7 @@ class TestUbuntuChecker(unittest.TestCase):
         page = ('<td>ubuntu-12.04.5-desktop-i386.iso</td>\n'
                 '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
         c = make_checker(nt.UbuntuChecker, self.tmp)
+        c._eol_cache_path = self.eol_cache
         fetched = []
 
         def _fetch(url, name):
@@ -1443,6 +1468,7 @@ class TestUbuntuChecker(unittest.TestCase):
         c = make_checker(nt.UbuntuChecker, self.tmp,
                          status_content='ubuntu-12.04.5-dvd-amd64.iso '
                                         'ubuntu-24.04-desktop-amd64.iso')
+        c._eol_cache_path = self.eol_cache
 
         def _fetch(url, name):
             if name == 'Ubuntu-EOL':
@@ -1643,6 +1669,7 @@ class TestUbuntuChecker(unittest.TestCase):
             '</table>'
         )
         c = make_checker(nt.UbuntuChecker, self.tmp)
+        c._eol_cache_path = self.eol_cache
 
         def _fetch(url, name):
             c._page = page + _PAD
@@ -1653,6 +1680,113 @@ class TestUbuntuChecker(unittest.TestCase):
         # 'hard' mode keys on the last tier of any kind: End of Life Apr 2035.
         self.assertEqual(c._eol_lines(now=(2035, 4)), set())
         self.assertEqual(c._eol_lines(now=(2035, 5)), {'20.04'})
+
+    def _failing_eol_fetch(self, page, now=None):
+        """A checker whose schedule fetch fails (fetch() returns False
+        for 'Ubuntu-EOL') while the tracker fetch is healthy — the
+        transient outage the cached schedule must survive. Callers do
+        c.check()."""
+        c = make_checker(nt.UbuntuChecker, self.tmp)
+        c._eol_cache_path = self.eol_cache
+
+        def _fetch(url, name):
+            if name == 'Ubuntu-EOL':
+                return False
+            c._page = page + _PAD
+            return True
+
+        c.fetch = _fetch
+        if now is not None:
+            # Pin the clock the same way _run() does.
+            c._eol_lines = functools.partial(
+                nt.UbuntuChecker._eol_lines, c, now=now)
+        return c
+
+    def test_schedule_fetch_failure_falls_back_to_cache(self):
+        """A transient schedule-page outage no longer re-alerts past-EOL
+        lines: the last-known-good schedule, cached by the prior healthy
+        run, is loaded and the EOL verdict re-derived from its dates."""
+        self._run(page=UBUNTU_PAGE, schedule=SCHEDULE_WITH_2510,
+                  now=UBUNTU_FROZEN_NOW)
+        page = ('<td>ubuntu-12.04.5-desktop-i386.iso</td>\n'
+                '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
+        c = self._failing_eol_fetch(page, now=UBUNTU_FROZEN_NOW)
+        c.check()
+        # 12.04.5 is dropped by the cache-derived EOL set: no false NEW.
+        self.assertEqual(c.updates,
+                         {'MISSING:*buntu*.iso', 'NEW:Ubuntu-26.04'})
+
+    def test_malformed_schedule_falls_back_to_cache(self):
+        """A schedule page that fetches but parses to no dates still
+        alerts MALFORMED:Ubuntu-EOL (a broken page is worth surfacing)
+        while the cached schedule rescues this run's verdict."""
+        self._run(page=UBUNTU_PAGE, schedule=SCHEDULE_WITH_2510,
+                  now=UBUNTU_FROZEN_NOW)
+        page = ('<td>ubuntu-12.04.5-desktop-i386.iso</td>\n'
+                '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
+        updates = self._run(page=page,
+                            schedule='<html><body>no tables here</body></html>',
+                            now=UBUNTU_FROZEN_NOW)
+        self.assertIn('MALFORMED:Ubuntu-EOL', updates)
+        self.assertNotIn('NEW:Ubuntu-12.04.5', updates)
+        self.assertIn('NEW:Ubuntu-26.04', updates)
+
+    def test_corrupt_cache_fails_open_without_crash(self):
+        """A cache file in any shape _eol_cache_save() didn't write is
+        discarded, not partially trusted: the failing run fails open
+        (every line, past-EOL included, alerts) rather than crash or
+        silently misplace a line's EOL."""
+        page = ('<td>ubuntu-12.04.5-desktop-i386.iso</td>\n'
+                '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
+        for content in ('not json at all', '[]', 'null',
+                        '{"std_end": "nope"}',
+                        '{"std_end": {"12.04": [2017]}}',
+                        '{"std_end": {"12.04": [2017, 13]}}',
+                        '{"std_end": {"12.04": [true, 4]}}',
+                        '{"std_end": {}, "esm_end": {}, "max_end": {}, '
+                        '"lts_lines": []}'):
+            with self.subTest(content=content):
+                self.eol_cache.write_text(content)
+                c = self._failing_eol_fetch(page, now=UBUNTU_FROZEN_NOW)
+                c.check()
+                self.assertIn('NEW:Ubuntu-12.04.5', c.updates)
+                self.assertIn('NEW:Ubuntu-26.04', c.updates)
+
+    def test_cache_stores_dates_not_verdict(self):
+        """The cache holds dates, not a verdict: 25.10 is still active
+        when the cache is written at (2026, 6) (its tier ends Jul 2026),
+        but a later run whose schedule fetch fails at UBUNTU_FROZEN_NOW
+        (2026, 8) must drop it from the re-derived verdict."""
+        page = ('<td>ubuntu-25.10-desktop-amd64.iso</td>\n'
+                '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
+        updates = self._run(page=page, schedule=SCHEDULE_WITH_2510,
+                            now=(2026, 6))
+        self.assertIn('NEW:Ubuntu-25.10', updates)
+        c = self._failing_eol_fetch(page, now=UBUNTU_FROZEN_NOW)
+        c.check()
+        self.assertEqual(c.updates,
+                         {'MISSING:*buntu*.iso', 'NEW:Ubuntu-26.04'})
+        self.assertNotIn('NEW:Ubuntu-25.10', c.updates)
+
+    def test_healthy_run_repairs_corrupt_cache(self):
+        """A corrupt cache is ignored for one run (fail open); the next
+        healthy run overwrites it with a fresh parse, so the following
+        failing run falls back to the repaired schedule."""
+        page = ('<td>ubuntu-12.04.5-desktop-i386.iso</td>\n'
+                '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
+        self.eol_cache.write_text('garbage')
+        c = self._failing_eol_fetch(page, now=UBUNTU_FROZEN_NOW)
+        c.check()
+        self.assertIn('NEW:Ubuntu-12.04.5', c.updates)
+        self._run(page=page, schedule=SCHEDULE_WITH_2510,
+                  now=UBUNTU_FROZEN_NOW)
+        c2 = make_checker(nt.UbuntuChecker, self.tmp)
+        c2._eol_cache_path = self.eol_cache
+        self.assertIsNotNone(c2._eol_cache_load())
+        c3 = self._failing_eol_fetch(page, now=UBUNTU_FROZEN_NOW)
+        c3.check()
+        self.assertEqual(c3.updates,
+                         {'MISSING:*buntu*.iso', 'NEW:Ubuntu-26.04'})
 
 
 # ProxmoxChecker
