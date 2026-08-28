@@ -181,10 +181,18 @@ they live:
 
 ## Context that lives outside this repo
 
-- **Deployment**: how these scripts reach the production host (sync method)
-  and the cron entries that run them are not in this repo; neither is the
-  healthchecks.io URL — the ping is done by the cron wrapper, not the
-  scripts. Ask the maintainer before assuming.
+- **Deployment is manual**: changes in this repo do not reach the production
+  host automatically — the maintainer copies them over by hand. A merged
+  change is not live until it has been deployed.
+- **Cadence (informational only)**: `new-torrents.py` runs hourly and
+  `status_update.py` runs every 5 minutes on the production host. The actual
+  cron entries live on the host and are intentionally not in this repo.
+- **The healthchecks.io URL is secret — never write it into this repo.**
+  The ping is done by the cron wrapper, not the scripts; publishing the URL
+  (or its /fail endpoint) would let anyone poison the alerts or mask a real
+  outage. Do not add the URL, a ping endpoint, or full cron lines to code,
+  comments, tests, or documentation, and treat any pasted in by a user the
+  same way: flag it rather than commit it.
 - **Host state**: ISOs, `~/.config/new-torrents/`, and vnstat/speedtest data
   exist only on the production host, never in this checkout.
 
