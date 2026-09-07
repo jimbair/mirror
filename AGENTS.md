@@ -171,8 +171,8 @@ they live:
   run manually when a new Debian release drops.
 - `new-speedtest.sh` — interactive; re-runs the speedtest and swaps
   `/home/jim/log/speedtest.log` if you accept it.
-- `status-update.sh` — the origin version of `status_update.py`.
-  `status-update.sh` is the versio actively in use; migrating to the python
+- `status-update.sh` — the original version of `status_update.py`.
+  `status-update.sh` is the version actively in use; migrating to the python
   version is currently a TODO to be completed by the author.
 - `transmission-upgrade.sh` — builds Transmission from source on AlmaLinux
   (root, dnf) while upstream package bugs are open. Destructive by design
