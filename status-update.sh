@@ -6,8 +6,13 @@ TMP=$(/usr/bin/mktemp)
 [[ -f "${TMP}" ]] || exit 1
 
 # Bandwidth stats via vnstat and ookla
-/home/jim/bin/vnstat > ${TMP} || exit 1
+/home/jim/bin/vnstat >> ${TMP} || exit 1
 /home/jim/bin/vnstat --hours >> ${TMP} || exit 1 
+
+# IPv6 Traffic Stats
+/home/jim/bin/ipv6-stats.py >> ${TMP} || exit 1
+
+# Daily speedtest
 cat /home/jim/log/speedtest.log >> ${TMP} || exit 1 
 echo >> ${TMP} || exit 1 # Formatting
 
