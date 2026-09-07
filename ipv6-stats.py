@@ -79,9 +79,7 @@ def ipv6_bytes_for(interface: str) -> int:
         )
     counters: dict[str, int] = {}
     for line in path.read_text().splitlines():
-        key, _, value = line.partition(" ")
-        key = key.strip()
-        value = value.strip()
+        key, value = line.split()
         if key and value:
             counters[key] = int(value)
     try:
