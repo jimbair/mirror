@@ -44,7 +44,7 @@ Keep them (and their comments) intact when refactoring.
   Alerts repeat every run until the condition clears — a silent no-op (exit 0)
   is a bug, not an optimization. Never "fix" an alert into silence.
 - **status.txt is ground truth** for what Transmission already knows about.
-  `status_update.py` writes it atomically precisely so concurrent readers
+  `status-update.sh` writes it atomically precisely so concurrent readers
   (including this script) never see a half-written file. Preserve the
   temp-then-install pattern.
 - **Threading invariant:** checkers run in a `ThreadPoolExecutor`, and each
@@ -61,7 +61,7 @@ Keep them (and their comments) intact when refactoring.
   overlapping runs; a held lock must exit non-zero and loudly (a silent skip
   would mask a stuck run from healthchecks).
 
-### status_update.py (status page builder)
+### status-update.sh (status page builder)
 
 - The `transmission-remote -l` table rendering is **verified byte-for-byte
   against real Transmission 3.x output** (fixed column widths, 2-space gutters,
@@ -171,9 +171,9 @@ they live:
   run manually when a new Debian release drops.
 - `new-speedtest.sh` — interactive; re-runs the speedtest and swaps
   `/home/jim/log/speedtest.log` if you accept it.
-- `status-update.sh` — the pre-Python shell version of `status_update.py`.
-  `status_update.py` is the maintained one; keep this only for reference and
-  don't fix bugs here.
+- `status-update.sh` — the origin version of `status_update.py`.
+  `status-update.sh` is the versio actively in use; migrating to the python
+  version is currently a TODO to be completed by the author.
 - `transmission-upgrade.sh` — builds Transmission from source on AlmaLinux
   (root, dnf) while upstream package bugs are open. Destructive by design
   (replaces the system daemon); verify version and checksums before running
@@ -185,7 +185,7 @@ they live:
   host automatically — the maintainer copies them over by hand. A merged
   change is not live until it has been deployed.
 - **Cadence (informational only)**: `new-torrents.py` runs hourly and
-  `status_update.py` runs every 5 minutes on the production host. The actual
+  `status-update.sh` runs every 5 minutes on the production host. The actual
   cron entries live on the host and are intentionally not in this repo.
 - **The healthchecks.io URL is secret — never write it into this repo.**
   The ping is done by the cron wrapper, not the scripts; publishing the URL
