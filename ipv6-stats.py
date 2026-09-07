@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ipv6_share.py -- report the percentage of interface traffic that has been
+ipv6-stats.py -- report the percentage of interface traffic that has been
 IPv6 since the machine's last boot.
 
 Data sources (both are LIVE KERNEL COUNTERS):
