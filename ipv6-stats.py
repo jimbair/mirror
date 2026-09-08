@@ -81,11 +81,10 @@ def ipv6_bytes_for(interface: str) -> int:
     path = PROC_NET_DEV_SNMP6 / interface
     if not path.exists():
         raise RuntimeError(
-            f"{path} does not exist -- per-interface IPv6 SNMP stats "
-            "require CONFIG_IPV6. When CONFIG_IPV6 is enabled the "
-            "kernel creates this file for every registered interface "
-            "(no IPv6 address required, MTU >= 1280), so IPv6 support "
-            "may be missing from this kernel"
+            f"{path} does not exist -- per-interface IPv6 SNMP stats need "
+            "CONFIG_IPV6 in the kernel and interface MTU >= 1280 (no IPv6 "
+            "address required). Check kernel IPv6 support, this interface's "
+            "MTU, and whether IPv6 is disabled here via disable_ipv6."
         )
     counters: dict[str, int] = {}
     for line in path.read_text().splitlines():
