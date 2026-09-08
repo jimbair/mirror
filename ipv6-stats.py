@@ -10,6 +10,14 @@ Data sources (both are LIVE KERNEL COUNTERS):
 Both reset to zero on reboot, so the reported window is always
 "since last boot". If you need a longer window, these counters have to be
 polled and persisted over time yourself.
+
+Precision caveat: the two sources count slightly different things.
+/proc/net/dev reports frame bytes as seen by the interface, which on
+typical Ethernet NICs includes the L2/MAC header, while Ip6InOctets/
+Ip6OutOctets count L3 (IP datagram) bytes only. The IPv6 share is
+therefore slightly under-reported (~1% for full-size frames at MTU
+1500), and the "non-IPv6" remainder also includes L2 overhead and
+non-IP protocols such as ARP.
 """
 
 from __future__ import annotations
@@ -73,15 +81,17 @@ def ipv6_bytes_for(interface: str) -> int:
     path = PROC_NET_DEV_SNMP6 / interface
     if not path.exists():
         raise RuntimeError(
-            f"{path} does not exist -- kernel/interface may lack "
-            "per-interface IPv6 SNMP stats (needs CONFIG_IPV6 and an "
-            "IPv6 address on the interface)"
+            f"{path} does not exist -- per-interface IPv6 SNMP stats "
+            "require CONFIG_IPV6. When CONFIG_IPV6 is enabled the "
+            "kernel creates this file for every registered interface "
+            "(no IPv6 address required, MTU >= 1280), so IPv6 support "
+            "may be missing from this kernel"
         )
     counters: dict[str, int] = {}
     for line in path.read_text().splitlines():
-        key, value = line.split()
-        if key and value:
-            counters[key] = int(value)
+        fields = line.split()
+        if len(fields) == 2:
+            counters[fields[0]] = int(fields[1])
     try:
         return counters["Ip6InOctets"] + counters["Ip6OutOctets"]
     except KeyError as exc:
@@ -128,7 +138,7 @@ def main() -> int:
     try:
         interface = args.interface or default_interface()
         share = gather(interface)
-    except RuntimeError as exc:
+    except (RuntimeError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
