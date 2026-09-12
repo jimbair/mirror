@@ -24,15 +24,15 @@ echo >> ${TMP} || exit 1 # Formatting
 #
 # head/tail preserve the header & footer; the middle section gets sorted by Ratio (desc).
 #
-# sed #1: merges ' <unit>' into '@<unit>' for Have (GB/MB/kB/B) and ETA (min/hr/day/sec)
+# sed #1: merges ' <unit>' into '@<unit>' for Have (B/kB/MB/GB/TB) and ETA (sec/min/hr/day/year)
 # so word-splitting doesn't miscount fields. Singular unit roots also match plural forms
 # as substrings, covering transmission-remote's inconsistent pluralization.
 #
-# awk: $7 is now reliably Ratio. High ratios print with a thousands comma (e.g. '2,328'),
-# which breaks both sort -n and column alignment if stripped in place — so awk prepends a
-# comma-free copy as a hidden tab-separated sort key instead of touching the real field.
+# awk: $7 is Ratio. High ratios print with a thousands comma (e.g. '2,328'), which breaks
+# both sort -n and column alignment if stripped in place. So, awk prepends a comma-free copy
+# as a hidden tab-separated sort key instead of touching the real field.
 #
-# sort/cut: sort numerically on the hidden key, then drop it — original line untouched.
+# sort/cut: sort numerically on the hidden key, then drop it.
 #
 # sed #2: reverses the @ merge.
 #
