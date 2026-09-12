@@ -16,18 +16,33 @@ TMP=$(/usr/bin/mktemp)
 cat /home/jim/log/speedtest.log >> ${TMP} || exit 1 
 echo >> ${TMP} || exit 1 # Formatting
 
-# Let's sort by ratio; thanks Gemini!
+# Let's sort by ratio; thanks Claude!
 #
-# 'head' and 'tail' print the header and footer lines untouched.
-# 'sed 1d;$d' strips the header/footer from the middle section before sorting.
-# The first 'sed -E' replaces spaces inside sizes (e.g. '13.94 GB') and ETAs
-# (e.g. '10 mins') with '@' so they don't break column-based sorting.
-# 'sort -k7rn' sorts numerically (-n) and in reverse/descending (-r) by the 7th column.
-# The final 'sed -E' swaps the '@' characters back into normal spaces.
+# head/tail preserve the header & footer; the middle section gets sorted by Ratio (desc).
+#
+# sed #1: merges ' <unit>' into '@<unit>' for Have (GB/MB/kB/B) and ETA (min/hr/day/sec)
+# so word-splitting doesn't miscount fields. Singular unit roots also match plural forms
+# as substrings, covering transmission-remote's inconsistent pluralization.
+#
+# awk: $7 is now reliably Ratio. High ratios print with a thousands comma (e.g. '2,328'),
+# which breaks both sort -n and column alignment if stripped in place — so awk prepends a
+# comma-free copy as a hidden tab-separated sort key instead of touching the real field.
+#
+# sort/cut: sort numerically on the hidden key, then drop it — original line untouched.
+#
+# sed #2: reverses the @ merge.
+#
+# NOTE: depends on sed #1 correctly collapsing ETA/Have so $7 is really Ratio. An unseen
+# ETA unit would make awk silently key on the wrong field.
 REMOTE=$(/usr/local/bin/transmission-remote -l)
 [[ -n "${REMOTE}" ]] || exit 1
 head -n 1 <<< ${REMOTE} >> ${TMP} || exit 1
-sed '1d;$d' <<< ${REMOTE} | sed -E 's/ (GB|MB|kB|B|mins|hrs|days|secs)/@\1/g' | sort -k7rn | sed -E 's/@(GB|MB|kB|B|mins|hrs|days|secs)/ \1/g' >> ${TMP} || exit 1
+sed '1d;$d' <<< ${REMOTE} \
+  | sed -E 's/ (GB|MB|kB|B|min|hr|day|sec)/@\1/g' \
+  | awk '{key=$7; gsub(",","",key); print key "\t" $0}' \
+  | sort -t$'\t' -k1,1rn \
+  | cut -f2- \
+  | sed -E 's/@(GB|MB|kB|B|min|hr|day|sec)/ \1/g' >> ${TMP} || exit 1
 tail -n 1 <<< ${REMOTE} >> ${TMP} || exit 1
 
 # Install the updated status
