@@ -42,11 +42,11 @@ REMOTE=$(/usr/local/bin/transmission-remote -l)
 [[ -n "${REMOTE}" ]] || exit 1
 head -n 1 <<< ${REMOTE} >> ${TMP} || exit 1
 sed '1d;$d' <<< ${REMOTE} \
-  | sed -E 's/ (GB|MB|kB|B|min|hr|day|sec)/@\1/g' \
-  | awk '{key=$7; gsub(",","",key); print key "\t" $0}' \
+  | sed -E 's/ (B|kB|MB|GB|TB|sec|min|hr|day|month|year)/@\1/g' \
+  | awk '{key=$7; if (key=="Inf") key="999999999"; else gsub(",","",key); print key "\t" $0}' \
   | sort -t$'\t' -k1,1rn \
   | cut -f2- \
-  | sed -E 's/@(GB|MB|kB|B|min|hr|day|sec)/ \1/g' >> ${TMP} || exit 1
+  | sed -E 's/@(B|kB|MB|GB|TB|sec|min|hr|day|month|year)/ \1/g' >> ${TMP} || exit 1
 tail -n 1 <<< ${REMOTE} >> ${TMP} || exit 1
 
 # Install the updated status
