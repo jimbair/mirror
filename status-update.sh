@@ -1,9 +1,13 @@
 #!/bin/bash
 # Update status.txt for our mirror
+set -o pipefail
 
 # Build in temp and install once done as we use status.txt for other cronjobs
 TMP=$(/usr/bin/mktemp)
 [[ -f "${TMP}" ]] || exit 1
+
+# Clean-up our temp regardless of our exit condition
+trap 'rm -f "${TMP}"' EXIT
 
 # Bandwidth stats via vnstat
 /home/jim/bin/vnstat >> ${TMP} || exit 1
@@ -47,7 +51,6 @@ tail -n 1 <<< ${REMOTE} >> ${TMP} || exit 1
 
 # Install the updated status
 cat ${TMP} > /var/lib/transmission/Downloads/status.txt || exit 1 
-rm ${TMP} || exit 1 
 
 # All done
 exit 0
