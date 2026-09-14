@@ -20,6 +20,17 @@ python3 new-torrents.py --help          # checker CLI; run checkers with --only 
 python3 status_update.py                # build status page (needs transmission-remote, vnstat)
 ```
 
+- **macOS interpreters:** the system `python3` (Xcode Command Line
+  Tools, 3.9.x) is too old for this repo — it fails at import time on
+  the `Path | None` annotations (the scripts use 3.11+ syntax; CI pins
+  3.11). The suggested solution is a locally installed modern Python from
+  Homebrew: `brew install python@3.11`, then run the commands above with
+  the versioned interpreter (`python3.11 tests/test_new_torrents.py -v`).
+  Don't rely on a bare `python3` on macOS — the maintainer's shell does
+  not have `/opt/homebrew/bin` in PATH, so it still resolves to the
+  system 3.9; use the full path `/opt/homebrew/bin/python3.11` if the
+  versioned name isn't in PATH. Any Python 3.11+ works.
+
 - Tests are plain `unittest`, no external dependencies, no package install.
   The scripts under test are imported via `importlib` in each test file (the
   hyphen in `new-torrents.py` rules out a plain import) — preserve that pattern
@@ -162,6 +173,13 @@ they live:
   dirs) and mock the network — follow that style; clean up tempdirs.
 - **Commits:** conventional-commit style with a scope, lowercase subject
   (`fix(ubuntu): ...`, `test(fetch): ...`, `chore: ...`, `docs: ...`).
+- **LLM co-author credit:** when an LLM made the change (or materially
+  helped make it), credit the model in the commit message with a
+  `Co-Authored-By: <model>` trailer, e.g. `Co-Authored-By: Qwen3.8 27B
+  (6-bit, extra-high reasoning)`. Credit the model, not the app or
+  harness that ran it. Place the trailer after a blank line following the
+  last body paragraph; with `git commit -s`, `Signed-off-by:` is appended
+  below it, so the co-author line must be the final line of the message.
 - **Branches:** prefix new branches `bionic/` (e.g. `bionic/fix-...`), per
   existing PR history.
 
