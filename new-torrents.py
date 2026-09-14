@@ -824,7 +824,11 @@ class ArchChecker(Checker):
 
 
 class FedoraChecker(Checker):
-    """Fedora — release versions and their torrent directories from torrent.fedoraproject.org/torrents.json.
+    """Fedora — stable release versions and their torrent directories from torrent.fedoraproject.org/torrents.json (pre-releases like 45_Beta are ignored).
+
+    Only stable (bare-integer) tracker versions are considered; pre-release
+    entries (45_Alpha, 45_Beta, 45_RC1, ...) are skipped entirely so a beta
+    landing does not alert and its final replacement does not read as a drop.
 
     Version-level alerts:
       NEW:Fedora-VER     - version appeared in JSON but no local directories exist yet
@@ -877,7 +881,24 @@ class FedoraChecker(Checker):
             self.alert('MALFORMED:Fedora-Tracker')
             return
 
-        tracker_versions = sorted(torrents_by_version, key=ver_key)
+        # Stable Fedora releases are the only versions we mirror, and on
+        # the tracker they are always bare integers ('42', '43', '44' --
+        # never dotted or lettered, confirmed against the live tracker).
+        # Pre-releases appear as they land and roll off when the final
+        # ships ('45_Alpha', '45_Beta', '45_RC1'), so they are skipped
+        # entirely: alerting NEW when a beta lands and DROPPED when the
+        # final replaces it would be pure noise around every release.
+        # Filtering the tracker side to bare integers mirrors the digit-
+        # only filter the local_versions scan below applies, so both sides
+        # of every comparison use the same "is this a stable release"
+        # test. (A tracker that currently lists no stable at all -- only
+        # pre-releases -- is a transient state, not a shape change, so it
+        # simply yields no versions; the empty-map check above is what
+        # catches real structure drift.)
+        tracker_versions = sorted(
+            (ver for ver in torrents_by_version if ver.isdigit()),
+            key=ver_key,
+        )
 
         # Collect versions present in local directories. The trailing slash in
         # the glob pattern ensures we only match directories, not ISO files.

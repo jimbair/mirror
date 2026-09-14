@@ -1886,6 +1886,24 @@ FEDORA_JSON = json.dumps([
     },
 ])
 
+# A stable (42) alongside a landing pre-release (45_Beta). Pre-releases
+# must be ignored: no NEW for the beta, no per-torrent alerts, and no
+# DROPPED when the final later replaces it.
+FEDORA_JSON_WITH_BETA = json.dumps([
+    {
+        'name': '42',
+        'torrents': [
+            {'torrent': 'Fedora-Workstation-Live-x86_64-42.torrent'},
+        ],
+    },
+    {
+        'name': '45_Beta',
+        'torrents': [
+            {'torrent': 'Fedora-Workstation-Live-x86_64-45_Beta.torrent'},
+        ],
+    },
+])
+
 
 class TestFedoraChecker(unittest.TestCase):
 
@@ -1903,6 +1921,43 @@ class TestFedoraChecker(unittest.TestCase):
         updates = self._run()
         self.assertIn('NEW:Fedora-41', updates)
         self.assertIn('NEW:Fedora-42', updates)
+
+    def test_beta_landing_does_not_alert_new(self):
+        """A pre-release (45_Beta) appearing on the tracker is not a
+        mirrored release, so it must not fire NEW:Fedora-45_Beta (or any
+        per-torrent beta alert) even with no local directory for it yet."""
+        updates = self._run(page=FEDORA_JSON_WITH_BETA)
+        self.assertIn('NEW:Fedora-42', updates)
+        self.assertFalse(
+            any('45_Beta' in u for u in updates),
+            f'Unexpected beta alert: {updates}',
+        )
+
+    def test_local_beta_dir_is_ignored(self):
+        """A directory on disk for a beta is not a mirrored release either,
+        so it must not alert DROPPED (the tracker's 45_Beta is not a stable
+        version) and must not produce per-torrent NEW/ORPHAN/STALE."""
+        (self.tmp / 'Fedora-Workstation-Live-x86_64-45_Beta').mkdir()
+        updates = self._run(page=FEDORA_JSON_WITH_BETA)
+        self.assertIn('NEW:Fedora-42', updates)
+        self.assertFalse(
+            any('45_Beta' in u for u in updates),
+            f'Unexpected beta alert: {updates}',
+        )
+
+    def test_all_prerelease_tracker_yields_no_alerts(self):
+        """A tracker listing only pre-releases (no stable yet) is a
+        transient state, not a shape change: no NEW and no MALFORMED."""
+        beta_only = json.dumps([
+            {
+                'name': '45_Beta',
+                'torrents': [
+                    {'torrent': 'Fedora-Workstation-Live-x86_64-45_Beta.torrent'},
+                ],
+            },
+        ])
+        updates = self._run(page=beta_only)
+        self.assertEqual(updates, set())
 
     def test_no_new_alert_when_local_dirs_exist(self):
         (self.tmp / 'Fedora-Workstation-Live-x86_64-42').mkdir()
