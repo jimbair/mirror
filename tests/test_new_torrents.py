@@ -1647,6 +1647,99 @@ class TestUbuntuChecker(unittest.TestCase):
                             now=UBUNTU_FROZEN_NOW)
         self.assertEqual(updates, {'STALE:Ubuntu-20.04'})
 
+    # 2026-09 incident fixtures: Canonical shipped 24.04.5.1 as a
+    # desktop-only bugfix release — the tracker pruned
+    # ubuntu-24.04.5-desktop-amd64.iso in its place while every other
+    # 24.04.5 artifact (live-server, flavors) stayed listed and current.
+    # PAGE mirrors that live shape; the pruned desktop ISO is what the
+    # per-artifact currency model must flag precisely.
+    POINT_RELEASE_PAGE = (
+        '<td>ubuntu-24.04.5-desktop-arm64.iso</td>\n'
+        '<td>ubuntu-24.04.5-live-server-amd64.iso</td>\n'
+        '<td>ubuntu-24.04.5-live-server-s390x.iso</td>\n'
+        '<td>kubuntu-24.04.5-desktop-amd64.iso</td>\n'
+        '<td>ubuntu-24.04.5.1-desktop-amd64.iso</td>\n'
+    )
+    POINT_RELEASE_ISOS = [
+        'ubuntu-24.04.5-desktop-arm64.iso',
+        'ubuntu-24.04.5-live-server-amd64.iso',
+        'ubuntu-24.04.5-live-server-s390x.iso',
+        'kubuntu-24.04.5-desktop-amd64.iso',
+        'ubuntu-24.04.5.1-desktop-amd64.iso',
+    ]
+
+    def test_artifact_specific_point_release_flags_only_dropped_file(self):
+        """The 24.04.5.1 incident end to end: the mirror holds every
+        tracker ISO plus the pruned 24.04.5 desktop-amd64. That file
+        must alert by name — not drag the whole 24.04.5 point release
+        into a grouped STALE:Ubuntu-24.04.5, which the old one-version-
+        per-line model fired because 24.04.5.1 was the line's max.
+        The still-current 24.04.5 siblings stay silent."""
+        local = self.POINT_RELEASE_ISOS + ['ubuntu-24.04.5-desktop-amd64.iso']
+        for name in local:
+            (self.tmp / name).write_bytes(b'x' * 100)
+        updates = self._run(status=' '.join(local),
+                            page=self.POINT_RELEASE_PAGE)
+        self.assertNotIn('STALE:Ubuntu-24.04.5', updates)
+        self.assertEqual(updates, {'STALE:ubuntu-24.04.5-desktop-amd64.iso'})
+
+    def test_artifact_specific_point_release_alerts_new_version_only(self):
+        """Same tracker state, mirror has the 24.04.5 artifacts but not
+        the new 24.04.5.1 desktop ISO: exactly one grouped alert, for
+        the new version. The still-current 24.04.5 version must not be
+        re-alerted as NEW (it has local ISOs, and its tracker ISOs are
+        all mirrored)."""
+        local = [n for n in self.POINT_RELEASE_ISOS
+                 if n != 'ubuntu-24.04.5.1-desktop-amd64.iso']
+        for name in local:
+            (self.tmp / name).write_bytes(b'x' * 100)
+        updates = self._run(status=' '.join(local),
+                            page=self.POINT_RELEASE_PAGE)
+        self.assertEqual(updates, {'NEW:Ubuntu-24.04.5.1'})
+
+    def test_fully_superseded_version_still_grouped_stale(self):
+        """Grouped STALE:Ubuntu-VER is reserved for a version current for
+        no artifact: once Canonical prunes the last remaining 24.04.4
+        ISOs too, leftover local 24.04.4 files collapse to one grouped
+        alert (pre-existing behavior the per-artifact model must keep —
+        a fully superseded version is as stale as a dropped line)."""
+        page = ('<td>ubuntu-24.04.5-live-server-amd64.iso</td>\n'
+                '<td>ubuntu-24.04.5.1-desktop-amd64.iso</td>\n')
+        local = ('ubuntu-24.04.4-desktop-amd64.iso '
+                 'kubuntu-24.04.4-desktop-amd64.iso '
+                 'ubuntu-24.04.5-live-server-amd64.iso '
+                 'ubuntu-24.04.5.1-desktop-amd64.iso').split()
+        for name in local:
+            (self.tmp / name).write_bytes(b'x' * 100)
+        updates = self._run(status=' '.join(local), page=page)
+        self.assertEqual(updates, {'STALE:Ubuntu-24.04.4'})
+
+    def test_version_current_for_one_artifact_only(self):
+        """Live-tracker shape (2026-09): the arm64/ppc64el/riscv64
+        live-server builds were never cut for 24.04.5, so that
+        artifact's current version is still 24.04.4 while amd64 is at
+        24.04.5. 24.04.4 therefore counts as a current version: a
+        mirror with no 24.04.4 ISOs gets one grouped NEW:Ubuntu-24.04.4
+        (the only surface for those current-but-unmirrored artifacts —
+        the per-file NEW branch runs only for versions that have local
+        files), and a mirror that has the still-listed arm64 live-server
+        stays silent for it."""
+        page = ('<td>ubuntu-24.04.4-live-server-arm64.iso</td>\n'
+                '<td>ubuntu-24.04.5-live-server-amd64.iso</td>\n'
+                '<td>ubuntu-24.04.5.1-desktop-amd64.iso</td>\n')
+        local = ['ubuntu-24.04.5-live-server-amd64.iso',
+                 'ubuntu-24.04.5.1-desktop-amd64.iso']
+        for name in local:
+            (self.tmp / name).write_bytes(b'x' * 100)
+        updates = self._run(status=' '.join(local), page=page)
+        self.assertEqual(updates, {'NEW:Ubuntu-24.04.4'})
+
+        # Mirroring the still-listed 24.04.4 arm64 live-server clears it.
+        arm64 = 'ubuntu-24.04.4-live-server-arm64.iso'
+        (self.tmp / arm64).write_bytes(b'x' * 100)
+        updates = self._run(status=' '.join(local + [arm64]), page=page)
+        self.assertEqual(updates, set())
+
     def test_malformed_page_alerts(self):
         updates = self._run(page='<html>nothing here</html>')
         self.assertIn('MALFORMED:Ubuntu-Tracker', updates)
