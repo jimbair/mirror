@@ -1050,7 +1050,14 @@ class UbuntuChecker(Checker):
     global "current version" to group around; grouping by the overall max
     would misclassify a perfectly current, unrelated line as stale the
     moment any other line advances. Each X.Y line is tracked and grouped
-    independently instead.
+    independently instead. Currency within a line is per artifact, not per
+    version: Canonical ships point releases that cover only some artifacts
+    (2026-09: 24.04.5.1 was a desktop-only bugfix that replaced just the
+    24.04.5 desktop-amd64 ISO, leaving every 24.04.5 live-server/flavor
+    ISO current), so each artifact signature — the filename with its
+    version blanked, see _artifact_key — carries its own max current
+    version, and the union of those is what the alert logic below treats
+    as "current".
 
     Canonical keeps past-EOL releases on the tracker (12.04.5 has sat
     there since 2017), so a past-EOL line's unmirrored point release
@@ -1068,19 +1075,25 @@ class UbuntuChecker(Checker):
     line Canonical keeps on the tracker; only when no such cache
     exists yet does it fail open and track every line the tracker lists.
 
-    Version-level alerts:
-      NEW:Ubuntu-VER   - a line's current point release has no local ISOs yet
+    Version-level alerts (currency is per artifact signature — see
+    _artifact_key — so a point release covering only some artifacts leaves
+    the other artifacts' older version current):
+      NEW:Ubuntu-VER   - a current point release has no local ISOs yet
       STALE:Ubuntu-VER - local ISOs exist for a point release no longer
-                          current within its line (superseded, or the whole
-                          line dropped from the tracker)
+                          current for any artifact in its line (fully
+                          superseded, or the whole line dropped from the
+                          tracker)
       EOL:Ubuntu-X.Y   - local ISOs exist for a release line past EOL per
                           _EOL_MODE; repeats every run until the local
                           files are removed
 
-    Per-file alerts (only once at least one local ISO matches that line's current version):
+    Per-file alerts (per-file checks run once at least one local ISO exists
+    for a given current version):
       NEW:ISO    - tracker ISO absent from disk and unknown to transmission
       ORPHAN:ISO - tracker ISO present on disk but unknown to transmission
-      STALE:ISO  - current-version (or unparseable) local ISO dropped from the tracker
+      STALE:ISO  - local ISO dropped from the tracker while still current
+                   for some artifact (or unparseable) — e.g. an
+                   artifact-specific point release replaced just this one
 
       MISSING:*buntu*.iso      - no Ubuntu-family ISOs found on our disk at all
       MALFORMED:Ubuntu-Tracker - tracker page returned no ISOs, or none had a
@@ -1129,6 +1142,20 @@ class UbuntuChecker(Checker):
     def _line_of(self, version: str) -> str:
         """Reduce a full X.Y(.Z) version to its X.Y release line."""
         return '.'.join(version.split('.')[:2])
+
+    def _artifact_key(self, iso: str) -> str:
+        """Filename with its version substring blanked out — the artifact's identity.
+
+        ISOs that differ only in version are the same artifact (ubuntu-
+        24.04.5-desktop-amd64.iso and ubuntu-24.04.5.1-desktop-amd64.iso
+        both key to ubuntu-{VER}-desktop-amd64.iso), while differently
+        shaped filenames (live-server, the flavors, other arches) stay
+        distinct. The blanked substring is exactly the one _version_of
+        extracts — same regex, first match — so the key and the version
+        can never disagree, even for a hypothetical name with several
+        dotted-number runs.
+        """
+        return self._VERSION_RE.sub('{VER}', iso, count=1)
 
     # Support-schedule parsing. The page is server-rendered static HTML; the
     # four tables we care about are identified by their header cells rather
@@ -1431,14 +1458,32 @@ class UbuntuChecker(Checker):
                     if v is not None
                 }
 
-        # Independently find the current (max) point release within each
-        # release line — e.g. 24.04.3 and 25.10 can both be current at once.
-        current_by_line: dict[str, str] = {}
-        for v in upstream_versions:
-            line = self._line_of(v)
-            if line not in current_by_line or ver_key(v) > ver_key(current_by_line[line]):
-                current_by_line[line] = v
-        current_versions = set(current_by_line.values())
+        # Independently find the current (max) point release per
+        # (line, artifact) pair — e.g. 24.04.3 and 25.10 can both be
+        # current at once, and within one line a point release can exist
+        # for only some artifacts: in 2026-09 Canonical shipped 24.04.5.1
+        # as a desktop-only bugfix and pruned the 24.04.5 desktop ISO it
+        # replaced, leaving every 24.04.5 live-server/flavor ISO current
+        # alongside it. One version per line would mark the whole old
+        # point release stale (grouped STALE:Ubuntu-24.04.5) even though
+        # most of it is still on the tracker, so each artifact signature
+        # (_artifact_key) carries its own currency verdict; the flat set
+        # of all of them feeds the NEW/STALE logic below as before.
+        current_by_artifact: dict[tuple[str, str], str] = {}
+        for iso in upstream_isos:
+            v = self._version_of(iso)
+            if v is None or v not in upstream_versions:
+                # v is None: unparseable filename (the MALFORMED bails
+                # above guarantee at least one parseable name, not all);
+                # v not in upstream_versions: that line is past EOL per
+                # _EOL_MODE, since upstream_versions is the filtered set
+                # (or the fail-open rebuild of it).
+                continue
+            key = (self._line_of(v), self._artifact_key(iso))
+            if (key not in current_by_artifact
+                    or ver_key(v) > ver_key(current_by_artifact[key])):
+                current_by_artifact[key] = v
+        current_versions = set(current_by_artifact.values())
 
         local_isos = sorted(self.iso_dir.glob('*buntu*.iso'))
         if not local_isos:
@@ -1477,12 +1522,15 @@ class UbuntuChecker(Checker):
             if path.name in upstream_set:
                 continue
             if ver is not None and ver not in current_versions:
-                # Superseded within its line, or the whole line is gone from
-                # the tracker; either way, group instead of one alert per file.
+                # Superseded for every artifact in its line, or the whole
+                # line is gone from the tracker; either way, group instead
+                # of one alert per file.
                 stale_versions.add(ver)
             else:
-                # Current-version (or unparseable) file dropped from the tracker;
-                # unusual enough to keep visible individually. torrent.ubuntu.com
+                # Still-current-for-some-artifact (or unparseable) file
+                # dropped from the tracker — e.g. an artifact-specific
+                # point release replaced just this one ISO; unusual enough
+                # to keep visible individually. torrent.ubuntu.com
                 # tracks all official flavors (kubuntu, xubuntu, lubuntu,
                 # edubuntu, ubuntu-mate/budgie/gnome/unity/cinnamon/kylin/studio,
                 # ubuntu-mini-iso, mythbuntu, ...), confirmed directly against
