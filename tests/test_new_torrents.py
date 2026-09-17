@@ -1740,6 +1740,93 @@ class TestUbuntuChecker(unittest.TestCase):
         updates = self._run(status=' '.join(local + [arm64]), page=page)
         self.assertEqual(updates, set())
 
+    # Overlap fixtures (2026-09 live-tracker shape): Canonical keeps
+    # superseded point releases listed for a while, so a mirror can
+    # accidentally hold two revisions of the same artifact at once.
+    # 26.04.1 was never cut for the arm64 live-server, which is what
+    # keeps 26.04 current for that one artifact.
+    OVERLAP_PAGE = (
+        '<td>ubuntu-26.04-desktop-amd64.iso</td>\n'
+        '<td>ubuntu-26.04.1-desktop-amd64.iso</td>\n'
+        '<td>ubuntu-26.04-live-server-arm64.iso</td>\n'
+    )
+    OVERLAP_ISOS = [
+        'ubuntu-26.04-desktop-amd64.iso',
+        'ubuntu-26.04.1-desktop-amd64.iso',
+        'ubuntu-26.04-live-server-arm64.iso',
+    ]
+
+    def test_older_listed_revision_on_disk_alerts_per_file_stale(self):
+        """Accidental on-disk duplicate while the version is still current
+        elsewhere: the mirror holds both revisions of desktop-amd64. The
+        older one must alert by name — not as a grouped STALE:Ubuntu-26.04
+        (which would falsely claim the whole 26.04 point release is dead,
+        while 26.04 remains the newest listed for the arm64 live-server
+        it was never superseded on) — and the still-current arm64
+        live-server stays silent."""
+        for name in self.OVERLAP_ISOS:
+            (self.tmp / name).write_bytes(b'x' * 100)
+        updates = self._run(status=' '.join(self.OVERLAP_ISOS),
+                            page=self.OVERLAP_PAGE)
+        self.assertNotIn('STALE:Ubuntu-26.04', updates)
+        self.assertEqual(
+            updates, {'STALE:ubuntu-26.04-desktop-amd64.iso'})
+
+    def test_older_listed_revision_never_a_new_target(self):
+        """The mirror holds exactly the newest listed revision per artifact
+        (26.04.1 desktop-amd64, 26.04 arm64 live-server) and nothing else:
+        fully compliant, so silence. The older listed 26.04 desktop-amd64
+        must not surface as NEW — a listed revision whose artifact has
+        moved on is cleanup material, not a fetch target (the pre-fix code
+        iterated every listed ISO of a current version and fired
+        NEW:ubuntu-26.04-desktop-amd64.iso here)."""
+        local = ['ubuntu-26.04.1-desktop-amd64.iso',
+                 'ubuntu-26.04-live-server-arm64.iso']
+        for name in local:
+            (self.tmp / name).write_bytes(b'x' * 100)
+        updates = self._run(status=' '.join(local),
+                            page=self.OVERLAP_PAGE)
+        self.assertEqual(updates, set())
+
+    def test_older_listed_revision_of_dead_version_grouped_stale(self):
+        """The whole point release is superseded but Canonical hasn't
+        pruned it yet: every artifact's newest listed revision is
+        24.04.5.1, so the still-listed 24.04.5 ISOs on disk collapse to
+        one grouped STALE:Ubuntu-24.04.5 — one cleanup alert for the dead
+        point release instead of one per leftover file (and no per-file
+        STALEs, since 24.04.5 is no longer the newest for any artifact).
+        The pre-fix code went silent here entirely: every 24.04.5 file was
+        listed upstream, so the stale scan skipped them all."""
+        page = ('<td>ubuntu-24.04.5-desktop-amd64.iso</td>\n'
+                '<td>ubuntu-24.04.5.1-desktop-amd64.iso</td>\n'
+                '<td>ubuntu-24.04.5-live-server-amd64.iso</td>\n'
+                '<td>ubuntu-24.04.5.1-live-server-amd64.iso</td>\n')
+        local = ['ubuntu-24.04.5-desktop-amd64.iso',
+                 'ubuntu-24.04.5.1-desktop-amd64.iso',
+                 'ubuntu-24.04.5-live-server-amd64.iso',
+                 'ubuntu-24.04.5.1-live-server-amd64.iso']
+        for name in local:
+            (self.tmp / name).write_bytes(b'x' * 100)
+        updates = self._run(status=' '.join(local), page=page)
+        self.assertEqual(updates, {'STALE:Ubuntu-24.04.5'})
+
+    def test_overlap_stale_with_precise_new_for_missing_current(self):
+        """Mixed: an accidental on-disk duplicate AND a genuinely missing
+        current artifact at once. The duplicate alerts per-file STALE; the
+        missing arm64 live-server (26.04's newest, never superseded)
+        alerts in per-file form — 26.04 has a local file, so the grouped
+        NEW:Ubuntu-26.04 is off the table — and must not name the older
+        desktop revision."""
+        local = ['ubuntu-26.04-desktop-amd64.iso',
+                 'ubuntu-26.04.1-desktop-amd64.iso']
+        for name in local:
+            (self.tmp / name).write_bytes(b'x' * 100)
+        updates = self._run(status=' '.join(local),
+                            page=self.OVERLAP_PAGE)
+        self.assertEqual(updates,
+                         {'STALE:ubuntu-26.04-desktop-amd64.iso',
+                          'NEW:ubuntu-26.04-live-server-arm64.iso'})
+
     def test_malformed_page_alerts(self):
         updates = self._run(page='<html>nothing here</html>')
         self.assertIn('MALFORMED:Ubuntu-Tracker', updates)

@@ -1059,6 +1059,18 @@ class UbuntuChecker(Checker):
     version, and the union of those is what the alert logic below treats
     as "current".
 
+    "Current" always means the newest *listed* revision of an artifact,
+    and the mirror holds exactly one revision per artifact: Canonical
+    keeps superseded point releases on the tracker for a while (2026-09:
+    ubuntu-26.04-desktop-amd64.iso and ubuntu-24.04.4's ISOs still sit
+    there next to their 26.04.1 / 24.04.5 successors), so a listed-but-
+    older revision of an artifact is never a fetch target, and an
+    on-disk copy of one is an accidental duplicate to clean up, not
+    currency. A superseded point release stays current only for the
+    artifacts it never covered — the arm64 live-server builds that
+    existed at 24.04.4 but were never cut at 24.04.5 keep 24.04.4
+    current alongside 24.04.5.1.
+
     Canonical keeps past-EOL releases on the tracker (12.04.5 has sat
     there since 2017), so a past-EOL line's unmirrored point release
     would alert NEW:Ubuntu-VER on every run. Each line is therefore
@@ -1078,22 +1090,30 @@ class UbuntuChecker(Checker):
     Version-level alerts (currency is per artifact signature — see
     _artifact_key — so a point release covering only some artifacts leaves
     the other artifacts' older version current):
-      NEW:Ubuntu-VER   - a current point release has no local ISOs yet
-      STALE:Ubuntu-VER - local ISOs exist for a point release no longer
-                          current for any artifact in its line (fully
-                          superseded, or the whole line dropped from the
+      NEW:Ubuntu-VER   - a point release that is the newest listed version
+                          for some artifact has no local ISOs yet
+      STALE:Ubuntu-VER - local ISOs exist for a version no longer the
+                          newest listed for any artifact in its line (a
+                          fully superseded point release Canonical hasn't
+                          pruned yet, or the whole line dropped from the
                           tracker)
       EOL:Ubuntu-X.Y   - local ISOs exist for a release line past EOL per
                           _EOL_MODE; repeats every run until the local
                           files are removed
 
     Per-file alerts (per-file checks run once at least one local ISO exists
-    for a given current version):
+    for a given current version; NEW/ORPHAN apply only to ISOs that are
+    the newest listed revision of their artifact — an older listed
+    revision is never a seeding candidate, so transmission not knowing
+    about it is not an orphan):
       NEW:ISO    - tracker ISO absent from disk and unknown to transmission
       ORPHAN:ISO - tracker ISO present on disk but unknown to transmission
       STALE:ISO  - local ISO dropped from the tracker while still current
                    for some artifact (or unparseable) — e.g. an
                    artifact-specific point release replaced just this one
+                   — or a listed-but-superseded revision of an artifact
+                   whose version is still the newest listed for some other
+                   artifact (an accidental on-disk duplicate)
 
       MISSING:*buntu*.iso      - no Ubuntu-family ISOs found on our disk at all
       MALFORMED:Ubuntu-Tracker - tracker page returned no ISOs, or none had a
@@ -1485,6 +1505,25 @@ class UbuntuChecker(Checker):
                 current_by_artifact[key] = v
         current_versions = set(current_by_artifact.values())
 
+        # The upstream ISOs the mirror should actually hold: the newest
+        # listed revision of each artifact. Canonical keeps superseded
+        # point releases listed for a while (2026-09: ubuntu-26.04- and
+        # ubuntu-24.04.4-desktop-amd64.iso still sit on the tracker next
+        # to their 26.04.1 / 24.04.5.1 successors), so "listed" alone
+        # never makes an ISO a target — the mirror holds exactly one
+        # revision per artifact, its newest. The per-file NEW/ORPHAN
+        # branch iterates only these (an older listed revision is neither
+        # fetch material nor a seeding candidate, so transmission not
+        # knowing about it is not an orphan); the stale scan below applies
+        # the same rule in reverse to name accidental on-disk duplicates.
+        target_isos: set[str] = set()
+        for iso in upstream_isos:
+            v = self._version_of(iso)
+            if (v is not None
+                    and current_by_artifact.get(
+                        (self._line_of(v), self._artifact_key(iso))) == v):
+                target_isos.add(iso)
+
         local_isos = sorted(self.iso_dir.glob('*buntu*.iso'))
         if not local_isos:
             self.alert('MISSING:*buntu*.iso')
@@ -1503,7 +1542,12 @@ class UbuntuChecker(Checker):
                 # Already partway through mirroring this line; fall back to
                 # per-file checks so stragglers and orphans still surface
                 # individually, scoped to just this line's current version.
-                for iso in upstream_isos:
+                # Targets only: an older listed revision of an artifact is
+                # never a fetch target (the mirror holds one revision per
+                # artifact — its newest) and transmission is only expected
+                # to know the ISOs we actually seed, so it can neither NEW
+                # nor ORPHAN from here.
+                for iso in target_isos:
                     if self._version_of(iso) == current_version:
                         self.check_iso(iso)
 
@@ -1520,6 +1564,31 @@ class UbuntuChecker(Checker):
                 eol_lines_present.add(line)
                 continue
             if path.name in upstream_set:
+                if ver is not None:
+                    # Listed upstream is not the same as current: Canonical
+                    # keeps superseded point releases listed for a while
+                    # (2026-09: 26.04's and 24.04.4's ISOs sit next to
+                    # their successors), so a local file whose artifact has
+                    # since advanced is an accidental on-disk duplicate —
+                    # cleanup, not currency. The index is always present:
+                    # the file's name is upstream and its line is not EOL
+                    # (that branch continued above), so the max loop
+                    # processed its artifact key.
+                    newest = current_by_artifact[
+                        (line, self._artifact_key(path.name))]
+                    if newest != ver:
+                        # Older listed revision of its own artifact.
+                        # Per-file when the version is still the newest
+                        # listed for some other artifact (a grouped
+                        # STALE:Ubuntu-VER would claim the whole point
+                        # release is dead, which it isn't); grouped when
+                        # no artifact still carries it (the whole point
+                        # release is superseded — one cleanup alert for it
+                        # instead of one per leftover file).
+                        if ver in current_versions:
+                            self.alert(f'STALE:{path.name}')
+                        else:
+                            stale_versions.add(ver)
                 continue
             if ver is not None and ver not in current_versions:
                 # Superseded for every artifact in its line, or the whole
