@@ -437,19 +437,21 @@ class Checker(ABC):
 
     def _record_failure(self, name: str, domain: str, reason: str) -> None:
         """Count one failed fetch for name. Once the threshold is reached,
-        alert the domain together with the reason and the consecutive-
+        raise DOWN:<domain> together with the reason and the consecutive-
         failure count. The alert used to be the bare domain, which threw
         away the one thing worth knowing when it fires: whether the
         upstream timed out, refused the connection, failed DNS, or
-        answered 503. Shared by fetch() and the rsync path so both report
-        the same way.
+        answered 503. The reason is free text (like EXCEPTION:) rather
+        than a per-cause prefix, so rsync's many exit codes and any fetch
+        exception are covered without a catch-all bucket. Shared by
+        fetch() and the rsync path so both report the same way.
         """
         self._failures.increment(name)
         self._debug(f'failed: {reason}')
         # Check threshold against in-memory state; no disk read needed
         if self._failures.at_threshold(name):
             n = self._failures.count(name)
-            self.alert(f'{domain}: {reason} ({n} consecutive failures)')
+            self.alert(f'DOWN:{domain}: {reason} ({n} consecutive failures)')
 
     def body_ok(self, alert_name: str, min_len: int = 250) -> bool:
         """Return False and alert if self._page is empty or below min_len
@@ -1919,10 +1921,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             '  MALFORMED:<src> upstream page or listing returned no usable data\n'
             '  UNSAFE:<name>   upstream-supplied name would escape the download dir\n'
             '  EXCEPTION:<cls> a checker crashed unexpectedly (details follow)\n'
-            '  <domain>[: why] fetches from that upstream domain are failing;\n'
-            '                  the reason and consecutive-failure count follow\n'
-            '                  the colon. A bare <domain> means it returned an\n'
-            '                  empty or error response'
+            '  DOWN:<domain>   fetches from that upstream domain keep failing; the\n'
+            '                  reason and consecutive-failure count follow\n'
+            '  <domain>        that upstream domain returned an empty or error\n'
+            '                  response'
         ),
         epilog=_checkers_epilogue(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
