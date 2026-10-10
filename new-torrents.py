@@ -99,6 +99,10 @@ class FailureTracker:
         """Return True if name has reached the alert threshold."""
         return self._counts.get(name, 0) >= self._threshold
 
+    def count(self, name: str) -> int:
+        """Return the current consecutive-failure count for name."""
+        return self._counts.get(name, 0)
+
     def save(self) -> None:
         """Write counts to disk if they changed. Called once after all
         checkers finish, via a same-directory temp file + os.replace()
@@ -413,13 +417,39 @@ class Checker(ABC):
         # IncompleteRead) from a connection that drops mid-response.
         except (urllib.error.URLError, OSError, zlib.error, EOFError,
                 LookupError, http.client.HTTPException) as e:
-            self._debug(f'fetch failed: {e}')
             self._page = ''
-            self._failures.increment(name)
-            # Check threshold against in-memory state; no disk read needed
-            if self._failures.at_threshold(name):
-                self.alert(domain)
+            self._record_failure(name, domain, self._describe_fetch_error(e))
             return False
+
+    @staticmethod
+    def _describe_fetch_error(e: Exception) -> str:
+        """One-line reason for a failed fetch: the exception type plus its
+        message ('socket.gaierror: [Errno -2] Name or service not known',
+        'TimeoutError: timed out'), or 'HTTP 503 Service Unavailable' for an
+        HTTP error status. URLError wraps the real cause in .reason, so
+        unwrap it rather than reporting a bare 'URLError'."""
+        if isinstance(e, urllib.error.HTTPError):
+            return f'HTTP {e.code} {e.reason}'
+        if isinstance(e, urllib.error.URLError) and isinstance(e.reason, Exception):
+            e = e.reason
+        detail = ' '.join(str(e).split())
+        return f'{type(e).__name__}: {detail}' if detail else type(e).__name__
+
+    def _record_failure(self, name: str, domain: str, reason: str) -> None:
+        """Count one failed fetch for name. Once the threshold is reached,
+        alert the domain together with the reason and the consecutive-
+        failure count. The alert used to be the bare domain, which threw
+        away the one thing worth knowing when it fires: whether the
+        upstream timed out, refused the connection, failed DNS, or
+        answered 503. Shared by fetch() and the rsync path so both report
+        the same way.
+        """
+        self._failures.increment(name)
+        self._debug(f'failed: {reason}')
+        # Check threshold against in-memory state; no disk read needed
+        if self._failures.at_threshold(name):
+            n = self._failures.count(name)
+            self.alert(f'{domain}: {reason} ({n} consecutive failures)')
 
     def body_ok(self, alert_name: str, min_len: int = 250) -> bool:
         """Return False and alert if self._page is empty or below min_len
@@ -1706,6 +1736,9 @@ class DebianChecker(Checker):
                                   or no filename had a parseable version
     """
 
+    # Seconds before the rsync listing is killed and counted as a failure.
+    _RSYNC_TIMEOUT = 60
+
     # The point release is the only dotted numeric run in these filenames; a
     # fixed prefix offset doesn't work since "-edu"/"-live"/"-mac" and the
     # "source" DVDs shift where it falls, so search for it instead.
@@ -1729,21 +1762,26 @@ class DebianChecker(Checker):
                 ],
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=self._RSYNC_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
-            self._debug('rsync timed out')
-            self._failures.increment('Debian')
-            if self._failures.at_threshold('Debian'):
-                self.alert('cdimage.debian.org')
+            self._record_failure(
+                'Debian', 'cdimage.debian.org',
+                f'rsync timed out after {self._RSYNC_TIMEOUT}s')
             return
 
         if result.returncode != 0:
-            self._debug(f'rsync failed (exit {result.returncode})')
-            self._failures.increment('Debian')
-            # Check threshold against in-memory state; no disk read needed
-            if self._failures.at_threshold('Debian'):
-                self.alert('cdimage.debian.org')
+            # rsync's own diagnosis is on stderr ("Connection refused
+            # (111)", "@ERROR: max connections reached", "timeout in data
+            # send/receive"). The first non-blank line is the specific one;
+            # the trailing "rsync error: ... (code N)" line only restates
+            # the exit code, which is reported separately.
+            stderr_lines = [ln.strip() for ln in result.stderr.splitlines()
+                            if ln.strip()]
+            detail = stderr_lines[0][:200] if stderr_lines else 'no stderr output'
+            self._record_failure(
+                'Debian', 'cdimage.debian.org',
+                f'rsync exit {result.returncode}: {detail}')
             return
 
         self._failures.clear('Debian')
@@ -1881,8 +1919,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             '  MALFORMED:<src> upstream page or listing returned no usable data\n'
             '  UNSAFE:<name>   upstream-supplied name would escape the download dir\n'
             '  EXCEPTION:<cls> a checker crashed unexpectedly (details follow)\n'
-            '  <domain>        fetches from that upstream domain are failing:\n'
-            '                  repeated errors, or empty/error responses'
+            '  <domain>[: why] fetches from that upstream domain are failing;\n'
+            '                  the reason and consecutive-failure count follow\n'
+            '                  the colon. A bare <domain> means it returned an\n'
+            '                  empty or error response'
         ),
         epilog=_checkers_epilogue(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
