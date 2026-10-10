@@ -20,6 +20,7 @@ import io
 import json
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -120,6 +121,27 @@ class TestFailureTracker(unittest.TestCase):
     def test_clear_nonexistent_is_noop(self):
         t = self._tracker()
         t.clear('ghost')  # should not raise
+
+    def test_count_reports_consecutive_failures(self):
+        """count() is the tally the DOWN: alert prints, so it must track
+        increment()/clear() exactly and report 0 (not raise) for a name
+        it has never seen."""
+        t = self._tracker()
+        self.assertEqual(t.count('svc'), 0)
+        t.increment('svc')
+        t.increment('svc')
+        self.assertEqual(t.count('svc'), 2)
+        t.clear('svc')
+        self.assertEqual(t.count('svc'), 0)
+
+    def test_count_survives_reload(self):
+        """The alert's "N consecutive failures" spans runs, so the count
+        must come back from disk, not restart at zero."""
+        t = self._tracker()
+        t.increment('svc')
+        t.increment('svc')
+        t.save()
+        self.assertEqual(self._tracker().count('svc'), 2)
 
     def test_save_writes_json(self):
         t = self._tracker()
@@ -498,13 +520,112 @@ class TestCheckerBase(unittest.TestCase):
         self.assertEqual(c.updates, set())
 
     def test_fetch_alerts_at_threshold(self):
+        """At the threshold the alert is DOWN:<domain> plus the reason and
+        the consecutive-failure count -- not the bare domain, which used
+        to discard why the fetch failed. URLError('down') has a plain-str
+        .reason, so the URLError itself is what gets described."""
         c = self._checker()
         err = urllib.error.URLError('down')
         with patch('urllib.request.urlopen', side_effect=err):
             c.fetch('https://example.com/x', 'svc')
             c.fetch('https://example.com/x', 'svc')
             c.fetch('https://example.com/x', 'svc')
-        self.assertTrue(c.updates)
+        self.assertEqual(
+            c.updates,
+            {'DOWN:example.com: URLError: <urlopen error down> '
+             '(3 consecutive failures)'},
+        )
+
+    def _prime_failures(self, name, n):
+        """Persisted state of n earlier consecutive failures, so the next
+        failed fetch is number n + 1."""
+        for _ in range(n):
+            self.ftrack.increment(name)
+
+    def test_fetch_alert_names_domain_not_counter_name(self):
+        """The alert is keyed on the URL's domain; the counter name ('svc'
+        here, a distro name in real use) is bookkeeping only and must not
+        leak into the alert."""
+        self._prime_failures('svc', 2)
+        c = self._checker()
+        with patch('urllib.request.urlopen',
+                   side_effect=ConnectionRefusedError(111, 'Connection refused')):
+            c.fetch('https://mirror.example.org/path/x', 'svc')
+        (alert,) = c.updates
+        self.assertTrue(alert.startswith('DOWN:mirror.example.org: '), alert)
+        self.assertNotIn('svc', alert)
+
+    def test_fetch_alert_reports_dns_failure(self):
+        self._prime_failures('svc', 2)
+        c = self._checker()
+        err = urllib.error.URLError(
+            socket.gaierror(-2, 'Name or service not known'))
+        with patch('urllib.request.urlopen', side_effect=err):
+            c.fetch('https://example.com/x', 'svc')
+        self.assertEqual(
+            c.updates,
+            {'DOWN:example.com: gaierror: [Errno -2] Name or service not '
+             'known (3 consecutive failures)'},
+        )
+
+    def test_fetch_alert_reports_http_status(self):
+        self._prime_failures('svc', 2)
+        c = self._checker()
+        err = urllib.error.HTTPError('https://example.com/x', 503,
+                                     'Service Unavailable', {}, io.BytesIO(b''))
+        with patch('urllib.request.urlopen', side_effect=err):
+            c.fetch('https://example.com/x', 'svc')
+        self.assertEqual(
+            c.updates,
+            {'DOWN:example.com: HTTP 503 Service Unavailable '
+             '(3 consecutive failures)'},
+        )
+
+    def test_fetch_alert_count_reflects_prior_failures(self):
+        """The count is the persisted consecutive total, so a long outage
+        reads as such rather than always saying 3."""
+        self._prime_failures('svc', 5)
+        c = self._checker()
+        with patch('urllib.request.urlopen',
+                   side_effect=TimeoutError('timed out')):
+            c.fetch('https://example.com/x', 'svc')
+        self.assertEqual(
+            c.updates,
+            {'DOWN:example.com: TimeoutError: timed out '
+             '(6 consecutive failures)'},
+        )
+
+    def test_describe_fetch_error(self):
+        """One line per failure: type + message, URLError unwrapped to its
+        cause, HTTPError reduced to its status, whitespace collapsed, and
+        no dangling colon when an exception carries no message."""
+        cases = [
+            (urllib.error.HTTPError('https://x/', 503, 'Service Unavailable',
+                                    {}, io.BytesIO(b'')),
+             'HTTP 503 Service Unavailable'),
+            (urllib.error.URLError(
+                socket.gaierror(-2, 'Name or service not known')),
+             'gaierror: [Errno -2] Name or service not known'),
+            (urllib.error.URLError(TimeoutError('timed out')),
+             'TimeoutError: timed out'),
+            (urllib.error.URLError('unknown url type: foo'),
+             'URLError: <urlopen error unknown url type: foo>'),
+            (TimeoutError('timed out'), 'TimeoutError: timed out'),
+            (ConnectionRefusedError(111, 'Connection refused'),
+             'ConnectionRefusedError: [Errno 111] Connection refused'),
+            (EOFError('Compressed file ended before the end-of-stream '
+                      'marker was reached'),
+             'EOFError: Compressed file ended before the end-of-stream '
+             'marker was reached'),
+            (LookupError('unknown encoding: totally-bogus-charset'),
+             'LookupError: unknown encoding: totally-bogus-charset'),
+            (OSError('first line\n    second   line'),
+             'OSError: first line second line'),
+            (OSError(), 'OSError'),
+        ]
+        for exc, expected in cases:
+            with self.subTest(exc=repr(exc)):
+                self.assertEqual(nt.Checker._describe_fetch_error(exc), expected)
 
     def test_fetch_handles_corrupt_deflate_body(self):
         """zlib.error from a corrupt Content-Encoding: deflate body must not
@@ -2407,17 +2528,46 @@ DEBIAN_RSYNC_OUTPUT_WIDE = DEBIAN_RSYNC_OUTPUT + (
 )
 
 
+# rsync's stderr for a plain failure: the specific diagnosis first, then the
+# generic "rsync error: ... (code N)" summary line. DebianChecker reports the
+# first non-blank line plus the exit code; the summary line only restates it.
+DEBIAN_RSYNC_STDERR_FIRST = (
+    'rsync: [receiver] write failed on "x": No space left on device (28)'
+)
+DEBIAN_RSYNC_STDERR = (
+    DEBIAN_RSYNC_STDERR_FIRST + '\n'
+    'rsync error: error in file IO (code 11) at receiver.c(378) '
+    '[receiver=3.2.7]\n'
+)
+
+
 class TestDebianChecker(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
-    def _rsync(self, stdout=DEBIAN_RSYNC_OUTPUT, returncode=0):
+    def _rsync(self, stdout=DEBIAN_RSYNC_OUTPUT, returncode=0, stderr=''):
         r = MagicMock()
         r.returncode = returncode
         r.stdout = stdout
+        # subprocess.run(text=True) always yields a str here. Leaving the
+        # MagicMock auto-attribute in place would let .splitlines() "work"
+        # (iterating a MagicMock yields nothing) and silently skip the very
+        # stderr handling the failure tests are meant to exercise.
+        r.stderr = stderr
         return r
+
+    def _checker_after_failures(self, prior, display=None):
+        """A DebianChecker whose persisted counter already holds `prior`
+        consecutive failures, so its next failure is number prior + 1.
+        Returns (checker, tracker)."""
+        ftrack_path = self.tmp / 'f.json'
+        ftrack_path.write_text(json.dumps({'Debian': prior}))
+        ftrack = nt.FailureTracker(ftrack_path, 3)
+        c = make_checker(nt.DebianChecker, self.tmp, failures=ftrack,
+                         display=display)
+        return c, ftrack
 
     def _run(self, status='', rsync_result=None):
         if rsync_result is None:
@@ -2501,26 +2651,105 @@ class TestDebianChecker(unittest.TestCase):
 
     def test_rsync_failure_updates_display(self):
         """A plain nonzero-exit rsync failure should update the live status
-        board too, matching the timeout branch's self._debug() call --
-        previously only the timeout path did this, leaving --verbose mode
-        silent about an ordinary rsync failure."""
-        ftrack_path = self.tmp / 'f.json'
-        ftrack_path.write_text('{}')
-        ftrack = nt.FailureTracker(ftrack_path, 3)
+        board too, matching the timeout branch -- previously only the
+        timeout path did this, leaving --verbose mode silent about an
+        ordinary rsync failure. The board now shows the same reason the
+        alert carries (exit code plus rsync's own first stderr line)."""
         display = MagicMock()
-        c = make_checker(nt.DebianChecker, self.tmp, failures=ftrack, display=display)
-        with patch('subprocess.run', return_value=self._rsync(returncode=11)):
+        c, _ = self._checker_after_failures(0, display=display)
+        with patch('subprocess.run', return_value=self._rsync(
+                returncode=11, stderr=DEBIAN_RSYNC_STDERR)):
             c.check()
-        display.update.assert_any_call('DebianChecker', 'rsync failed (exit 11)')
+        display.update.assert_any_call(
+            'DebianChecker',
+            f'failed: rsync exit 11: {DEBIAN_RSYNC_STDERR_FIRST}')
 
     def test_rsync_failure_at_threshold_alerts(self):
-        ftrack_path = self.tmp / 'f.json'
-        ftrack_path.write_text(json.dumps({'Debian': 2}))
-        ftrack = nt.FailureTracker(ftrack_path, 3)
-        c = make_checker(nt.DebianChecker, self.tmp, failures=ftrack)
-        with patch('subprocess.run', return_value=self._rsync(returncode=11)):
+        """The third consecutive failure raises DOWN:<domain> carrying the
+        exit code, rsync's own diagnosis (first stderr line) and the
+        consecutive-failure count -- not just the bare domain."""
+        c, _ = self._checker_after_failures(2)
+        with patch('subprocess.run', return_value=self._rsync(
+                returncode=11, stderr=DEBIAN_RSYNC_STDERR)):
             c.check()
-        self.assertTrue(c.updates)
+        self.assertEqual(
+            c.updates,
+            {'DOWN:cdimage.debian.org: rsync exit 11: '
+             f'{DEBIAN_RSYNC_STDERR_FIRST} (3 consecutive failures)'},
+        )
+
+    def test_rsync_failure_below_threshold_no_alert(self):
+        """Transient outages stay silent until the threshold: the second
+        consecutive failure counts but must not alert, for either failure
+        mode."""
+        failures = {
+            'nonzero exit': dict(return_value=self._rsync(
+                returncode=11, stderr=DEBIAN_RSYNC_STDERR)),
+            'timeout': dict(side_effect=subprocess.TimeoutExpired(
+                'rsync', nt.DebianChecker._RSYNC_TIMEOUT)),
+        }
+        for label, kwargs in failures.items():
+            with self.subTest(label):
+                c, ftrack = self._checker_after_failures(1)
+                with patch('subprocess.run', **kwargs):
+                    c.check()
+                self.assertEqual(c.updates, set())
+                self.assertEqual(ftrack.count('Debian'), 2)
+
+    def test_rsync_failure_reports_first_nonblank_stderr_line(self):
+        """rsync's specific diagnosis is the first non-blank stderr line;
+        leading blank lines are skipped and the trailing generic
+        'rsync error: ... (code N)' summary is left out, since the exit
+        code is reported separately."""
+        stderr = (
+            '\n   \n'
+            'rsync: failed to connect to cdimage.debian.org '
+            '(2001:6b0:19::165): Connection refused (111)\n'
+            'rsync error: error in socket IO (code 10) at '
+            'clientserver.c(139) [Receiver=3.2.7]\n'
+        )
+        c, _ = self._checker_after_failures(2)
+        with patch('subprocess.run', return_value=self._rsync(
+                returncode=10, stderr=stderr)):
+            c.check()
+        self.assertEqual(
+            c.updates,
+            {'DOWN:cdimage.debian.org: rsync exit 10: rsync: failed to '
+             'connect to cdimage.debian.org (2001:6b0:19::165): Connection '
+             'refused (111) (3 consecutive failures)'},
+        )
+
+    def test_rsync_failure_without_stderr_still_reports_exit_code(self):
+        c, _ = self._checker_after_failures(2)
+        with patch('subprocess.run', return_value=self._rsync(
+                returncode=12, stderr='')):
+            c.check()
+        self.assertEqual(
+            c.updates,
+            {'DOWN:cdimage.debian.org: rsync exit 12: no stderr output '
+             '(3 consecutive failures)'},
+        )
+
+    def test_rsync_failure_stderr_detail_truncated(self):
+        """An enormous first stderr line is capped at 200 characters so one
+        pathological message can't flood the healthchecks.io body."""
+        c, _ = self._checker_after_failures(2)
+        with patch('subprocess.run', return_value=self._rsync(
+                returncode=11, stderr='x' * 500 + '\n')):
+            c.check()
+        self.assertEqual(
+            c.updates,
+            {'DOWN:cdimage.debian.org: rsync exit 11: ' + 'x' * 200 +
+             ' (3 consecutive failures)'},
+        )
+
+    def test_rsync_failure_count_reflects_prior_failures(self):
+        c, _ = self._checker_after_failures(5)
+        with patch('subprocess.run', return_value=self._rsync(
+                returncode=11, stderr=DEBIAN_RSYNC_STDERR)):
+            c.check()
+        (alert,) = c.updates
+        self.assertTrue(alert.endswith('(6 consecutive failures)'), alert)
 
     def test_rsync_timeout_increments_counter(self):
         ftrack_path = self.tmp / 'f.json'
@@ -2532,13 +2761,37 @@ class TestDebianChecker(unittest.TestCase):
         self.assertEqual(ftrack._counts.get('Debian', 0), 1)
 
     def test_rsync_timeout_at_threshold_alerts(self):
-        ftrack_path = self.tmp / 'f.json'
-        ftrack_path.write_text(json.dumps({'Debian': 2}))
-        ftrack = nt.FailureTracker(ftrack_path, 3)
-        c = make_checker(nt.DebianChecker, self.tmp, failures=ftrack)
-        with patch('subprocess.run', side_effect=subprocess.TimeoutExpired('rsync', 60)):
+        """A timeout names itself and the limit that was hit, so a hung
+        rsync is distinguishable at a glance from a refused connection."""
+        limit = nt.DebianChecker._RSYNC_TIMEOUT
+        c, _ = self._checker_after_failures(2)
+        with patch('subprocess.run',
+                   side_effect=subprocess.TimeoutExpired('rsync', limit)):
             c.check()
-        self.assertIn('cdimage.debian.org', c.updates)
+        self.assertEqual(
+            c.updates,
+            {f'DOWN:cdimage.debian.org: rsync timed out after {limit}s '
+             '(3 consecutive failures)'},
+        )
+
+    def test_rsync_timeout_updates_display(self):
+        limit = nt.DebianChecker._RSYNC_TIMEOUT
+        display = MagicMock()
+        c, _ = self._checker_after_failures(0, display=display)
+        with patch('subprocess.run',
+                   side_effect=subprocess.TimeoutExpired('rsync', limit)):
+            c.check()
+        display.update.assert_any_call(
+            'DebianChecker', f'failed: rsync timed out after {limit}s')
+
+    def test_rsync_runs_with_the_class_timeout(self):
+        """The limit passed to subprocess.run and the one quoted in the
+        alert come from the same constant, so they can't drift apart."""
+        c = make_checker(nt.DebianChecker, self.tmp)
+        with patch('subprocess.run', return_value=self._rsync()) as run:
+            c.check()
+        self.assertEqual(run.call_args.kwargs['timeout'],
+                         nt.DebianChecker._RSYNC_TIMEOUT)
 
     def test_malformed_rsync_output_alerts(self):
         # rsync succeeds but returns no .torrent lines
@@ -2836,6 +3089,17 @@ class TestMain(unittest.TestCase):
         self.assertIn('usage:', out)
         for cls in nt.CHECKERS:
             self.assertIn(cls.__name__.removesuffix('Checker').lower(), out)
+
+    def test_help_documents_down_alert_form(self):
+        """--help is the only place the alert vocabulary is documented, so
+        the DOWN:<domain> form (and the bare <domain> form body_ok() still
+        raises) must be listed, or the first DOWN: alert is a mystery."""
+        buf = io.StringIO()
+        with patch('sys.stdout', buf), self.assertRaises(SystemExit):
+            nt._parse_args(['--help'])
+        out = buf.getvalue()
+        self.assertIn('DOWN:<domain>', out)
+        self.assertIn('consecutive-failure count', out)
 
     def test_unknown_checker_name_is_usage_error_before_lock(self):
         """An unknown checker name is a usage error (exit 2, valid
