@@ -13,6 +13,7 @@ even if status_update.py is ever renamed to something hyphenated.
 Adjust SCRIPT_PATH below if you rename or move files.
 """
 
+import dataclasses
 import importlib.util
 import unittest
 from pathlib import Path
@@ -27,6 +28,11 @@ spec.loader.exec_module(su)
 # A representative transmission-remote -l output, combining real-world
 # column values seen in the wild: percentages, GB/MB/kB sizes, mins/hrs/days
 # ETAs, None/Unknown placeholders, and a multi-word torrent name.
+#
+# The spacing is hand-written for the parser and sort tests. It is NOT
+# transmission-remote's real column layout (render() does not reproduce its
+# rows), so don't use it to judge rendering; REAL_4_1_3_RUNNING and
+# REAL_4_1_3_STARRED below are the byte-for-byte references for that.
 SAMPLE_OUTPUT = '\n'.join([
     'ID   Done   Have      ETA      Up   Down  Ratio  Status      Name',
     '1    100%   2.26 GB   Done     0.0  0.0   0.11   Idle        Arch Linux x86_64 ISO',
@@ -37,6 +43,29 @@ SAMPLE_OUTPUT = '\n'.join([
     '5    100%   4.12 GB   2 hrs    0.0  0.0   49.20  Seeding     ubuntu-24.04.1-desktop-amd64.iso',
     '6    n/a    None      Unknown  0.0  0.0   None   Idle        unresolved-magnet-link',
     'Sum:        9.0 GB              0.0  0.0',
+])
+
+# Verbatim `transmission-remote -l` output from Transmission 4.1.3 (build
+# 838877323f, the version on the production host), captured 2026-10-11. Unlike
+# SAMPLE_OUTPUT these are the byte-for-byte references AGENTS.md asks for:
+# every space below was printed by Transmission, so
+# TransmissionTable.from_output(...).render() has to reproduce them exactly.
+#
+# Both come from the same torrent on a throwaway daemon. The second shows a
+# row with a local error: Transmission prints '*' in the space after the ID
+# whenever the torrent's RPC `error` field is non-zero (print_torrent_list()
+# in utils/remote.cc). Here the torrent's data file was deleted while it was
+# stopped and a start was then attempted, so Transmission refused the start,
+# recorded "No data found! ..." as the error, and left the torrent Stopped.
+REAL_4_1_3_RUNNING = '\n'.join([
+    '    ID    Done       Have  ETA              Up      Down  Ratio  Status       Name',
+    '     1    100%     100 kB  Done            0.0       0.0   0.00  Idle         probe.bin',
+    'Sum:               100 kB                  0.0       0.0',
+])
+REAL_4_1_3_STARRED = '\n'.join([
+    '    ID    Done       Have  ETA              Up      Down  Ratio  Status       Name',
+    '     1*   100%     100 kB  Done            0.0       0.0   0.00  Stopped      probe.bin',
+    'Sum:               100 kB                  0.0       0.0',
 ])
 
 
@@ -167,6 +196,16 @@ class TestTransmissionTable(unittest.TestCase):
         table.sorted_by('ratio')
         self.assertEqual([row.id for row in table.rows], original_order)
 
+    def test_sorted_by_id_strips_the_error_mark(self) -> None:
+        # An error-flagged torrent's ID carries Transmission's '*' ('2*'), and
+        # float('2*') would raise, so the sort key has to strip it. IDs 2* and
+        # 10 also tell numeric order from string order ('10' < '2*' as text).
+        running = su.TransmissionTable.from_output(REAL_4_1_3_RUNNING).rows[0]
+        starred = su.TransmissionTable.from_output(REAL_4_1_3_STARRED).rows[0]
+        rows = [dataclasses.replace(running, id='10'), dataclasses.replace(starred, id='2*')]
+        table = su.TransmissionTable('header', rows, 'Sum:')
+        self.assertEqual([row.id for row in table.sorted_by('id', reverse=False).rows], ['2*', '10'])
+
     def test_render_round_trips_header_and_footer(self) -> None:
         table = su.TransmissionTable.from_output(SAMPLE_OUTPUT)
         rendered = table.render()
@@ -231,6 +270,55 @@ class TestTransmissionTable(unittest.TestCase):
         table = su.TransmissionTable('ID   Done   Have', [], 'Sum:')
         rendered = table.render()
         self.assertEqual(rendered, 'ID   Done   Have\nSum:')
+
+
+class TestRenderGolden(unittest.TestCase):
+    """render() against Transmission's own -l output, character for character.
+
+    The alignment tests above compare columns with each other, which a wrong
+    width, gutter or error mark can leave intact (every row shifts together).
+    Only a full-text comparison against Transmission's own output catches those.
+    The first three tests use real captures; the last uses a row derived from
+    Transmission's format string, and says so.
+    """
+
+    def assert_renders_exactly(self, capture: str) -> None:
+        self.assertEqual(su.TransmissionTable.from_output(capture).render(), capture)
+
+    def test_running_torrent_is_reproduced_exactly(self) -> None:
+        self.assert_renders_exactly(REAL_4_1_3_RUNNING)
+
+    def test_starred_torrent_is_reproduced_exactly(self) -> None:
+        # '*' replaces the space after the ID ('     1*' versus '     1 '),
+        # with no extra gap before or after it.
+        self.assert_renders_exactly(REAL_4_1_3_STARRED)
+
+    def test_error_mark_stays_on_the_id_when_parsed(self) -> None:
+        # render() splits the mark back off the ID, so from_line() has to keep
+        # '1*' as one field; the sort-by-id key strips the same star.
+        running = su.TransmissionTable.from_output(REAL_4_1_3_RUNNING).rows[0]
+        starred = su.TransmissionTable.from_output(REAL_4_1_3_STARRED).rows[0]
+        self.assertEqual((running.id, running.status), ('1', 'Idle'))
+        self.assertEqual((starred.id, starred.status), ('1*', 'Stopped'))
+
+    def test_over_wide_value_overflows_its_own_row_only(self) -> None:
+        # Transmission's format specs only set minimum widths ({:>5s} for
+        # Ratio), so a value that doesn't fit pushes the rest of its own row
+        # right and nothing else moves; no column is widened for the whole
+        # table (AGENTS.md: "no auto-widening"). Overflowing the ratio needs
+        # 6 characters, e.g. '12,345': tr_strpercent() in utils.cc formats
+        # with {:.0Lf}, so a locale that groups digits prints it that way.
+        #
+        # No real capture of this exists yet, so unlike the ones above this
+        # fixture is derived from print_torrent_list()'s format string, not
+        # captured: row 2 is the running capture's row with a new ID and
+        # ratio. Replace it with a real capture if one ever turns up.
+        self.assert_renders_exactly('\n'.join([
+            '    ID    Done       Have  ETA              Up      Down  Ratio  Status       Name',
+            '     1    100%     100 kB  Done            0.0       0.0   0.00  Idle         probe.bin',
+            '     2    100%     100 kB  Done            0.0       0.0  12,345  Idle         probe.bin',
+            'Sum:               200 kB                  0.0       0.0',
+        ]))
 
 
 class TestStatusReport(unittest.TestCase):
