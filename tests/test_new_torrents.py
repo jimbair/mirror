@@ -988,20 +988,20 @@ MINT_ISOS = ['linuxmint-22.0-cinnamon-64bit.iso', 'linuxmint-22.0-mate-64bit.iso
 # download_all.php support-page fixtures. Each supported release takes
 # one table row; the version cell is <td rowspan="3">X.Y</td> (bare
 # form for a brand-new major). The codename cells are not parsed.
-def mint_support_page(*versions):
+def mint_support_page(*versions, lmde=()):
     return ('<table><tr><th>Version</th><th>Codename</th><th>Edition</th>'
             '<th>Package base</th><th>Status</th></tr>' + ''.join(
                 f'<tr><td rowspan="3">{v}</td><td rowspan="3">Example</td>'
-                '<td>Cinnamon</td><td rowspan="3">Ubuntu</td>'
+                f'<td>Cinnamon</td><td rowspan="3">{base}</td>'
                 '<td rowspan="3">Long term support release</td></tr>'
-                for v in versions) + '</table>')
+                for v, base in ([(v, 'Ubuntu') for v in versions]
+                                + [(v, 'Debian Trixie') for v in lmde])) + '</table>')
 
 
 MINT_SUPPORTED = mint_support_page('22.0')
 MINT_SUPPORTED_BOTH = mint_support_page('22.0', '21.3')
-# The same page also carries an LMDE row (version "7"); "7" never
-# appears in the pub index, so check() must filter it out.
-MINT_SUPPORTED_LMDE = mint_support_page('22.0', '7')
+# LMDE has its own version numbers and a Debian package base.
+MINT_SUPPORTED_LMDE = mint_support_page('22.0', lmde=('7',))
 MINT_VER_21_3 = (
     '<a href="linuxmint-21.3-cinnamon-64bit.iso">linuxmint-21.3-cinnamon-64bit.iso</a>'
     '<a href="linuxmint-21.3-mate-64bit.iso">linuxmint-21.3-mate-64bit.iso</a>'
@@ -1367,8 +1367,9 @@ class TestMintChecker(unittest.TestCase):
         local = MINT_ISOS + ['linuxmint-21.3-cinnamon-64bit.iso']
         for name in local:
             (self.tmp / name).write_bytes(b'x')
-        for page in (mint_support_page('7'), MINT_SUPPORTED[:-8],
+        for page in (mint_support_page(lmde=('7',)), MINT_SUPPORTED[:-8],
                      MINT_SUPPORTED.replace('</tr></table>', '</table>'),
+                     MINT_SUPPORTED.replace('>Ubuntu<', '>Unknown<'),
                      MINT_SUPPORTED.replace('rowspan="3">22.0', 'rowspan="3">broken')):
             with self.subTest(page=page):
                 self.assertEqual(self._run(status=' '.join(local), pages=[
@@ -1383,7 +1384,7 @@ class TestMintChecker(unittest.TestCase):
         self.assertEqual(self._run(status=' '.join(local), pages=[
             index, MINT_VER, MINT_SUPPORTED_BOTH]), expected)
         cache = (self.tmp / 'mint-supported.json').read_bytes()
-        for bad_page in (None, mint_support_page('7'), MINT_SUPPORTED[:-8]):
+        for bad_page in (None, mint_support_page(lmde=('7',)), MINT_SUPPORTED[:-8]):
             with self.subTest(page=bad_page):
                 c = make_checker(nt.MintChecker, self.tmp, ' '.join(local))
                 seq = fake_fetch_seq(c, [index, MINT_VER])
@@ -1413,12 +1414,35 @@ class TestMintChecker(unittest.TestCase):
         for name in MINT_ISOS + ['linuxmint-21.3-cinnamon-64bit.iso']:
             (self.tmp / name).write_bytes(b'x')
         for payload in (b'\xff', b'[]', b'{"supported":[],"archive":[]}',
-                        b'{"supported":["21.3"],"archive":["22.0"]}'):
+                        b'{"supported":["bad"],"archive":["22.0"]}'):
             with self.subTest(payload=payload):
                 (self.tmp / 'mint-supported.json').write_bytes(payload)
                 self.assertEqual(self._run(status=' '.join(MINT_ISOS), pages=[
                     MINT_INDEX, MINT_VER, '<html>broken</html>']),
                     {'MALFORMED:Linux-Mint-Supported'})
+
+    def test_supported_release_missing_from_archive_is_never_eol(self):
+        local = MINT_ISOS + ['linuxmint-23-cinnamon-64bit.iso',
+                             'linuxmint-20.3-cinnamon-64bit.iso']
+        for name in local:
+            (self.tmp / name).write_bytes(b'x')
+        index = '<a href="20.3/">20.3/</a>' + MINT_INDEX
+        for support in (mint_support_page('22.0', '23'), '<html>broken</html>'):
+            with self.subTest(support=support):
+                expected = {'EOL:Linux-Mint-20.3'}
+                if support.startswith('<html>'):
+                    expected.add('MALFORMED:Linux-Mint-Supported')
+                self.assertEqual(self._run(status=' '.join(local), pages=[
+                    index, MINT_VER, support]), expected)
+        cached = make_checker(nt.MintChecker, self.tmp)._support_cache_load()
+        self.assertEqual(cached, ({'22.0', '23'}, {'20.3', '21.3', '22.0'}))
+
+    def test_support_and_archive_sets_can_be_disjoint(self):
+        c = make_checker(nt.MintChecker, self.tmp)
+        c._support_cache_save({'23'}, {'22.0'})
+        self.assertEqual(c._support_cache_load(), ({'23'}, {'22.0'}))
+        c._page = mint_support_page('23')
+        self.assertEqual(c._parse_supported(), {'23'})
 
     def test_failed_support_cache_replace_preserves_cache_and_checks(self):
         for name in MINT_ISOS:
@@ -1435,15 +1459,14 @@ class TestMintChecker(unittest.TestCase):
         self.assertEqual(c._supported_cache_path.read_bytes(), previous)
 
     def test_lmde_row_on_support_page_is_filtered_out(self):
-        """The support page also carries an LMDE row (version "7"); "7"
-        never appears in the pub index, so check() must drop it via the
-        intersection -- otherwise a new LMDE release would loop
-        reporting NEW:Linux-Mint-7 on every run."""
+        """Identify LMDE by package base, even if a version number collides
+        with a Mint archive directory. Its artifacts are not linuxmint ISOs.
+        """
         for iso in MINT_ISOS:
             (self.tmp / iso).write_bytes(b'x' * 100)
         updates = self._run(
             status=' '.join(MINT_ISOS),
-            pages=[MINT_INDEX, MINT_VER, MINT_SUPPORTED_LMDE],
+            pages=['<a href="7/">7/</a>' + MINT_INDEX, MINT_VER, MINT_SUPPORTED_LMDE],
         )
         self.assertEqual(updates, set())
 

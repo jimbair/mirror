@@ -705,15 +705,15 @@ class MintChecker(Checker):
     # (a brand-new major uses the bare form, e.g. "21", matching the pub
     # index and the filenames). The page also carries an LMDE row
     # (version "7"), which is not a linuxmint release -- its artifacts
-    # are lmde-*.iso under a different archive path -- so check()
-    # intersects the parsed versions with the pub index to drop it.
+    # are lmde-*.iso under a different archive path. The package-base
+    # column distinguishes Debian-based LMDE from Ubuntu-based Mint.
     _supported_cache_path: Path = MINT_SUPPORT_CACHE_FILE
 
-    def _parse_supported(self, archive: set[str]) -> set[str] | None:
+    def _parse_supported(self) -> set[str] | None:
         """Accept a complete releases table, not an isolated numeric cell.
 
         An LMDE-only response or a truncated table must not turn an empty
-        intersection into evidence that every older Mint release is EOL.
+        supported set into evidence that every older Mint release is EOL.
         Header and row validation also catch one row drifting while other
         rows still happen to match; whitespace/attribute ordering is noise.
         """
@@ -741,10 +741,18 @@ class MintChecker(Checker):
                 if re.search(r'\browspan\s*=', attrs, re.IGNORECASE):
                     if not re.fullmatch(r'\d+(?:\.\d+)*', text) or len(cells) != 5:
                         return None
-                    found.add(text)
+                    base = ' '.join(html.unescape(re.sub(
+                        r'<[^>]+>', ' ', cells[3][1])).split()).lower()
+                    if re.match(r'ubuntu(?:\s|$)', base):
+                        found.add(text)
+                    elif not re.match(r'debian(?:\s|$)', base):
+                        return None
                 elif re.fullmatch(r'\d+(?:\.\d+)*', text):
                     return None
-            return found & archive or None
+            # Publication and cache timing can leave the archive listing
+            # behind this page. Never discard explicit support evidence
+            # merely because that independent listing lacks a version.
+            return found or None
         return None
 
     def _support_cache_save(self, supported: set[str], archive: set[str]) -> None:
@@ -773,7 +781,9 @@ class MintChecker(Checker):
                                re.fullmatch(r'\d+(?:\.\d+)*', v) for v in values)):
                 return None
         supported, archive = set(raw['supported']), set(raw['archive'])
-        return (supported, archive) if supported <= archive else None
+        # A newer supported version need not have appeared in the archive
+        # snapshot yet. Keep the sets independent, just as on a fresh fetch.
+        return supported, archive
 
     def _version_of(self, filename: str) -> str | None:
         m = self._VERSION_RE.search(filename)
@@ -854,7 +864,7 @@ class MintChecker(Checker):
         eol_known: set[str] | None = None
         if self.fetch('https://linuxmint.com/download_all.php',
                       'Linux-Mint-Supported'):
-            supported = self._parse_supported(set(versions))
+            supported = self._parse_supported()
             if supported is not None:
                 self._support_cache_save(supported, set(versions))
             else:
