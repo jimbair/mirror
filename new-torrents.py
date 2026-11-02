@@ -54,6 +54,10 @@ LOCK_FILE = Path.home() / '.config' / 'new-torrents' / 'lock'
 # consecutive failures, so a one-off outage is only visible as those
 # false NEWs).
 UBUNTU_EOL_CACHE_FILE = Path.home() / '.config' / 'new-torrents' / 'ubuntu-eol.json'
+# Membership in the last complete Mint support table, plus the archive
+# versions known at that instant. Cached absence says nothing about a
+# release that appeared later, so it must never make that new release EOL.
+MINT_SUPPORT_CACHE_FILE = Path.home() / '.config' / 'new-torrents' / 'mint-supported.json'
 
 
 ###########
@@ -584,8 +588,9 @@ class MintChecker(Checker):
     ISOs of a version the support page doesn't list are past EOL and are
     surfaced as EOL:Linux-Mint-VER, repeating every run until the local
     files are removed. When the support page is unfetchable or
-    unparseable the checker fails open: only the newest version is
-    tracked and nothing counts as past EOL.
+    unparseable, the last complete support table is used instead; only
+    when no cache exists does the checker fail open and track just the
+    newest version without classifying anything as past EOL.
 
     Version-level alerts:
       NEW:Linux-Mint-VER   - a tracked version has no matching ISOs on disk yet
@@ -625,7 +630,73 @@ class MintChecker(Checker):
     # (version "7"), which is not a linuxmint release -- its artifacts
     # are lmde-*.iso under a different archive path -- so check()
     # intersects the parsed versions with the pub index to drop it.
-    _SUPPORTED_RE = re.compile(r'<td rowspan="\d+">(\d+(?:\.\d+)*)</td>')
+    _supported_cache_path: Path = MINT_SUPPORT_CACHE_FILE
+
+    def _parse_supported(self, archive: set[str]) -> set[str] | None:
+        """Accept a complete releases table, not an isolated numeric cell.
+
+        An LMDE-only response or a truncated table must not turn an empty
+        intersection into evidence that every older Mint release is EOL.
+        Header and row validation also catch one row drifting while other
+        rows still happen to match; whitespace/attribute ordering is noise.
+        """
+        for table in re.findall(r'<table\b[^>]*>(.*?)</table>', self._page,
+                                re.DOTALL | re.IGNORECASE):
+            rows = re.findall(r'<tr\b[^>]*>(.*?)</tr>', table,
+                              re.DOTALL | re.IGNORECASE)
+            if not rows:
+                continue
+            headers = [' '.join(re.sub(r'<[^>]+>', ' ', c).split()).lower()
+                       for c in re.findall(r'<th\b[^>]*>(.*?)</th>', rows[0],
+                                           re.DOTALL | re.IGNORECASE)]
+            if headers != ['version', 'codename', 'edition', 'package base', 'status']:
+                continue
+            if len(re.findall(r'<tr\b', table, re.IGNORECASE)) != len(rows):
+                return None
+            found: set[str] = set()
+            for row in rows[1:]:
+                cells = re.findall(r'<td\b([^>]*)>(.*?)</td>', row,
+                                   re.DOTALL | re.IGNORECASE)
+                if not cells:
+                    return None
+                attrs, first = cells[0]
+                text = re.sub(r'<[^>]+>', '', first).strip()
+                if re.search(r'\browspan\s*=', attrs, re.IGNORECASE):
+                    if not re.fullmatch(r'\d+(?:\.\d+)*', text) or len(cells) != 5:
+                        return None
+                    found.add(text)
+                elif re.fullmatch(r'\d+(?:\.\d+)*', text):
+                    return None
+            return found & archive or None
+        return None
+
+    def _support_cache_save(self, supported: set[str], archive: set[str]) -> None:
+        payload = {'supported': sorted(supported, key=ver_key),
+                   'archive': sorted(archive, key=ver_key)}
+        try:
+            self._supported_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._supported_cache_path.with_name(
+                self._supported_cache_path.name + '.tmp')
+            tmp.write_text(json.dumps(payload, indent=2))
+            os.replace(tmp, self._supported_cache_path)
+        except OSError as e:
+            self.alert(f'ERROR:Linux-Mint-Supported-cache: {self._describe_fetch_error(e)}')
+
+    def _support_cache_load(self) -> tuple[set[str], set[str]] | None:
+        try:
+            raw = json.loads(self._supported_cache_path.read_text())
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        for key in ('supported', 'archive'):
+            values = raw.get(key)
+            if (not isinstance(values, list) or not values
+                    or not all(isinstance(v, str) and
+                               re.fullmatch(r'\d+(?:\.\d+)*', v) for v in values)):
+                return None
+        supported, archive = set(raw['supported']), set(raw['archive'])
+        return (supported, archive) if supported <= archive else None
 
     def _version_of(self, filename: str) -> str | None:
         m = self._VERSION_RE.search(filename)
@@ -697,22 +768,25 @@ class MintChecker(Checker):
         # list are past EOL and surface as EOL:Linux-Mint-VER, repeating
         # every run until the local files are removed.
         supported: set[str] | None = None
+        eol_known: set[str] | None = None
         if self.fetch('https://linuxmint.com/download_all.php',
                       'Linux-Mint-Supported'):
-            found = set(re.findall(self._SUPPORTED_RE, self._page))
-            if found:
-                # Intersect with the pub index: the page also carries an
-                # LMDE row (version "7"), which is not a linuxmint
-                # release and would otherwise loop reporting
-                # NEW:Linux-Mint-7 on every run.
-                supported = found & set(versions)
+            supported = self._parse_supported(set(versions))
+            if supported is not None:
+                self._support_cache_save(supported, set(versions))
             else:
                 self.alert('MALFORMED:Linux-Mint-Supported')
-        # supported stays None when the page is unusable: fail open --
-        # only current is tracked and nothing counts as past EOL.
+        if supported is None:
+            cached = self._support_cache_load()
+            if cached is not None:
+                supported, eol_known = cached
+                self._debug('supported releases from cache')
+        # With no usable cache either, fail open: only current is tracked
+        # and nothing counts as past EOL. Cached absence can classify only
+        # archive versions already known when the cache was written.
 
         if supported is not None:
-            for ver in sorted(supported - {current}, key=ver_key):
+            for ver in sorted((supported & set(versions)) - {current}, key=ver_key):
                 local_ver = [p for p in local_isos
                              if self._version_of(p.name) == ver]
                 if not local_ver:
@@ -751,7 +825,8 @@ class MintChecker(Checker):
                 # Current-version file dropped from the listing; unusual
                 # enough to keep visible individually.
                 self.alert(f'STALE:{path.name}')
-            elif supported is not None and ver not in supported:
+            elif (supported is not None and ver not in supported
+                  and (eol_known is None or ver in eol_known)):
                 # Past EOL per download_all.php; group per version.
                 eol_versions.add(ver)
 
