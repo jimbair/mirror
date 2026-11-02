@@ -3657,6 +3657,204 @@ class TestMain(unittest.TestCase):
         self.assertIn('NEW:linuxmint-test.iso', out.getvalue())
 
 
+class TestSelfUpdate(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.target = self.root / 'new-torrents.py'
+        self.original = b'# installed checker\n'
+        self.target.write_bytes(self.original)
+        self.target.chmod(0o755)
+        # This is valid checker-shaped Python that would fail if validation
+        # executed it. Updating must never run the downloaded code.
+        self.source = (b'#!/usr/bin/env python3\n'
+                       b'class Checker: pass\n'
+                       b'def _parse_args(argv): pass\n'
+                       b'def _run(args): return 0\n'
+                       b'def main(argv=None): return 0\n'
+                       b'raise RuntimeError("do not execute during update")\n')
+        self.enterContext(patch.multiple(
+            nt, __file__=str(self.target),
+            LOCK_FILE=self.root / 'state' / 'lock',
+            FAIL_FILE=self.root / 'state' / 'failures.json',
+            ISO_DIR=self.root / 'missing-downloads',
+            STATUS_FILE=self.root / 'missing-downloads' / 'status.txt'))
+
+    def response(self, source=None, length=None):
+        source = self.source if source is None else source
+        response = http_response(source)
+        response.headers['Content-Length'] = str(len(source) if length is None else length)
+        return response
+
+    def run_update(self, flag='--update'):
+        self.stdout = io.StringIO()
+        self.stderr = io.StringIO()
+        with patch('sys.stdout', self.stdout), patch('sys.stderr', self.stderr):
+            return nt.main([flag])
+
+    def assert_unchanged(self):
+        self.assertEqual(self.target.read_bytes(), self.original)
+        self.assertEqual(list(self.root.iterdir()), [self.target])
+
+    def test_both_flags_update_atomically_preserve_mode_and_skip_host_setup(self):
+        for flag, mode in (('-u', 0o755), ('--update', 0o640)):
+            with self.subTest(flag=flag):
+                self.target.write_bytes(self.original)
+                self.target.chmod(mode)
+                with self.target.open('rb') as reader, \
+                        patch('urllib.request.urlopen', return_value=self.response()) as download, \
+                        patch.object(nt, '_run') as run, \
+                        patch('fcntl.flock') as flock, patch('shutil.which') as which:
+                    self.assertEqual(self.run_update(flag), 0, self.stderr.getvalue())
+                    self.assertEqual(reader.read(), self.original)
+                download.assert_called_once_with(nt.UPDATE_URL, timeout=30)
+                run.assert_not_called()
+                flock.assert_not_called()
+                which.assert_not_called()
+                self.assertEqual(self.target.read_bytes(), self.source)
+                self.assertEqual(self.target.stat().st_mode & 0o777, mode)
+                self.assertEqual(list(self.root.iterdir()), [self.target])
+
+    def test_identical_download_does_not_replace_the_script(self):
+        self.target.write_bytes(self.source)
+        with patch('urllib.request.urlopen', return_value=self.response()), \
+                patch('os.replace') as replace:
+            self.assertEqual(self.run_update(), 0)
+        replace.assert_not_called()
+        self.assertIn('already up to date', self.stdout.getvalue())
+
+    def test_command_line_argv_and_response_without_content_length(self):
+        response = http_response(self.source)
+        with patch('sys.argv', [str(self.target), '-u']), \
+                patch('urllib.request.urlopen', return_value=response), \
+                patch('sys.stdout', io.StringIO()):
+            self.assertEqual(nt.main(), 0)
+        self.assertEqual(self.target.read_bytes(), self.source)
+
+    def test_update_through_a_symlink_preserves_the_link(self):
+        link = self.root / 'linked-checker'
+        link.symlink_to(self.target.name)
+        with patch.object(nt, '__file__', str(link)), \
+                patch('urllib.request.urlopen', return_value=self.response()):
+            self.assertEqual(self.run_update(), 0)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.read_bytes(), self.source)
+        self.assertEqual(self.target.read_bytes(), self.source)
+
+    def test_network_and_http_errors_preserve_the_installed_script(self):
+        errors = [urllib.error.URLError('connection failed'),
+                  urllib.error.HTTPError(nt.UPDATE_URL, 404, 'Not Found', {}, None),
+                  TimeoutError('timed out'), http.client.IncompleteRead(b'partial')]
+        for error in errors:
+            with self.subTest(error=error), \
+                    patch('urllib.request.urlopen', side_effect=error):
+                self.assertEqual(self.run_update(), 1)
+                self.assertIn('update failed', self.stderr.getvalue())
+                self.assert_unchanged()
+
+    def test_invalid_or_unrelated_python_preserves_the_installed_script(self):
+        for source in (b'', b'<html>error</html>', b'def main(:\n',
+                       b'print("unrelated script")\n',
+                       self.source.replace(b'class Checker: pass\n', b''),
+                       self.source.replace(b'def _run(args): return 0\n', b''),
+                       self.source + b'return\n'):
+            with self.subTest(source=source), \
+                    patch('urllib.request.urlopen', return_value=self.response(source)):
+                self.assertEqual(self.run_update(), 1)
+                self.assert_unchanged()
+
+    def test_incomplete_or_oversized_download_preserves_the_installed_script(self):
+        for source, length in ((self.source, len(self.source) + 10),
+                               (self.source, 'invalid'),
+                               (b'x' * (nt.MAX_UPDATE_BYTES + 1), None)):
+            with self.subTest(length=length), \
+                    patch('urllib.request.urlopen', return_value=self.response(source, length)):
+                self.assertEqual(self.run_update(), 1)
+                self.assert_unchanged()
+
+    def test_real_http_premature_eof_is_rejected(self):
+        headers = f'Content-Length: {len(self.source) + 10}\r\n'.encode()
+        with patch('urllib.request.urlopen',
+                   return_value=http_wire_response(self.source, headers)):
+            self.assertEqual(self.run_update(), 1)
+        self.assertIn('incomplete download', self.stderr.getvalue())
+        self.assert_unchanged()
+
+    def test_the_current_checker_is_accepted_as_an_update(self):
+        source = SCRIPT_PATH.read_bytes()
+        with patch('urllib.request.urlopen', return_value=self.response(source)):
+            self.assertEqual(self.run_update(), 0, self.stderr.getvalue())
+        self.assertEqual(self.target.read_bytes(), source)
+
+    def test_write_or_replace_error_preserves_script_and_cleans_temporary(self):
+        for operation in ('fchmod', 'fsync', 'replace'):
+            with self.subTest(operation=operation), \
+                    patch('urllib.request.urlopen', return_value=self.response()), \
+                    patch.object(nt.os, operation, side_effect=PermissionError('denied')):
+                self.assertEqual(self.run_update(), 1)
+                self.assertIn('denied', self.stderr.getvalue())
+                self.assert_unchanged()
+
+    def test_temporary_creation_error_preserves_the_script(self):
+        with patch('urllib.request.urlopen', return_value=self.response()), \
+                patch.object(nt.tempfile, 'NamedTemporaryFile',
+                             side_effect=PermissionError('directory is read-only')):
+            self.assertEqual(self.run_update(), 1)
+        self.assert_unchanged()
+
+    def test_partial_write_error_preserves_script_and_cleans_temporary(self):
+        create_temp = nt.tempfile.NamedTemporaryFile
+
+        def interrupted_file(*args, **kwargs):
+            stream = create_temp(*args, **kwargs)
+            write = stream.write
+
+            def fail_after_partial_write(source):
+                write(source[:5])
+                raise OSError('write interrupted')
+
+            stream.write = fail_after_partial_write
+            return stream
+
+        with patch('urllib.request.urlopen', return_value=self.response()), \
+                patch.object(nt.tempfile, 'NamedTemporaryFile', side_effect=interrupted_file):
+            self.assertEqual(self.run_update(), 1)
+        self.assertIn('write interrupted', self.stderr.getvalue())
+        self.assert_unchanged()
+
+    def test_cleanup_error_is_reported_without_losing_the_update_error(self):
+        with patch('urllib.request.urlopen', return_value=self.response()), \
+                patch('os.replace', side_effect=PermissionError('replace denied')), \
+                patch.object(Path, 'unlink', side_effect=PermissionError('cleanup denied')):
+            self.assertEqual(self.run_update(), 1)
+        self.assertIn('replace denied', self.stderr.getvalue())
+        self.assertIn('could not remove temporary update', self.stderr.getvalue())
+        self.assertEqual(self.target.read_bytes(), self.original)
+
+    def test_update_rejects_other_arguments_before_downloading_or_creating_state(self):
+        for argv in (['--update', '--verbose'], ['--update', 'mint'],
+                     ['arch', '-u'], ['-u', '--update'], ['--update', '--update']):
+            with self.subTest(argv=argv), patch('urllib.request.urlopen') as download, \
+                    patch('sys.stderr', io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as error:
+                    nt.main(argv)
+                self.assertEqual(error.exception.code, 2)
+                self.assertIn('must be used on its own', stderr.getvalue())
+                download.assert_not_called()
+                self.assert_unchanged()
+
+    def test_help_lists_both_update_flags_without_downloading_or_creating_state(self):
+        with patch('sys.stdout', io.StringIO()) as stdout, \
+                patch('urllib.request.urlopen') as download:
+            with self.assertRaises(SystemExit) as error:
+                nt.main(['--help'])
+        self.assertEqual(error.exception.code, 0)
+        self.assertIn('-u, --update', stdout.getvalue())
+        download.assert_not_called()
+        self.assert_unchanged()
+
+
 class TestVerKey(unittest.TestCase):
 
     def test_major_version_ordering(self):

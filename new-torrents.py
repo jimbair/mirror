@@ -6,6 +6,7 @@
 # We send the output as a POST to /fail in the event of a non-zero exit.
 
 import argparse
+import ast
 import errno
 import fcntl
 import gzip
@@ -16,8 +17,10 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -61,6 +64,11 @@ UBUNTU_EOL_CACHE_FILE = Path.home() / '.config' / 'new-torrents' / 'ubuntu-eol.j
 # versions known at that instant. Cached absence says nothing about a
 # release that appeared later, so it must never make that new release EOL.
 MINT_SUPPORT_CACHE_FILE = Path.home() / '.config' / 'new-torrents' / 'mint-supported.json'
+
+# A standalone installation can update without a Git checkout or any of
+# the mirror host's tools and data. Only this script is replaced.
+UPDATE_URL = 'https://raw.githubusercontent.com/jimbair/mirror/main/new-torrents.py'
+MAX_UPDATE_BYTES = 2 * 1024 * 1024
 
 
 ###########
@@ -2154,13 +2162,68 @@ def _checkers_epilogue() -> str:
     return '\n'.join(lines)
 
 
+def update_self() -> int:
+    """Validate and atomically replace this script with GitHub's main copy."""
+    temporary: Path | None = None
+    try:
+        target = Path(__file__).resolve(strict=True)
+        mode = stat.S_IMODE(target.stat().st_mode)
+        print(f'new-torrents.py: downloading update from {UPDATE_URL}')
+        with urllib.request.urlopen(UPDATE_URL, timeout=30) as response:
+            source = response.read(MAX_UPDATE_BYTES + 1)
+            if len(source) > MAX_UPDATE_BYTES:
+                raise ValueError('download exceeds the 2 MiB size limit')
+            length = response.headers.get('Content-Length')
+            if length is not None and len(source) != int(length):
+                raise ValueError('incomplete download (Content-Length mismatch)')
+        tree = ast.parse(source, filename=str(target))
+        compile(tree, str(target), 'exec')
+        functions = {node.name for node in tree.body
+                     if isinstance(node, ast.FunctionDef)}
+        classes = {node.name for node in tree.body
+                   if isinstance(node, ast.ClassDef)}
+        if not ({'main', '_parse_args', '_run'} <= functions and 'Checker' in classes):
+            raise ValueError('download is not a new-torrents.py script')
+        if source == target.read_bytes():
+            print('new-torrents.py: already up to date')
+            return 0
+        # Keep the temporary file beside the resolved target so replacement
+        # stays atomic and a symlink used to launch the checker survives.
+        # Validate without executing the downloaded code; the new version
+        # takes effect only on the next invocation, never midway through
+        # this process's already-loaded classes and constants.
+        with tempfile.NamedTemporaryFile(
+                dir=target.parent, prefix=f'.{target.name}.',
+                suffix='.tmp', delete=False) as output:
+            temporary = Path(output.name)
+            output.write(source)
+            output.flush()
+            os.fchmod(output.fileno(), mode)
+            os.fsync(output.fileno())
+        os.replace(temporary, target)
+        temporary = None
+        print(f'new-torrents.py: updated {target}; use the new version on your next run')
+        return 0
+    except (OSError, urllib.error.URLError, http.client.HTTPException,
+            SyntaxError, ValueError) as e:
+        print(f'new-torrents.py: update failed: {e}', file=sys.stderr)
+        return 1
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as e:
+                print(f'new-torrents.py: could not remove temporary update '
+                      f'{temporary}: {e}', file=sys.stderr)
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse and validate the command line.
 
     Returns a namespace with .checker_cls (None for the full suite) and
-    .verbose. Raises ValueError for an unknown checker name; argparse
-    itself raises SystemExit(2) on other usage errors and SystemExit(0)
-    after printing help for --help.
+    .verbose and .update. Raises ValueError for an unknown checker name;
+    argparse itself raises SystemExit(2) on other usage errors and
+    SystemExit(0) after printing help for --help.
     """
     parser = argparse.ArgumentParser(
         prog='new-torrents.py',
@@ -2195,12 +2258,20 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help='run only this checker (e.g. mint); default: run all of them',
     )
     parser.add_argument(
+        '-u', '--update',
+        action='store_true',
+        help='replace this script with the latest version from GitHub main '
+             'and exit; use on its own',
+    )
+    parser.add_argument(
         '--verbose',
         action='store_true',
         help='show the live per-checker status display (default: on when '
              'stderr is a terminal, off under cron)',
     )
     args = parser.parse_args(argv)
+    if args.update and len(argv) != 1:
+        parser.error('-u/--update must be used on its own')
     args.checker_cls = _resolve_checker(args.checker)
     return args
 
@@ -2277,8 +2348,8 @@ def main(argv: list[str] | None = None) -> int:
 
     argv defaults to sys.argv[1:] when omitted; tests pass it explicitly
     so they never inherit the test runner's own arguments. Arguments are
-    parsed before the lock is touched: --help and usage errors (e.g. an
-    unknown checker name) shouldn't need -- or create -- a lockfile.
+    parsed before the lock is touched: --help, --update, and usage errors
+    (e.g. an unknown checker name) shouldn't need -- or create -- a lockfile.
 
     A held lock means either a legitimate overlap (a manual run colliding
     with cron) or a prior invocation stuck far longer than it should be --
@@ -2294,6 +2365,9 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:
         print(f'ERROR: {e}. Exiting.', file=sys.stderr)
         return 2
+
+    if args.update:
+        return update_self()
 
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     lock_fd = open(LOCK_FILE, 'w')

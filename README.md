@@ -43,8 +43,8 @@ reports work to do; downloading, adding, and removing torrents remain manual.
 
 | Exit code | Meaning |
 | --- | --- |
-| `0` | Clean run, including fetch failures below the alert threshold. |
-| `1` | Alerts, operational errors, or an overlapping run holding the lock. |
+| `0` | Clean run (including fetch failures below the alert threshold), or successful self-update. |
+| `1` | Alerts, operational/update errors, or an overlapping run holding the lock. |
 | `2` | Invalid command-line arguments. |
 
 Alerts repeat each run until their condition clears. Version-level alerts
@@ -75,6 +75,29 @@ tier, including paid legacy support. Mint tracks all releases on its supported
 versions page. Both checkers retain validated support metadata for upstream
 outages; Ubuntu stores dates and recalculates EOL as the clock advances.
 
+## Updating the checker
+
+Update the installed `new-torrents.py` from this repository's latest `main`
+branch:
+
+```sh
+python3.11 new-torrents.py --update
+# Equivalent: python3.11 new-torrents.py -u
+```
+
+Use the update option on its own. It requires network access and write access
+to the script's directory. The download is limited to 2 MiB and checked for
+valid Python and expected checker classes/functions without executing it.
+It replaces the script atomically, preserving permissions and any symlink
+used to launch it. An identical download reports that it is already up to date.
+
+Updates overwrite local edits to `new-torrents.py`. Only this script is updated;
+the command exits and the next invocation uses the new version. Updating runs
+independently of torrent checks and needs no rsync, downloads, status file, or
+runtime-state directory. Update errors leave the installed script intact and
+exit 1; combining the option with a checker name or `--verbose` is a usage
+error (exit 2).
+
 ## State and scheduling
 
 The production checker runs hourly; the active `status-update.sh` builder runs
@@ -95,11 +118,11 @@ The checker's state snapshots and the active shell builder's `status.txt` are
 published through temporary files followed by same-directory atomic replacement.
 State-write failures are reported while completed checker alerts remain available.
 
-HTTP fetches allow 8 MiB of encoded data and 16 MiB after decompression. A
-30-second elapsed budget is checked between reads alongside a 10-second socket
-timeout. One blocking operation can outlast the remaining budget; this is not
-a process-level deadline for operating-system DNS or connection setup. Debian's
-rsync listing has a separate 60-second timeout.
+Checker HTTP fetches allow 8 MiB of encoded data and 16 MiB after decompression.
+A 30-second elapsed budget is checked between reads alongside a 10-second
+socket timeout. One blocking operation can outlast the remaining budget; this
+is not a process-level deadline for operating-system DNS or connection setup.
+Debian's rsync listing has a separate 60-second timeout.
 
 `status_update.py` is the Python status-builder alternative; migration from the
 active shell version is still pending. Both builders rely on production paths

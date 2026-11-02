@@ -22,6 +22,7 @@ python3 tests/test_transmission_upgrade.py -v  # stubbed service lifecycle tests
 python3 tests/test_debian_torrents_fetch.py -v  # isolated torrent collection tests
 python3 new-torrents.py --help          # checker CLI; select with a positional name
 python3 new-torrents.py mint            # just Mint; names are case-insensitive
+python3 new-torrents.py --update         # manual in-place self-update; -u also works
 bash -n status-update.sh               # shell syntax check
 python3 status_update.py                # build status page (needs transmission-remote, vnstat)
 ```
@@ -92,6 +93,13 @@ Keep them (and their comments) intact when refactoring.
 - **Locking:** `fcntl.flock` on `~/.config/new-torrents/lock` prevents
   overlapping runs; a held lock must exit non-zero and loudly (a silent skip
   would mask a stuck run from healthchecks).
+- **Self-update:** `--update` / `-u` is a standalone manual command, dispatched
+  before the checker lock, prerequisites, or runtime state are touched. It
+  downloads only `new-torrents.py` from GitHub `main`, limits the download to
+  2 MiB, validates Python without executing it, and atomically replaces the
+  resolved script path while preserving its permissions and launcher symlink.
+  Validation expects `Checker`, `main`, `_parse_args`, and `_run`; keep it in
+  sync with entry-point refactors. Updates never run as part of normal checks.
 
 ### status_update.py (Python status page builder)
 
@@ -146,8 +154,9 @@ The feature-addition recipe for `new-torrents.py`:
    add its path to the `paths` filter in `.github/workflows/test.yml` and
    give it a job; the existing test files are already covered.
 
-Exit-code contract to preserve in any change: 0 = clean, 1 = alerts present
-or lock held, 2 = usage error. `--help` exits without creating the lockfile.
+Exit-code contract to preserve in any change: 0 = clean or self-update success,
+1 = alerts, operational/update errors, or lock held, 2 = usage error. `--help`
+and `--update` exit without creating the checker lockfile.
 
 ## Bug-scan primer
 
@@ -231,8 +240,9 @@ they live:
 ## Context that lives outside this repo
 
 - **Deployment is manual**: changes in this repo do not reach the production
-  host automatically — the maintainer copies them over by hand. A merged
-  change is not live until it has been deployed.
+  host automatically — the maintainer copies them over by hand or explicitly
+  runs `new-torrents.py --update` for that script. A merged change is not live
+  until it has been deployed.
 - **Cadence (informational only)**: `new-torrents.py` runs hourly and
   `status-update.sh` runs every 5 minutes on the production host. The actual
   cron entries live on the host and are intentionally not in this repo.
