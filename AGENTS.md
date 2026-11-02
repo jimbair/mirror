@@ -95,7 +95,9 @@ Keep them (and their comments) intact when refactoring.
   for response-limit errors just as for other failed fetches.
 - **Locking:** `fcntl.flock` on `~/.config/new-torrents/lock` prevents
   overlapping runs; a held lock must exit non-zero and loudly (a silent skip
-  would mask a stuck run from healthchecks).
+  would mask a stuck run from healthchecks). Open without truncating and
+  rewrite the diagnostic PID only after acquiring the lock, so a refused
+  invocation preserves the holder's PID.
 - **Self-update:** `--update` / `-u` is a standalone manual command, dispatched
   before the checker lock, prerequisites, or runtime state are touched. It
   downloads only `new-torrents.py` from GitHub `main`, limits the download to

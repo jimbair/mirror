@@ -3375,6 +3375,8 @@ class TestMain(unittest.TestCase):
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         holder_fd = open(lock_path, 'w')
         fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        holder_fd.write('4242')
+        holder_fd.flush()
         try:
             # Deliberately do NOT create iso_dir/status.txt -- if main()
             # incorrectly proceeded past the lock check, it would fail for
@@ -3386,8 +3388,24 @@ class TestMain(unittest.TestCase):
                 ret = self._run_main()
             self.assertEqual(ret, 1)
             self.assertIn('another instance is already running', buf.getvalue())
+            self.assertEqual(lock_path.read_text(), '4242')
         finally:
             holder_fd.close()
+
+    def test_acquired_lock_replaces_a_longer_stale_pid_before_running_checks(self):
+        lock_path = self.tmp / 'lock'
+        lock_path.write_text('99999999999999999999')
+        seen = []
+
+        def record_pid(args):
+            seen.append(lock_path.read_text())
+            return 0
+
+        with patch.object(nt, '_run', side_effect=record_pid):
+            self.assertEqual(self._run_main(), 0)
+        expected = str(nt.os.getpid())
+        self.assertEqual(seen, [expected])
+        self.assertEqual(lock_path.read_text(), expected)
 
     def test_lock_released_after_clean_run_allows_next_invocation(self):
         """The lock must not leak past a single run -- a second, later
@@ -3429,7 +3447,7 @@ class TestMain(unittest.TestCase):
         try:
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline:
-                probe = open(lock_path, 'w')
+                probe = open(lock_path, 'a')
                 try:
                     fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     fcntl.flock(probe, fcntl.LOCK_UN)

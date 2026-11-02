@@ -2380,7 +2380,10 @@ def main(argv: list[str] | None = None) -> int:
         return update_self()
 
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    lock_fd = open(LOCK_FILE, 'w')
+    # Opening with 'w' would erase the current holder's diagnostic PID
+    # before flock can refuse an overlapping run. Create without truncating
+    # and rewrite the contents only after this process owns the lock.
+    lock_fd = open(LOCK_FILE, 'a')
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -2388,6 +2391,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f'ERROR: another instance is already running (lock held on {LOCK_FILE}). Exiting.')
         return 1
 
+    lock_fd.seek(0)
+    lock_fd.truncate()
     lock_fd.write(str(os.getpid()))
     lock_fd.flush()
     try:
