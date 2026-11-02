@@ -6,8 +6,9 @@ Guidance for AI coding agents (and humans) working in this repository.
 
 Scripts that operate the Linux torrent mirror at [mirror.tsue.net](https://mirror.tsue.net/).
 The production host runs AlmaLinux 10 with Transmission; these scripts live in
-cron there. The repo itself has no build step and no runtime dependencies beyond
-the Python 3 standard library.
+cron there. The repo has no build step or third-party Python packages. The
+Debian checker needs rsync; the status builders also need the host tools and
+data described in README.md. The checker uses Unix-only `fcntl.flock`.
 
 ## Commands
 
@@ -16,7 +17,10 @@ All commands run from the repo root (the directory containing this file):
 ```sh
 python3 tests/test_new_torrents.py -v   # tests for new-torrents.py
 python3 tests/test_status_update.py -v  # tests for status_update.py
-python3 new-torrents.py --help          # checker CLI; run checkers with --only <name>
+python3 tests/test_status_update_sh.py -v  # active shell publication tests
+python3 new-torrents.py --help          # checker CLI; select with a positional name
+python3 new-torrents.py mint            # just Mint; names are case-insensitive
+bash -n status-update.sh               # shell syntax check
 python3 status_update.py                # build status page (needs transmission-remote, vnstat)
 ```
 
@@ -35,10 +39,10 @@ python3 status_update.py                # build status page (needs transmission-
   The scripts under test are imported via `importlib` in each test file (the
   hyphen in `new-torrents.py` rules out a plain import) — preserve that pattern
   if you add or rename test files.
-- CI (`.github/workflows/test.yml`) runs both test suites on Ubuntu (Python 3.11)
+- CI (`.github/workflows/test.yml`) runs all three suites on Ubuntu (Python 3.11)
   and in an `almalinux:10` container, and only when the script/test/workflow
-  paths change. If you touch a script but not its test file, update the
-  workflow's `paths` list only if the relationship itself changes.
+  paths or `tests/fixtures/**` change. If you touch a script but not its test
+  file, update the workflow's `paths` list only if the relationship changes.
 - `new-torrents.py` does real network fetches and reads
   `/var/lib/transmission/Downloads` when run without mocked inputs; don't run
   the full checkers casually — tests are the safe way to exercise behavior.
@@ -65,17 +69,31 @@ Keep them (and their comments) intact when refactoring.
   add.
 - **Failure thresholding:** a domain is only reported down after
   `FAIL_THRESHOLD` (3) consecutive failures; transient outages are swallowed
-  by design. The Ubuntu checker additionally falls back to the cached EOL
-  schedule (`~/.config/new-torrents/ubuntu-eol.json`) so a one-off schedule
-  outage doesn't re-alert every past-EOL line as NEW.
+  by design. Mint directory counters are per release, so healthy siblings
+  cannot reset a persistent outage. Ubuntu and Mint fall back to validated
+  support caches (`ubuntu-eol.json` and `mint-supported.json`), preventing
+  transient outages or partial parses from replacing reliable metadata.
+- **Malformed is not removed:** valid Fedora entries are still checked when
+  siblings are malformed, but incomplete lists cannot justify STALE/DROPPED
+  cleanup alerts for their affected version. Both support parsers require
+  complete table structure before replacing their caches. Cached Mint
+  absence can classify only archive versions known at cache time as EOL.
+- **State-write errors:** report them without discarding completed alerts or
+  the freshly parsed support verdict. Close the display even if persistence
+  fails. State loaders treat invalid JSON and non-UTF-8 files as corrupt.
+- **HTTP bounds:** encoded responses are limited to 8 MiB and decompressed
+  bodies to 16 MiB. A 30-second read budget is checked between bounded reads,
+  alongside a 10-second socket timeout; it is not an OS-level DNS watchdog.
+  Keep gzip and both wrapped/raw deflate support, and use failure thresholding
+  for response-limit errors just as for other failed fetches.
 - **Locking:** `fcntl.flock` on `~/.config/new-torrents/lock` prevents
   overlapping runs; a held lock must exit non-zero and loudly (a silent skip
   would mask a stuck run from healthchecks).
 
-### status-update.sh (status page builder)
+### status_update.py (Python status page builder)
 
 - The `transmission-remote -l` table rendering is **verified byte-for-byte
-  against real Transmission 3.x output** (fixed column widths, 2-space gutters,
+  against real Transmission 4.1.3 captures** (fixed column widths, 2-space gutters,
   no auto-widening). Don't "improve" the formatting to be data-driven —
   matching transmission-remote exactly is the requirement.
 - `TransmissionRow.from_line` parsing depends on the observation that Have/ETA
@@ -113,7 +131,8 @@ The feature-addition recipe for `new-torrents.py`:
    caught by `Checker.run()` and reported as `EXCEPTION:<Checker>`, which
    keeps the failure isolated, but a clean MALFORMED is the established
    response to structure drift (see Fedora's `torrents.json` handling for
-   the careful pattern: skip bad entries, alert on unusable pages).
+   the careful pattern: check valid entries, alert on unusable metadata, and
+   avoid removal conclusions for malformed versions).
 6. Test with the shared helpers at the top of `tests/test_new_torrents.py`:
    `make_checker(cls, iso_dir, status_content, ...)` to construct, and
    `fake_fetch_fn` / `fake_fetch_seq` to inject pages (both pad past
@@ -153,11 +172,14 @@ they live:
 - **Alert fan-out**: one upstream release change spans many files — group
   alerts (Mint's version-bump logic) instead of firing one per file.
 - **State durability**: every persisted file (`failures.json`,
-  `ubuntu-eol.json`, `status.txt`) is written temp-then-`os.replace` in the
-  same directory so a crash can't wipe or corrupt it.
+  `ubuntu-eol.json`, `mint-supported.json`, `status.txt`) is published through
+  a temporary file and same-directory replacement (`os.replace` in Python,
+  `mv` in the shell builder). Never copy over the public destination: that
+  exposes a truncated snapshot to concurrent readers.
 - **`status_update.py`**'s high-risk area is the table: rendering is
   byte-for-byte against real `transmission-remote -l`; the `SAMPLE_OUTPUT`
-  fixture in its test file is the reference.
+  fixture covers alignment, and the captured Transmission 4.1.3 fixtures
+  pin exact byte output, including error-marked IDs and overflow ratios.
 
 ## Conventions
 
@@ -173,17 +195,13 @@ they live:
   dirs) and mock the network — follow that style; clean up tempdirs.
 - **Commits:** conventional-commit style with a scope, lowercase subject
   (`fix(ubuntu): ...`, `test(fetch): ...`, `chore: ...`, `docs: ...`).
-- **LLM co-author credit:** when an LLM made the change (or materially
-  helped make it), credit the model in the commit message with a
-  `Co-Authored-By: <model>` trailer, e.g. `Co-Authored-By: Qwen3.8 27B
-  (6-bit, extra-high reasoning)`. Credit the model, not the app or
-  harness that ran it. Place the trailer after a blank line following the
-  last body paragraph; with `git commit -s`, `Signed-off-by:` is appended
-  below it, so the co-author line must be the final line of the message.
+- **Sign-off and attribution:** sign off every commit with `git commit -s`.
+  Follow the client's default attribution convention, using a single
+  assistance or co-author trailer. Do not add both forms of attribution.
 - **Branches:** prefix new branches `bionic/` (e.g. `bionic/fix-...`), per
   existing PR history.
 
-## Shell scripts (not covered by CI)
+## Shell scripts
 
 - `debian-torrents-fetch.sh` — rsyncs all current Debian `.torrent` files;
   run manually when a new Debian release drops.
@@ -191,7 +209,9 @@ they live:
   `/home/jim/log/speedtest.log` if you accept it.
 - `status-update.sh` — the original version of `status_update.py`.
   `status-update.sh` is the version actively in use; migrating to the python
-  version is currently a TODO to be completed by the author.
+  version is currently a TODO to be completed by the author. Publication is
+  tested in `tests/test_status_update_sh.py` on Ubuntu and AlmaLinux in CI;
+  the host-specific collectors are stubbed. Other shell scripts have no CI.
 - `transmission-upgrade.sh` — builds Transmission from source on AlmaLinux
   (root, dnf) while upstream package bugs are open. Destructive by design
   (replaces the system daemon); verify version and checksums before running
@@ -219,7 +239,8 @@ they live:
 - ISOs/downloads: `/var/lib/transmission/Downloads` (`ISO_DIR`)
 - Status page: `.../Downloads/status.txt`
 - Speedtest log: `/home/jim/log/speedtest.log`
-- Runtime state: `~/.config/new-torrents/` (failures.json, lock, ubuntu-eol.json)
+- Runtime state: `~/.config/new-torrents/` (failures.json, lock,
+  ubuntu-eol.json, mint-supported.json)
 
 When editing constants, remember these are hardcoded for the production host
 and the tests rely on the same values.
