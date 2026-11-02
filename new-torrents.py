@@ -1642,6 +1642,11 @@ class UbuntuChecker(Checker):
                 # active. If filtering removed every line, the schedule
                 # data is suspect (e.g. a restructured page shifted our
                 # columns); track everything rather than go silent.
+                # The local cleanup scan must use the same fallback:
+                # retaining eol_lines here would classify the very line
+                # restored as a NEW target as EOL at the same time.
+                eol_lines = set()
+                self.alert('MALFORMED:Ubuntu-EOL')
                 upstream_versions = {
                     v for v in (self._version_of(iso) for iso in upstream_isos)
                     if v is not None

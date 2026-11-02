@@ -1660,6 +1660,18 @@ class TestUbuntuChecker(unittest.TestCase):
         updates = self._run(page=page, now=UBUNTU_FROZEN_NOW)
         self.assertIn('NEW:Ubuntu-12.04.5', updates)
 
+    def test_all_eol_fallback_also_disables_local_eol_classification(self):
+        old = 'ubuntu-24.04-desktop-amd64.iso'
+        (self.tmp / old).write_bytes(b'x')
+        page = '<td>ubuntu-24.04.1-desktop-amd64.iso</td>'
+        for _ in range(2):
+            c = make_checker(nt.UbuntuChecker, self.tmp, old)
+            c.fetch = fake_fetch_fn(c, page)
+            c._eol_lines = lambda: {'24.04'}
+            c.check()
+            self.assertEqual(c.updates, {'MALFORMED:Ubuntu-EOL',
+                                        'NEW:Ubuntu-24.04.1', 'STALE:Ubuntu-24.04'})
+
     def test_off_mode_never_fetches_schedule(self):
         """'off' mode must not even fetch the schedule page."""
         nt.UbuntuChecker._EOL_MODE = 'off'
