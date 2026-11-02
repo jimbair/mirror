@@ -196,8 +196,10 @@ they live:
 - **Commits:** conventional-commit style with a scope, lowercase subject
   (`fix(ubuntu): ...`, `test(fetch): ...`, `chore: ...`, `docs: ...`).
 - **Sign-off and attribution:** sign off every commit with `git commit -s`.
-  Follow the client's default attribution convention, using a single
-  assistance or co-author trailer. Do not add both forms of attribution.
+  Follow the active client's native AI-attribution defaults unchanged. Do not
+  override its trailer format or identity, add a second credit trailer, or
+  add model names or reasoning-effort labels unless the client includes them
+  by default.
 - **Branches:** prefix new branches `bionic/` (e.g. `bionic/fix-...`), per
   existing PR history.
 

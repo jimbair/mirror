@@ -120,3 +120,12 @@ bash -n status-update.sh
 CI runs the three suites on Ubuntu and AlmaLinux 10. Representative upstream
 snippets and their source URLs live in [tests/fixtures](tests/fixtures/README.md).
 See [AGENTS.md](AGENTS.md) for architecture invariants and contribution guidance.
+
+## Commit conventions
+
+Sign off every commit with `git commit -s`.
+
+Follow the active client's native AI-attribution defaults unchanged. Do not
+override its trailer format or identity, add a second credit trailer, or
+add model names or reasoning-effort labels unless the client includes them
+by default.
