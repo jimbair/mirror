@@ -15,16 +15,16 @@ data described in README.md. The checker uses Unix-only `fcntl.flock`.
 All commands run from the repo root (the directory containing this file):
 
 ```sh
-python3 tests/test_new_torrents.py -v   # tests for new-torrents.py
+python3 tests/test_new_torrents.py -v  # tests for new-torrents.py
 python3 tests/test_status_update.py -v  # tests for status_update.py
 python3 tests/test_status_update_sh.py -v  # active shell publication tests
 python3 tests/test_transmission_upgrade.py -v  # stubbed service lifecycle tests
 python3 tests/test_debian_torrents_fetch.py -v  # isolated torrent collection tests
-python3 new-torrents.py --help          # checker CLI; select with a positional name
-python3 new-torrents.py mint            # just Mint; names are case-insensitive
-python3 new-torrents.py --update         # manual in-place self-update; -u also works
-bash -n status-update.sh               # shell syntax check
-python3 status_update.py                # build status page (needs transmission-remote, vnstat)
+python3 new-torrents.py --help  # checker CLI; select with a positional name
+python3 new-torrents.py mint  # just Mint; names are case-insensitive
+python3 new-torrents.py --update  # manual in-place self-update; -u also works
+bash -n status-update.sh  # shell syntax check
+python3 status_update.py  # build status page (needs transmission-remote, vnstat)
 ```
 
 - **macOS interpreters:** the system `python3` (Xcode Command Line
