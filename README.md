@@ -103,7 +103,10 @@ rsync listing has a separate 60-second timeout.
 
 `status_update.py` is the Python status-builder alternative; migration from the
 active shell version is still pending. Both builders rely on production paths
-and data that are absent from a normal development checkout.
+and data that are absent from a normal development checkout. Both publish
+`status.txt` atomically and require write access to its parent directory;
+file-only write permission is insufficient. Set up directory access for the
+cron user before switching builders.
 
 ## Tests and development
 

@@ -8,8 +8,10 @@
 # readers (and new-torrents.py, which treats status.txt as ground truth for
 # what transmission already knows about) never see a half-written file.
 
+import os
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -301,24 +303,30 @@ class StatusReport:
         return '\n\n'.join(sections)
 
     def write(self, destination: Path) -> None:
-        """Build the report and write it into destination's existing file,
-        matching the original status-update.sh's cat $TMP > $STATUS approach
-        rather than a rename.
+        """Publish a complete snapshot through a same-directory replacement.
 
-        build() fully assembles the report in memory before this touches
-        the filesystem at all, so a failure partway through gathering
-        vnstat/speedtest/transmission output never reaches destination —
-        there's nothing left for an intermediate temp file to protect here.
-        This needs write access to status.txt itself but not to its parent
-        directory, which transmission's daemon owns.
-
-        No reader other than this script's own cron job touches status.txt,
-        so the brief window where destination is open for writing isn't a
-        correctness concern the way it would be for a file under active
-        concurrent access.
+        The checker treats status.txt as ground truth, and web clients read
+        it concurrently. Building in memory does not make an in-place write
+        atomic: opening the public path still truncates it before writing.
+        Stage beside it so replacement stays on one filesystem, and leave
+        the previous snapshot intact on build, write, or publication errors.
+        Like the shell builder, this requires parent-directory write access.
         """
         content = self.build()
-        destination.write_text(content)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                    mode='w', encoding='utf-8', dir=destination.parent,
+                    prefix=destination.name + '.tmp.', delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(content)
+            # Temporary files start private; publish the same public mode
+            # as the shell builder so the web server can read the new inode.
+            temporary.chmod(0o644)
+            os.replace(temporary, destination)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
 
 def main() -> int:

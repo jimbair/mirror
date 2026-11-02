@@ -390,24 +390,61 @@ class TestStatusReportWrite(unittest.TestCase):
         self.assertIn('Sum:', content)
 
     @patch.object(su, 'run_command')
-    def test_write_does_not_require_parent_directory_write_access(self, mock_run) -> None:
-        # Simulates the real failure this was built for: status.txt's
-        # parent directory (owned by the transmission daemon) isn't
-        # writable by whatever user runs this script, but the file itself
-        # is. write() should only need permission on destination, not on
-        # destination.parent, since it no longer creates a sibling temp
-        # file there.
+    def test_write_preserves_an_open_readers_complete_snapshot(self, mock_run) -> None:
         mock_run.side_effect = ['', '', SAMPLE_OUTPUT]
         destination = self.tmp_path / 'status.txt'
-        destination.write_text('placeholder')
-        destination.chmod(0o644)
-        self.tmp_path.chmod(0o555)  # read+execute only, no write
-        self.addCleanup(self.tmp_path.chmod, 0o755)
+        destination.write_text('old complete snapshot')
 
         report = su.StatusReport(self.speedtest_log)
-        report.write(destination)
+        with destination.open() as reader:
+            report.write(destination)
+            self.assertEqual(reader.read(), 'old complete snapshot')
 
         self.assertIn('Sum:', destination.read_text())
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(list(self.tmp_path.glob('status.txt.tmp.*')), [])
+
+    @patch.object(su.StatusReport, 'build', return_value='new complete snapshot')
+    def test_failed_replace_preserves_the_previous_snapshot(self, mock_build) -> None:
+        destination = self.tmp_path / 'status.txt'
+        destination.write_text('old complete snapshot')
+        with patch.object(su.os, 'replace', side_effect=PermissionError('replace denied')):
+            with self.assertRaises(PermissionError):
+                su.StatusReport(self.speedtest_log).write(destination)
+        self.assertEqual(destination.read_text(), 'old complete snapshot')
+        self.assertEqual(list(self.tmp_path.glob('status.txt.tmp.*')), [])
+
+    @patch.object(su.StatusReport, 'build', return_value='new complete snapshot')
+    def test_partial_write_failure_preserves_the_previous_snapshot(self, mock_build) -> None:
+        destination = self.tmp_path / 'status.txt'
+        destination.write_text('old complete snapshot')
+        create_temp = su.tempfile.NamedTemporaryFile
+
+        def interrupted_file(*args, **kwargs):
+            stream = create_temp(*args, **kwargs)
+            write = stream.write
+
+            def fail_after_partial_write(content):
+                write(content[:5])
+                raise OSError('write interrupted')
+
+            stream.write = fail_after_partial_write
+            return stream
+
+        with patch.object(su.tempfile, 'NamedTemporaryFile', side_effect=interrupted_file):
+            with self.assertRaisesRegex(OSError, 'write interrupted'):
+                su.StatusReport(self.speedtest_log).write(destination)
+        self.assertEqual(destination.read_text(), 'old complete snapshot')
+        self.assertEqual(list(self.tmp_path.glob('status.txt.tmp.*')), [])
+
+    @patch.object(su.StatusReport, 'build', side_effect=RuntimeError('collector failed'))
+    def test_failed_build_preserves_the_previous_snapshot(self, mock_build) -> None:
+        destination = self.tmp_path / 'status.txt'
+        destination.write_text('old complete snapshot')
+        with self.assertRaisesRegex(RuntimeError, 'collector failed'):
+            su.StatusReport(self.speedtest_log).write(destination)
+        self.assertEqual(destination.read_text(), 'old complete snapshot')
+        self.assertEqual(list(self.tmp_path.glob('status.txt.tmp.*')), [])
 
     @patch.object(su, 'run_command')
     def test_write_overwrites_existing_destination(self, mock_run) -> None:

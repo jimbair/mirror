@@ -61,9 +61,10 @@ Keep them (and their comments) intact when refactoring.
   Alerts repeat every run until the condition clears — a silent no-op (exit 0)
   is a bug, not an optimization. Never "fix" an alert into silence.
 - **status.txt is ground truth** for what Transmission already knows about.
-  `status-update.sh` writes it atomically precisely so concurrent readers
+  Both status builders write it atomically precisely so concurrent readers
   (including this script) never see a half-written file. Preserve the
-  temp-then-install pattern.
+  temp-then-install pattern. The cron user needs parent-directory write
+  access; file-only write permission cannot support atomic replacement.
 - **Threading invariant:** checkers run in a `ThreadPoolExecutor`, and each
   failure-tracker counter name is owned by exactly one checker thread — that
   is why `FailureTracker` is unsynchronized by design. If a new checker ever
