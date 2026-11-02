@@ -81,8 +81,10 @@ Keep them (and their comments) intact when refactoring.
   siblings are malformed, but incomplete lists cannot justify STALE/DROPPED
   cleanup alerts for their affected version. Both support parsers require
   complete table structure before replacing their caches. Ubuntu retains
-  cached dates for pruned expired tiers and accepts fresh dates for present
-  rows; losing an unexpired tier still alerts and preserves the old cache.
+  cached dates for pruned expired tiers and accepts extensions or corrections
+  to expired dates. Losing or shortening an unexpired tier alerts and
+  preserves the old cache. The maximum end date combines all four tables:
+  a surviving expired ESM row must not hide lost active legacy coverage.
   Cached Mint absence can classify only archive versions known at cache time
   as EOL.
 - **State-write errors:** report them without discarding completed alerts or

@@ -75,8 +75,10 @@ tier, including paid legacy support. Mint tracks all releases on its supported
 versions page. Both checkers retain validated support metadata for upstream
 outages; Ubuntu stores dates and recalculates EOL as the clock advances.
 When Ubuntu prunes expired schedule rows, cached dates preserve their EOL
-history while fresh dates continue to update. Losing an unexpired tier or
-receiving an incomplete table still alerts and retains the previous cache.
+history while fresh dates continue to update. Losing or shortening an
+unexpired tier, or receiving an incomplete table, alerts and retains the
+previous cache. Genuine upstream support reductions also require review
+instead of silently making an active release eligible for cleanup.
 
 ## Updating the checker
 

@@ -2442,16 +2442,77 @@ class TestUbuntuChecker(unittest.TestCase):
         self._run(now=UBUNTU_FROZEN_NOW)
         schedule = re.sub(r'<tr><td>Ubuntu 12\.04(?: ESM| LTS).*?</tr>', '',
                           UBUNTU_SCHEDULE_PAGE)
-        schedule = schedule.replace('Apr 2041', 'Apr 2040').replace('Jul 2025', 'Jul 2027')
+        schedule = (schedule.replace('Apr 2041', 'Apr 2042')
+                    .replace('May 2025', 'May 2024').replace('Jul 2025', 'Jul 2027'))
         tracker = ('<td>ubuntu-24.10-desktop-amd64.iso</td>'
                    '<td>ubuntu-26.04-desktop-amd64.iso</td>')
         self.assertEqual(self._run(page=tracker, schedule=schedule,
                                    now=UBUNTU_FROZEN_NOW), {
             'MISSING:*buntu*.iso', 'NEW:Ubuntu-24.10', 'NEW:Ubuntu-26.04'})
         cached = self._failing_eol_fetch(tracker)._eol_cache_load()
-        # Fresh values win for both shortened and extended support dates.
-        self.assertEqual(cached.max_end['26.04'], (2040, 4))
+        # Fresh values may correct expired tiers or extend support. Moving
+        # an unexpired end earlier requires an alert and cache fallback.
+        self.assertEqual(cached.std_end['20.04'], (2024, 5))
+        self.assertEqual(cached.max_end['26.04'], (2042, 4))
         self.assertEqual(cached.max_end['24.10'], (2027, 7))
+
+    def test_lost_active_legacy_rows_cannot_end_support_at_an_expired_esm_date(self):
+        tables = UBUNTU_SCHEDULE_PAGE.split('</table>')
+        # Leave a second legacy line so losing 16.04 still produces four
+        # structurally valid, nonempty tables. Otherwise this test would
+        # pass via the parser's empty-table guard instead of the cache guard.
+        tables[2] += ('<tr><td>Ubuntu 20.04 ESM</td><td>coverage</td>'
+                      '<td>Apr 2030</td><td>5 years</td><td>Apr 2035</td></tr>')
+        original = '</table>'.join(tables)
+        names = ['ubuntu-16.04.7-desktop-amd64.iso',
+                 'ubuntu-26.04-desktop-amd64.iso']
+        for name in names:
+            (self.tmp / name).write_bytes(b'x')
+        tracker = ''.join(f'<td>{name}</td>' for name in names)
+        status = ' '.join(names)
+        self.assertEqual(self._run(status=status, page=tracker, schedule=original,
+                                   now=UBUNTU_FROZEN_NOW), set())
+        cache = self.eol_cache.read_bytes()
+        tables[0] = re.sub(r'<tr><td>Ubuntu 16\.04 LTS.*?</tr>', '', tables[0])
+        tables[2] = re.sub(r'<tr><td>Ubuntu 16\.04 ESM.*?</tr>', '', tables[2])
+        incomplete = '</table>'.join(tables)
+        checker = make_checker(nt.UbuntuChecker, self.tmp)
+        checker._page = incomplete
+        parsed = checker._parse_schedule()
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.max_end['16.04'], (2026, 4))
+        for _ in range(2):
+            self.assertEqual(self._run(status=status, page=tracker, schedule=incomplete,
+                                       now=UBUNTU_FROZEN_NOW), {'MALFORMED:Ubuntu-EOL'})
+            self.assertEqual(self.eol_cache.read_bytes(), cache)
+
+    def test_shorter_unexpired_dates_are_rejected_for_each_support_tier(self):
+        self._run(now=UBUNTU_FROZEN_NOW)
+        cache = self.eol_cache.read_bytes()
+        for old, new in (('May 2031', 'May 2030'),  # standard
+                         ('Apr 2030', 'Apr 2029'),  # ESM
+                         ('Apr 2031', 'Apr 2030'),  # maximum, still active
+                         ('Apr 2031', 'Apr 2026')):  # maximum, now expired
+            with self.subTest(old=old, new=new):
+                schedule = UBUNTU_SCHEDULE_PAGE.replace(old, new)
+                updates = self._run(schedule=schedule, now=UBUNTU_FROZEN_NOW)
+                self.assertIn('MALFORMED:Ubuntu-EOL', updates)
+                self.assertEqual(self.eol_cache.read_bytes(), cache)
+
+    def test_shortened_end_date_is_rejected_until_the_cached_end_month_passes(self):
+        self._run(now=UBUNTU_FROZEN_NOW)
+        cache = self.eol_cache.read_bytes()
+        schedule = UBUNTU_SCHEDULE_PAGE.replace('Apr 2031', 'Apr 2030')
+        for now in ((2031, 4), (2031, 5)):
+            with self.subTest(now=now):
+                updates = self._run(schedule=schedule, now=now)
+                if now == (2031, 4):
+                    self.assertIn('MALFORMED:Ubuntu-EOL', updates)
+                    self.assertEqual(self.eol_cache.read_bytes(), cache)
+                else:
+                    self.assertNotIn('MALFORMED:Ubuntu-EOL', updates)
+                    cached = self._failing_eol_fetch(UBUNTU_PAGE)._eol_cache_load()
+                    self.assertEqual(cached.max_end['16.04'], (2030, 4))
 
     def test_missing_unexpired_tier_is_rejected_until_its_end_month_passes(self):
         self._run(now=UBUNTU_FROZEN_NOW)

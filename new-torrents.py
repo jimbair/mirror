@@ -1494,16 +1494,20 @@ class UbuntuChecker(Checker):
                       'list-of-releases/', 'Ubuntu-EOL'):
             data = self._parse_schedule()
             if data is not None and cached is not None:
-                # Losing an unexpired tier is still suspicious, even if
-                # other rows and all table headers survived. But pruning
+                # Losing or shortening an unexpired tier is suspicious,
+                # even if other rows and all table headers survived.
+                # max_end combines all tables: a lost legacy row can leave
+                # the same key backed only by an earlier, expired ESM date.
+                # Flag genuine upstream cuts too rather than silently
+                # making an active line eligible for cleanup. But pruning
                 # expired rows must not freeze every subsequent update:
                 # retain those dates so old tracker ISOs stay EOL, while
                 # fresh values replace cached dates for present rows.
                 # Compare each tier's end month rather than the whole
                 # line: ESM can expire while legacy support remains active.
-                if any(end >= now
+                if any(end >= now and (line not in new or new[line] < end)
                        for old, new in zip(cached[:3], data[:3])
-                       for line, end in old.items() if line not in new):
+                       for line, end in old.items()):
                     data = None
                 else:
                     data = ScheduleData(
@@ -1519,7 +1523,7 @@ class UbuntuChecker(Checker):
                 except OSError as e:
                     self.alert(f'ERROR:Ubuntu-EOL-cache: {self._describe_fetch_error(e)}')
             else:
-                # The page is malformed or lost unexpired support data.
+                # The page is malformed or lost/shortened unexpired support.
                 # Alert rather than silently disabling the filter, even though
                 # the cached schedule below rescues this run's verdict --
                 # the broken page is still worth surfacing.
