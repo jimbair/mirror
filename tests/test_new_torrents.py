@@ -104,6 +104,16 @@ def http_response(body, encoding='', charset='utf-8'):
     return response
 
 
+def http_wire_response(body, headers):
+    """Use HTTPResponse itself so tests cover HTTP message framing."""
+    sock = MagicMock()
+    sock.makefile.return_value = io.BytesIO(
+        b'HTTP/1.1 200 OK\r\n' + headers + b'\r\n' + body)
+    response = http.client.HTTPResponse(sock)
+    response.begin()
+    return response
+
+
 class TestFailureTracker(unittest.TestCase):
 
     def setUp(self):
@@ -849,6 +859,46 @@ class TestCheckerBase(unittest.TestCase):
             self.assertFalse(c.fetch('https://example.com/x', 'svc'))
         self.assertEqual(c._page, '')
         self.assertEqual(self.ftrack.count('svc'), 1)
+
+    def test_fetch_rejects_premature_eof_with_content_length(self):
+        # Unlike read(), HTTPResponse.read1() returns EOF without raising
+        # IncompleteRead when Content-Length still promises more bytes.
+        # Use the real response parser rather than mocking that exception.
+        c = self._checker()
+        body = b'a plausible partial page' + b' ' * 300
+        headers = f'Content-Length: {len(body) + 100}\r\n'.encode()
+        for run in range(1, 4):
+            c.updates.clear()
+            c._page = 'previous response'
+            with patch('urllib.request.urlopen',
+                       return_value=http_wire_response(body, headers)):
+                self.assertFalse(c.fetch('https://example.com/x', 'svc'))
+            self.assertEqual(c._page, '')
+            self.assertEqual(self.ftrack.count('svc'), run)
+            self.assertEqual(bool(c.updates), run >= 3)
+        self.assertIn('IncompleteRead', next(iter(c.updates)))
+
+    def test_fetch_accepts_complete_http_message_framing(self):
+        body = b'a complete page' * 30
+        compressed = gzip.compress(body)
+        cases = [
+            (body, f'Content-Length: {len(body)}\r\n'.encode()),
+            (compressed, (f'Content-Length: {len(compressed)}\r\n'
+                          'Content-Encoding: gzip\r\n').encode()),
+            (body, b'Connection: close\r\n'),
+            # Transfer-Encoding takes precedence over Content-Length.
+            (f'{len(body):x}\r\n'.encode() + body + b'\r\n0\r\n\r\n',
+             b'Transfer-Encoding: chunked\r\nContent-Length: 9999\r\n'),
+        ]
+        for encoded, headers in cases:
+            with self.subTest(headers=headers):
+                c = self._checker()
+                self.ftrack.increment('svc')
+                with patch('urllib.request.urlopen',
+                           return_value=http_wire_response(encoded, headers)):
+                    self.assertTrue(c.fetch('https://example.com/x', 'svc'))
+                self.assertEqual(c._page, body.decode())
+                self.assertEqual(self.ftrack.count('svc'), 0)
 
     def test_body_ok_alerts_on_empty_page(self):
         """body_ok fires when page is empty."""

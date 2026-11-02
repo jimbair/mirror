@@ -466,6 +466,14 @@ class Checker(ABC):
                                        self._MAX_FETCH_BYTES - size + 1))
             self._check_deadline(deadline)
             if not chunk:
+                # read1() does not raise on premature EOF for a response
+                # with Content-Length, unlike read(). HTTPResponse keeps
+                # the outstanding byte count in length; chunked and
+                # close-delimited bodies leave it None. A partial listing
+                # must not clear outage counters or justify cleanup alerts.
+                remaining = getattr(response, 'length', None)
+                if isinstance(remaining, int) and remaining > 0:
+                    raise http.client.IncompleteRead(b''.join(chunks), remaining)
                 return b''.join(chunks)
             size += len(chunk)
             if size > self._MAX_FETCH_BYTES:
