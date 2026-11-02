@@ -19,6 +19,7 @@ python3 tests/test_new_torrents.py -v   # tests for new-torrents.py
 python3 tests/test_status_update.py -v  # tests for status_update.py
 python3 tests/test_status_update_sh.py -v  # active shell publication tests
 python3 tests/test_transmission_upgrade.py -v  # stubbed service lifecycle tests
+python3 tests/test_debian_torrents_fetch.py -v  # isolated torrent collection tests
 python3 new-torrents.py --help          # checker CLI; select with a positional name
 python3 new-torrents.py mint            # just Mint; names are case-insensitive
 bash -n status-update.sh               # shell syntax check
@@ -207,7 +208,10 @@ they live:
 ## Shell scripts
 
 - `debian-torrents-fetch.sh` — rsyncs all current Debian `.torrent` files;
-  run manually when a new Debian release drops.
+  run manually when a new Debian release drops. Failed setup, rsync, or moves
+  must exit non-zero and preserve any downloaded files for recovery. Tests
+  in `tests/test_debian_torrents_fetch.py` use disposable working directories
+  and a stubbed rsync; CI runs them on Ubuntu and AlmaLinux.
 - `new-speedtest.sh` — interactive; re-runs the speedtest and swaps
   `/home/jim/log/speedtest.log` if you accept it.
 - `status-update.sh` — the original version of `status_update.py`.

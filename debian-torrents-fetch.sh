@@ -4,7 +4,7 @@
 # is dropped and I need to update mirror.tsue.net's torrents
 
 # Create two directories, one for the rsync target and one to easily grab all torrents
-mkdir -p torrents_tree torrents
+mkdir -p torrents_tree torrents || exit 1
 
 # Sync the tree (only downloads .torrent files)
 rsync -am \
@@ -13,8 +13,12 @@ rsync -am \
   --exclude='*' \
   rsync://cdimage.debian.org/debian-cd/ torrents_tree/ || exit 1
 
-# Move torrent files into a single directory
-find torrents_tree -type f -name '*.torrent' -exec mv '{}' torrents/ \; || exit 2
+# Move torrent files into a single directory. With -exec ... \;, a failed
+# move is only a false predicate and find can still exit successfully.
+# The batched + form propagates command failures, retaining the source
+# tree for recovery instead of deleting downloads that never moved.
+find torrents_tree -type f -name '*.torrent' \
+  -exec sh -c 'mv -- "$@" torrents/' debian-torrents-move {} + || exit 2
 
 # Remove tree (which should now be empty)
 rm -r torrents_tree || exit 3

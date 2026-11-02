@@ -115,12 +115,15 @@ python3.11 -B tests/test_new_torrents.py -v
 python3.11 -B tests/test_status_update.py -v
 python3.11 -B tests/test_status_update_sh.py -v
 python3.11 -B tests/test_transmission_upgrade.py -v
+python3.11 -B tests/test_debian_torrents_fetch.py -v
 bash -n status-update.sh
 bash -n transmission-upgrade.sh
+bash -n debian-torrents-fetch.sh
 ```
 
 CI runs the suites on Ubuntu and AlmaLinux 10. Upgrade tests stub host commands
 and exercise service recovery without root or a real installation.
+Torrent-fetch tests stub rsync and keep all downloads in temporary directories.
 Representative upstream snippets and their source URLs live in
 [tests/fixtures](tests/fixtures/README.md).
 See [AGENTS.md](AGENTS.md) for architecture invariants and contribution guidance.

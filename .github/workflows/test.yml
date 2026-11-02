@@ -12,6 +12,8 @@ on:
       - 'tests/test_status_update_sh.py'
       - 'transmission-upgrade.sh'
       - 'tests/test_transmission_upgrade.py'
+      - 'debian-torrents-fetch.sh'
+      - 'tests/test_debian_torrents_fetch.py'
       - '.github/workflows/test.yml'
   pull_request:
     paths:
@@ -24,6 +26,8 @@ on:
       - 'tests/test_status_update_sh.py'
       - 'transmission-upgrade.sh'
       - 'tests/test_transmission_upgrade.py'
+      - 'debian-torrents-fetch.sh'
+      - 'tests/test_debian_torrents_fetch.py'
       - '.github/workflows/test.yml'
 jobs:
   maintenance-shell-ubuntu:
@@ -34,7 +38,9 @@ jobs:
         with:
           python-version: '3.11'
       - run: bash -n transmission-upgrade.sh
+      - run: bash -n debian-torrents-fetch.sh
       - run: python3 tests/test_transmission_upgrade.py -v
+      - run: python3 tests/test_debian_torrents_fetch.py -v
   maintenance-shell-almalinux:
     runs-on: ubuntu-latest
     container: almalinux:10
@@ -42,7 +48,9 @@ jobs:
       - uses: actions/checkout@v4
       - run: dnf install -y python3
       - run: bash -n transmission-upgrade.sh
+      - run: bash -n debian-torrents-fetch.sh
       - run: python3 tests/test_transmission_upgrade.py -v
+      - run: python3 tests/test_debian_torrents_fetch.py -v
   status-update-shell-ubuntu:
     runs-on: ubuntu-latest
     steps:
