@@ -2710,6 +2710,15 @@ class TestAlmaChecker(unittest.TestCase):
         self.assertIn('MALFORMED:AlmaLinux-isos.html', updates)
 
 
+    def test_removed_architecture_in_current_version_alerts_stale(self):
+        names = ['AlmaLinux-9.4-x86_64', 'AlmaLinux-9.4-aarch64']
+        for name in names:
+            (self.tmp / name).mkdir()
+        page = '<a href="/isos/x86_64/9.4.html">AlmaLinux 9.4</a>'
+        self.assertEqual(self._run(status=' '.join(names), page=page),
+                         {'STALE:AlmaLinux-9.4-aarch64'})
+
+
 # DebianChecker (mocks subprocess.run)
 
 # Every torrent filename on cdimage.debian.org is the ISO name with .torrent

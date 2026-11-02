@@ -1083,6 +1083,7 @@ class AlmaChecker(Checker):
       NEW:AlmaLinux-VER-ARCH    - expected directory absent from disk and transmission
       ORPHAN:AlmaLinux-VER-ARCH - directory present on disk but unknown to transmission
       STALE:AlmaLinux-VER-ARCH  - local directory superseded by a newer point release
+                                 or its architecture removed upstream
     """
 
     def check(self) -> None:
@@ -1144,6 +1145,14 @@ class AlmaChecker(Checker):
         else:
             for arch in arches:
                 self.check_dir(f'AlmaLinux-{current_version}-{arch}')
+
+        # A version can stay current while an architecture is retracted.
+        # The grouped older-version scan cannot see that change: compare
+        # current directories with the complete expected names as well.
+        expected = {f'AlmaLinux-{current_version}-{arch}' for arch in arches}
+        for directory in local_current:
+            if directory.name not in expected:
+                self.alert(f'STALE:{directory.name}')
 
         # Group superseded point releases by version instead of alerting once
         # per arch directory (e.g. a 10.0 → 10.1 bump used to fire one STALE
