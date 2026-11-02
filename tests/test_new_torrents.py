@@ -2384,7 +2384,7 @@ class TestUbuntuChecker(unittest.TestCase):
         tracker = ('<td>ubuntu-12.04.5-desktop-i386.iso</td>\n'
                    '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
         first_table = UBUNTU_SCHEDULE_PAGE.split('</table>', 1)[0] + '</table>'
-        missing_row = re.sub(r'<tr><td>Ubuntu 12.04 ESM.*?</tr>', '',
+        missing_row = re.sub(r'<tr><td>Ubuntu 20.04 ESM.*?</tr>', '',
                              UBUNTU_SCHEDULE_PAGE)
         for schedule in (first_table, missing_row,
                          UBUNTU_SCHEDULE_PAGE.replace('Apr 2019', 'unknown'),
@@ -2395,6 +2395,72 @@ class TestUbuntuChecker(unittest.TestCase):
                 self.assertIn('MALFORMED:Ubuntu-EOL', updates)
                 self.assertNotIn('NEW:Ubuntu-12.04.5', updates)
                 self.assertEqual(self.eol_cache.read_bytes(), cache)
+
+    def test_pruned_historical_rows_preserve_eol_and_accept_new_schedule_dates(self):
+        self._run(now=UBUNTU_FROZEN_NOW)
+        schedule = re.sub(r'<tr><td>Ubuntu 12\.04(?: ESM| LTS).*?</tr>', '',
+                          SCHEDULE_WITH_2510)
+        tracker = ('<td>ubuntu-12.04.5-desktop-i386.iso</td>'
+                   '<td>ubuntu-25.10-desktop-amd64.iso</td>'
+                   '<td>ubuntu-26.04-desktop-amd64.iso</td>')
+        expected = {'MISSING:*buntu*.iso', 'NEW:Ubuntu-26.04'}
+        # Repeated healthy responses must not get stuck behind a cached
+        # historical row, nor resurrect an old tracker ISO as NEW.
+        for _ in range(2):
+            self.assertEqual(self._run(page=tracker, schedule=schedule,
+                                       now=UBUNTU_FROZEN_NOW), expected)
+        checker = self._failing_eol_fetch(tracker, now=UBUNTU_FROZEN_NOW)
+        cached = checker._eol_cache_load()
+        self.assertEqual(cached.esm_end['12.04'], (2019, 4))
+        self.assertEqual(cached.max_end['25.10'], (2026, 7))
+        self.assertIn('12.04', cached.lts_lines)
+        checker.check()
+        self.assertEqual(checker.updates, expected)
+
+    def test_fresh_schedule_dates_override_cached_dates_after_historical_pruning(self):
+        self._run(now=UBUNTU_FROZEN_NOW)
+        schedule = re.sub(r'<tr><td>Ubuntu 12\.04(?: ESM| LTS).*?</tr>', '',
+                          UBUNTU_SCHEDULE_PAGE)
+        schedule = schedule.replace('Apr 2041', 'Apr 2040').replace('Jul 2025', 'Jul 2027')
+        tracker = ('<td>ubuntu-24.10-desktop-amd64.iso</td>'
+                   '<td>ubuntu-26.04-desktop-amd64.iso</td>')
+        self.assertEqual(self._run(page=tracker, schedule=schedule,
+                                   now=UBUNTU_FROZEN_NOW), {
+            'MISSING:*buntu*.iso', 'NEW:Ubuntu-24.10', 'NEW:Ubuntu-26.04'})
+        cached = self._failing_eol_fetch(tracker)._eol_cache_load()
+        # Fresh values win for both shortened and extended support dates.
+        self.assertEqual(cached.max_end['26.04'], (2040, 4))
+        self.assertEqual(cached.max_end['24.10'], (2027, 7))
+
+    def test_missing_unexpired_tier_is_rejected_until_its_end_month_passes(self):
+        self._run(now=UBUNTU_FROZEN_NOW)
+        cache = self.eol_cache.read_bytes()
+        schedule = re.sub(r'<tr><td>Ubuntu 20\.04 ESM.*?</tr>', '',
+                          SCHEDULE_WITH_2510)
+        for now in ((2030, 4), (2030, 5)):
+            with self.subTest(now=now):
+                updates = self._run(schedule=schedule, now=now)
+                if now == (2030, 4):
+                    self.assertIn('MALFORMED:Ubuntu-EOL', updates)
+                    self.assertEqual(self.eol_cache.read_bytes(), cache)
+                else:
+                    self.assertNotIn('MALFORMED:Ubuntu-EOL', updates)
+                    cached = self._failing_eol_fetch(UBUNTU_PAGE)._eol_cache_load()
+                    self.assertEqual(cached.esm_end['20.04'], (2030, 4))
+                    self.assertEqual(cached.max_end['25.10'], (2026, 7))
+
+    def test_expired_tier_can_be_pruned_while_its_lts_line_remains_active(self):
+        self._run(now=UBUNTU_FROZEN_NOW)
+        schedule = re.sub(r'<tr><td>Ubuntu 16\.04 ESM.*?</tr>', '',
+                          UBUNTU_SCHEDULE_PAGE, count=1)
+        tracker = ('<td>ubuntu-16.04.7-desktop-amd64.iso</td>'
+                   '<td>ubuntu-26.04-desktop-amd64.iso</td>')
+        self.assertEqual(self._run(page=tracker, schedule=schedule,
+                                   now=UBUNTU_FROZEN_NOW), {
+            'MISSING:*buntu*.iso', 'NEW:Ubuntu-16.04.7', 'NEW:Ubuntu-26.04'})
+        cached = self._failing_eol_fetch(tracker)._eol_cache_load()
+        self.assertEqual(cached.esm_end['16.04'], (2026, 4))
+        self.assertEqual(cached.max_end['16.04'], (2031, 4))
 
     def test_blank_historical_point_release_date_uses_its_lines_other_row(self):
         schedule = UBUNTU_SCHEDULE_PAGE.replace('</table>',

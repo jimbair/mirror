@@ -74,6 +74,9 @@ line. Its default EOL policy retains a line through the final Canonical support
 tier, including paid legacy support. Mint tracks all releases on its supported
 versions page. Both checkers retain validated support metadata for upstream
 outages; Ubuntu stores dates and recalculates EOL as the clock advances.
+When Ubuntu prunes expired schedule rows, cached dates preserve their EOL
+history while fresh dates continue to update. Losing an unexpired tier or
+receiving an incomplete table still alerts and retains the previous cache.
 
 ## Updating the checker
 

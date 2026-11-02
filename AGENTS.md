@@ -80,8 +80,11 @@ Keep them (and their comments) intact when refactoring.
 - **Malformed is not removed:** valid Fedora entries are still checked when
   siblings are malformed, but incomplete lists cannot justify STALE/DROPPED
   cleanup alerts for their affected version. Both support parsers require
-  complete table structure before replacing their caches. Cached Mint
-  absence can classify only archive versions known at cache time as EOL.
+  complete table structure before replacing their caches. Ubuntu retains
+  cached dates for pruned expired tiers and accepts fresh dates for present
+  rows; losing an unexpired tier still alerts and preserves the old cache.
+  Cached Mint absence can classify only archive versions known at cache time
+  as EOL.
 - **State-write errors:** report them without discarding completed alerts or
   the freshly parsed support verdict. Close the display even if persistence
   fails. State loaders treat invalid JSON and non-UTF-8 files as corrupt.

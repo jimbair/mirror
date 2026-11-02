@@ -1485,19 +1485,32 @@ class UbuntuChecker(Checker):
         """
         if self._EOL_MODE == 'off':
             return set()
+        if now is None:
+            today = date.today()
+            now = (today.year, today.month)
         data: ScheduleData | None = None
         cached = self._eol_cache_load()
         if self.fetch('https://ubuntu.com/project/docs/release-team/'
                       'list-of-releases/', 'Ubuntu-EOL'):
             data = self._parse_schedule()
             if data is not None and cached is not None:
-                # Historical rows remain relevant after support ends. A
-                # response that silently loses previously parsed lines is
-                # not a healthy replacement, even if every table header
-                # and some dates survived the scrape.
-                if any(not set(old) <= set(new)
-                       for old, new in zip(cached, data)):
+                # Losing an unexpired tier is still suspicious, even if
+                # other rows and all table headers survived. But pruning
+                # expired rows must not freeze every subsequent update:
+                # retain those dates so old tracker ISOs stay EOL, while
+                # fresh values replace cached dates for present rows.
+                # Compare each tier's end month rather than the whole
+                # line: ESM can expire while legacy support remains active.
+                if any(end >= now
+                       for old, new in zip(cached[:3], data[:3])
+                       for line, end in old.items() if line not in new):
                     data = None
+                else:
+                    data = ScheduleData(
+                        std_end=cached.std_end | data.std_end,
+                        esm_end=cached.esm_end | data.esm_end,
+                        max_end=cached.max_end | data.max_end,
+                        lts_lines=cached.lts_lines | data.lts_lines)
             if data is not None:
                 # Side effect only: a later run whose fetch or parse
                 # fails falls back to this. Never blocks the verdict.
@@ -1506,9 +1519,8 @@ class UbuntuChecker(Checker):
                 except OSError as e:
                     self.alert(f'ERROR:Ubuntu-EOL-cache: {self._describe_fetch_error(e)}')
             else:
-                # The page yielded no dates at all: structure change (or
-                # a short error shell that still passed fetch()). Alert
-                # rather than silently disabling the filter, even though
+                # The page is malformed or lost unexpired support data.
+                # Alert rather than silently disabling the filter, even though
                 # the cached schedule below rescues this run's verdict --
                 # the broken page is still worth surfacing.
                 self.alert('MALFORMED:Ubuntu-EOL')
@@ -1518,8 +1530,6 @@ class UbuntuChecker(Checker):
                         else 'EOL schedule unavailable')
         if data is None:
             return None
-        if now is None:
-            now = (date.today().year, date.today().month)
         return self._eol_from(data, now)
 
     def _parse_schedule(self) -> ScheduleData | None:
