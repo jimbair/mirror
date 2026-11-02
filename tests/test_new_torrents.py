@@ -178,6 +178,10 @@ class TestFailureTracker(unittest.TestCase):
         t = self._tracker()
         self.assertFalse(t.at_threshold('x'))  # no crash, empty state
 
+    def test_non_utf8_state_starts_fresh(self):
+        self.path.write_bytes(b'\xff')
+        self.assertEqual(self._tracker().count('svc'), 0)
+
     def test_non_int_values_are_discarded(self):
         """A hand-edited failures.json carrying non-int values (e.g.
         {"Debian": "2"} while debugging an outage) must not poison the
@@ -1253,6 +1257,20 @@ class TestMintChecker(unittest.TestCase):
                     MINT_INDEX, MINT_VER, '<html>broken</html>']),
                     {'MALFORMED:Linux-Mint-Supported'})
 
+    def test_failed_support_cache_replace_preserves_cache_and_checks(self):
+        for name in MINT_ISOS:
+            (self.tmp / name).write_bytes(b'x')
+        c = make_checker(nt.MintChecker, self.tmp, MINT_ISOS[0])
+        c._support_cache_save({'21.3'}, {'21.3', '22.0'})
+        previous = c._supported_cache_path.read_bytes()
+        c.fetch = fake_fetch_seq(c, [MINT_INDEX, MINT_VER, MINT_SUPPORTED])
+        with patch('os.replace', side_effect=PermissionError('read-only state')):
+            c.check()
+        self.assertIn('ORPHAN:' + MINT_ISOS[1], c.updates)
+        self.assertTrue(any(u.startswith('ERROR:Linux-Mint-Supported-cache:')
+                            for u in c.updates))
+        self.assertEqual(c._supported_cache_path.read_bytes(), previous)
+
     def test_lmde_row_on_support_page_is_filtered_out(self):
         """The support page also carries an LMDE row (version "7"); "7"
         never appears in the pub index, so check() must drop it via the
@@ -2186,6 +2204,22 @@ class TestUbuntuChecker(unittest.TestCase):
                 c.check()
                 self.assertIn('NEW:Ubuntu-12.04.5', c.updates)
                 self.assertIn('NEW:Ubuntu-26.04', c.updates)
+
+    def test_cache_write_failure_keeps_the_verdict_and_iso_checks(self):
+        for error in (PermissionError('read-only state'), OSError('disk full')):
+            with self.subTest(error=error):
+                with patch.object(nt.UbuntuChecker, '_eol_cache_save', side_effect=error):
+                    updates = self._run(now=UBUNTU_FROZEN_NOW)
+                self.assertIn('MISSING:*buntu*.iso', updates)
+                self.assertIn('NEW:Ubuntu-24.04', updates)
+                self.assertTrue(any(u.startswith('ERROR:Ubuntu-EOL-cache:')
+                                    for u in updates))
+
+    def test_non_utf8_cache_fails_open(self):
+        self.eol_cache.write_bytes(b'\xff')
+        c = self._failing_eol_fetch('<td>ubuntu-26.04-desktop-amd64.iso</td>')
+        c.check()
+        self.assertIn('NEW:Ubuntu-26.04', c.updates)
 
     def test_cache_stores_dates_not_verdict(self):
         """The cache holds dates, not a verdict: 25.10 is still active
@@ -3176,6 +3210,30 @@ class TestMain(unittest.TestCase):
         # Non-zero because of the crashing checker's own EXCEPTION: alert,
         # not because main() itself blew up.
         self.assertEqual(ret, 1)
+
+    def test_state_save_failure_reports_existing_alerts_and_closes_display(self):
+        self.iso_dir.mkdir()
+        (self.iso_dir / 'status.txt').write_text('Sum: 1')
+        for error in (PermissionError('read-only state'), OSError('disk full')):
+            for existing_alert in (False, True):
+                with self.subTest(error=error, alert=existing_alert):
+                    display = MagicMock()
+                    output = io.StringIO()
+
+                    def check(c):
+                        if existing_alert:
+                            c.alert('NEW:important-release')
+
+                    with patch.object(nt.ArchChecker, 'check', check), \
+                         patch.object(nt.FailureTracker, 'save', side_effect=error), \
+                         patch.object(nt, 'StatusDisplay', return_value=display), \
+                         patch('sys.stdout', output):
+                        ret = self._run_main(argv=['arch', '--verbose'])
+                    self.assertEqual(ret, 1)
+                    self.assertIn('ERROR:failure-state:', output.getvalue())
+                    self.assertEqual('NEW:important-release' in output.getvalue(),
+                                     existing_alert)
+                    display.close.assert_called_once()
 
     def test_clean_run_with_display_has_no_trailing_blank_line(self):
         """With the live status display active (--verbose forces it even

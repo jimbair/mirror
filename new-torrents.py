@@ -125,11 +125,9 @@ class FailureTracker:
     # Internal
 
     def _load(self) -> dict[str, int]:
-        if not self._path.exists():
-            return {}
         try:
             data = json.loads(self._path.read_text())
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, UnicodeError, OSError):
             return {}
         # Valid JSON that isn't an object (e.g. a list) would raise at
         # the per-checker counter accesses; treat it like a corrupt file.
@@ -1384,7 +1382,10 @@ class UbuntuChecker(Checker):
             if data is not None:
                 # Side effect only: a later run whose fetch or parse
                 # fails falls back to this. Never blocks the verdict.
-                self._eol_cache_save(data)
+                try:
+                    self._eol_cache_save(data)
+                except OSError as e:
+                    self.alert(f'ERROR:Ubuntu-EOL-cache: {self._describe_fetch_error(e)}')
             else:
                 # The page yielded no dates at all: structure change (or
                 # a short error shell that still passed fetch()). Alert
@@ -1537,7 +1538,8 @@ class UbuntuChecker(Checker):
             return None
         out: dict[str, tuple[int, int]] = {}
         for line, ym in raw.items():
-            if (not isinstance(ym, list) or len(ym) != 2
+            if (not re.fullmatch(r'\d{1,2}\.\d{2}', line)
+                    or not isinstance(ym, list) or len(ym) != 2
                     or any(not isinstance(x, int) or isinstance(x, bool)
                            for x in ym)
                     or not 1900 <= ym[0] <= 2100
@@ -1576,7 +1578,7 @@ class UbuntuChecker(Checker):
             return None
         try:
             raw = json.loads(self._eol_cache_path.read_text())
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, UnicodeError, OSError):
             return None
         if not isinstance(raw, dict):
             return None
@@ -1586,7 +1588,8 @@ class UbuntuChecker(Checker):
         lts_raw = raw.get('lts_lines')
         if (std_end is None or esm_end is None or max_end is None
                 or not isinstance(lts_raw, list)
-                or not all(isinstance(line, str) for line in lts_raw)):
+                or not all(isinstance(line, str) and
+                           re.fullmatch(r'\d{1,2}\.\d{2}', line) for line in lts_raw)):
             return None
         # _eol_cache_save() only ever persists a parse that found at
         # least one date (a no-date page never gets cached), so an
@@ -2053,6 +2056,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             '  DROPPED:<line>  local ISOs exist for a version no longer offered\n'
             '  MISSING:<glob>  no ISOs of that distro found on disk at all\n'
             '  MALFORMED:<src> upstream page or listing returned no usable data\n'
+            '  ERROR:<source>  local state could not be saved (details follow)\n'
             '  UNSAFE:<name>   upstream-supplied name would escape the download dir\n'
             '  EXCEPTION:<cls> a checker crashed unexpectedly (details follow)\n'
             '  DOWN:<domain>   fetches from that upstream domain keep failing; the\n'
@@ -2113,21 +2117,26 @@ def _run(args: argparse.Namespace) -> int:
     interactive = sys.stderr.isatty() or args.verbose
     names = [cls.__name__ for cls in checkers]
     display = StatusDisplay(names) if interactive else None
-    failures = FailureTracker(FAIL_FILE, FAIL_THRESHOLD)
-    instances = [
-        cls(ISO_DIR, status_content, failures, display) for cls in checkers
-    ]
     all_updates: set[str] = set()
+    try:
+        failures = FailureTracker(FAIL_FILE, FAIL_THRESHOLD)
+        instances = [
+            cls(ISO_DIR, status_content, failures, display) for cls in checkers
+        ]
+        with ThreadPoolExecutor(max_workers=len(instances)) as pool:
+            for future in as_completed(pool.submit(checker.run) for checker in instances):
+                all_updates |= future.result()
 
-    with ThreadPoolExecutor(max_workers=len(instances)) as pool:
-        for future in as_completed(pool.submit(checker.run) for checker in instances):
-            all_updates |= future.result()
-
-    # Persist failure counts now that all checkers have finished
-    failures.save()
-
-    if display:
-        display.close()
+        # Persistence failure is itself an alert, not a reason to discard
+        # every already-completed result (which is posted to monitoring on
+        # stdout). The next run must also know saving the counters failed.
+        try:
+            failures.save()
+        except OSError as e:
+            all_updates.add(f'ERROR:failure-state: {Checker._describe_fetch_error(e)}')
+    finally:
+        if display:
+            display.close()
 
     # Report all accumulated alerts and exit non-zero so healthchecks.io fires
     if all_updates:
