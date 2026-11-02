@@ -1606,11 +1606,13 @@ class UbuntuChecker(Checker):
         if not self.body_ok('torrent.ubuntu.com'):
             return
 
-        page_lines = [
-            ln for ln in self._page.splitlines()
-            if not re.search(r'beta|snapshot', ln, re.IGNORECASE)
+        # HTML whitespace is not a record boundary. A compacted table can
+        # put stable and prerelease entries on one line; filtering that
+        # whole line would hide stable targets and falsely mark them stale.
+        upstream_isos = [
+            iso for iso in re.findall(r'>([^<]+\.iso)<', self._page)
+            if not re.search(r'beta|snapshot', iso, re.IGNORECASE)
         ]
-        upstream_isos = re.findall(r'>([^<]+\.iso)<', '\n'.join(page_lines))
         # Page structure could change; alert and bail if it does
         if not upstream_isos:
             self.alert('MALFORMED:Ubuntu-Tracker')

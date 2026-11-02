@@ -1450,9 +1450,8 @@ class TestCachyChecker(unittest.TestCase):
 
 # UbuntuChecker
 
-# The tracker_index format uses bare >NAME< spans, one per line.
-# The beta/snapshot filter works at the line level, so each entry must be
-# on its own line for the filter to be able to drop the unwanted ones.
+# The tracker_index format uses bare >NAME< spans; HTML line breaks have
+# no bearing on whether a filename is stable or a prerelease.
 UBUNTU_PAGE = (
     '<td>ubuntu-24.04-desktop-amd64.iso</td>\n'
     '<td>ubuntu-24.04-live-server-amd64.iso</td>\n'
@@ -1786,6 +1785,19 @@ class TestUbuntuChecker(unittest.TestCase):
             any('beta' in u.lower() or 'snapshot' in u.lower() for u in updates),
             f'Beta/snapshot leaked into alerts: {updates}',
         )
+
+    def test_minified_tracker_keeps_stable_entries_next_to_prereleases(self):
+        for iso in UBUNTU_ISOS:
+            (self.tmp / iso).write_bytes(b'x')
+        updates = self._run(status=' '.join(UBUNTU_ISOS),
+                            page=UBUNTU_PAGE.replace('\n', ''))
+        self.assertEqual(updates, set())
+
+    def test_beta_text_elsewhere_on_the_line_does_not_hide_a_stable_iso(self):
+        page = '<td>ubuntu-26.04-desktop-amd64.iso</td><td>beta information</td>'
+        updates = self._run(page=page, now=UBUNTU_FROZEN_NOW)
+        self.assertIn('NEW:Ubuntu-26.04', updates)
+        self.assertNotIn('MALFORMED:Ubuntu-Tracker', updates)
 
     def test_no_alert_when_current_versions_fully_present(self):
         for name in UBUNTU_ISOS:
