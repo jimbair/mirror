@@ -607,6 +607,7 @@ class TestCheckerBase(unittest.TestCase):
         c = self._checker()
         err = urllib.error.HTTPError('https://example.com/x', 503,
                                      'Service Unavailable', {}, io.BytesIO(b''))
+        self.addCleanup(err.close)
         with patch('urllib.request.urlopen', side_effect=err):
             c.fetch('https://example.com/x', 'svc')
         self.assertEqual(
@@ -658,6 +659,8 @@ class TestCheckerBase(unittest.TestCase):
             (OSError(), 'OSError'),
         ]
         for exc, expected in cases:
+            if isinstance(exc, urllib.error.HTTPError):
+                self.addCleanup(exc.close)
             with self.subTest(exc=repr(exc)):
                 self.assertEqual(nt.Checker._describe_fetch_error(exc), expected)
 
@@ -3406,7 +3409,7 @@ class TestMain(unittest.TestCase):
                     with patch.object(nt.ArchChecker, 'check', check), \
                          patch.object(nt.FailureTracker, 'save', side_effect=error), \
                          patch.object(nt, 'StatusDisplay', return_value=display), \
-                         patch('sys.stdout', output):
+                         patch('sys.stdout', output), patch('sys.stderr', io.StringIO()):
                         ret = self._run_main(argv=['arch', '--verbose'])
                     self.assertEqual(ret, 1)
                     self.assertIn('ERROR:failure-state:', output.getvalue())
@@ -3584,6 +3587,75 @@ class TestVerKey(unittest.TestCase):
 
     def test_single_component(self):
         self.assertEqual(nt.ver_key('42'), (42,))
+
+
+class TestUpstreamFixtures(unittest.TestCase):
+    """Captured upstream structure complements focused synthetic cases."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.iso_dir = Path(self.tmp.name)
+
+    def _fixture(self, filename):
+        return (Path(__file__).parent / 'fixtures' / filename).read_text(encoding='utf-8')
+
+    def test_mint_multiple_supported_releases_and_lmde(self):
+        current = 'linuxmint-22.3-cinnamon-64bit.iso'
+        (self.iso_dir / current).write_bytes(b'x')
+        c = make_checker(nt.MintChecker, self.iso_dir, current)
+        current_isos = [f'linuxmint-22.3-{edition}-64bit.iso'
+                        for edition in ('cinnamon', 'mate', 'xfce')]
+        pages = {
+            'https://pub.linuxmint.io/stable/':
+                '<a href="21.3/">21.3/</a><a href="22/">22/</a>'
+                '<a href="22.3/">22.3/</a>',
+            'https://pub.linuxmint.io/stable/22.3/':
+                ''.join(f'<a href="{name}">{name}</a>' for name in current_isos),
+            'https://linuxmint.com/download_all.php':
+                self._fixture('mint-supported.html'),
+        }
+
+        def fetch(url, name):
+            c._page = pages[url] + _PAD
+            return True
+
+        c.fetch = fetch
+        c.check()
+        self.assertEqual(c.updates, {'NEW:Linux-Mint-21.3', 'NEW:Linux-Mint-22',
+                                    'NEW:' + current_isos[1], 'NEW:' + current_isos[2]})
+
+    def test_ubuntu_support_tables_and_blank_point_release_cells(self):
+        c = make_checker(nt.UbuntuChecker, self.iso_dir)
+        c._page = self._fixture('ubuntu-schedule.html')
+        data = c._parse_schedule()
+        self.assertIsNotNone(data)
+        self.assertEqual(c._eol_from(data, (2026, 11)), {'10.04', '25.10'})
+
+    def test_fedora_stable_versions_and_beta(self):
+        c = make_checker(nt.FedoraChecker, self.iso_dir)
+        c.fetch = fake_fetch_fn(c, self._fixture('fedora-torrents.json'))
+        c.check()
+        self.assertEqual(c.updates, {'NEW:Fedora-43', 'NEW:Fedora-44', 'NEW:Fedora-45'})
+
+    def test_proxmox_tracks_arm64_and_x86_64_downloads(self):
+        c = make_checker(nt.ProxmoxChecker, self.iso_dir)
+        c.fetch = fake_fetch_fn(c, self._fixture('proxmox-downloads.html'))
+        c.check()
+        self.assertEqual(c.updates, {'NEW:proxmox-ve_8.4-1', 'NEW:proxmox-ve_9.2-1',
+                                    'NEW:proxmox-ve_9.2-1-arm64'})
+
+    def test_arch_current_release_markup(self):
+        c = make_checker(nt.ArchChecker, self.iso_dir)
+        c.fetch = fake_fetch_fn(c, self._fixture('arch-download.html'))
+        c.check()
+        self.assertEqual(c.updates, {'NEW:Arch-2026.11.01'})
+
+    def test_cachyos_encoded_torrent_properties(self):
+        c = make_checker(nt.CachyChecker, self.iso_dir)
+        c.fetch = fake_fetch_fn(c, self._fixture('cachyos-torrent-props.txt'))
+        c.check()
+        self.assertEqual(c.updates, {'NEW:CachyOS-260809'})
 
 
 if __name__ == '__main__':

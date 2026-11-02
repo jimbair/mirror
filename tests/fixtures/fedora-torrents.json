@@ -1,0 +1,46 @@
+[
+  {
+    "name": "43",
+    "torrents": [
+      {
+        "torrent": "Fedora-Budgie-Live-x86_64-43.torrent"
+      },
+      {
+        "torrent": "Fedora-COSMIC-Atomic-ostree-aarch64-43.torrent"
+      }
+    ]
+  },
+  {
+    "name": "44",
+    "torrents": [
+      {
+        "torrent": "Fedora-Budgie-Live-x86_64-44.torrent"
+      },
+      {
+        "torrent": "Fedora-COSMIC-Atomic-ostree-aarch64-44.torrent"
+      }
+    ]
+  },
+  {
+    "name": "45_Beta",
+    "torrents": [
+      {
+        "torrent": "Fedora-Budgie-Live-x86_64-45_Beta.torrent"
+      },
+      {
+        "torrent": "Fedora-COSMIC-Live-aarch64-45_Beta.torrent"
+      }
+    ]
+  },
+  {
+    "name": "45",
+    "torrents": [
+      {
+        "torrent": "Fedora-Budgie-Live-x86_64-45.torrent"
+      },
+      {
+        "torrent": "Fedora-COSMIC-Live-aarch64-45.torrent"
+      }
+    ]
+  }
+]

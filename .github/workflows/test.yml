@@ -5,6 +5,7 @@ on:
     paths:
       - 'new-torrents.py'
       - 'tests/test_new_torrents.py'
+      - 'tests/fixtures/**'
       - 'status_update.py'
       - 'tests/test_status_update.py'
       - 'status-update.sh'
@@ -14,6 +15,7 @@ on:
     paths:
       - 'new-torrents.py'
       - 'tests/test_new_torrents.py'
+      - 'tests/fixtures/**'
       - 'status_update.py'
       - 'tests/test_status_update.py'
       - 'status-update.sh'
