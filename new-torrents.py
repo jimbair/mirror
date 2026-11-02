@@ -1738,8 +1738,10 @@ class UbuntuChecker(Checker):
         # HTML whitespace is not a record boundary. A compacted table can
         # put stable and prerelease entries on one line; filtering that
         # whole line would hide stable targets and falsely mark them stale.
+        # Whitespace around link text belongs to the HTML formatting, not
+        # the local filename used for status matching and stale detection.
         upstream_isos = [
-            iso for iso in re.findall(r'>([^<]+\.iso)<', self._page)
+            iso.strip() for iso in re.findall(r'>([^<]+\.iso)\s*<', self._page)
             if not re.search(r'beta|snapshot', iso, re.IGNORECASE)
         ]
         # Page structure could change; alert and bail if it does

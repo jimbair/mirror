@@ -1994,6 +1994,27 @@ class TestUbuntuChecker(unittest.TestCase):
         self.assertIn('NEW:Ubuntu-26.04', updates)
         self.assertNotIn('MALFORMED:Ubuntu-Tracker', updates)
 
+    def test_tracker_whitespace_around_names_does_not_change_known_iso_matches(self):
+        for name in UBUNTU_ISOS:
+            (self.tmp / name).write_bytes(b'x')
+        names = UBUNTU_ISOS + ['ubuntu-24.10-beta-amd64.iso']
+        for before, after in (('', ' '), (' \n\t', '\n\t'), ('\t', ''), ('\r\n', '\r\n')):
+            with self.subTest(before=before, after=after):
+                page = '<table><tr>' + ''.join(
+                    f'<td><a href="download">{before}{name}{after}</a></td>'
+                    for name in names) + '</tr></table>'
+                self.assertEqual(self._run(status=' '.join(UBUNTU_ISOS), page=page,
+                                           now=UBUNTU_FROZEN_NOW), set())
+
+    def test_tracker_whitespace_preserves_per_file_new_and_orphan_names(self):
+        desktop = 'ubuntu-24.04-desktop-amd64.iso'
+        server = 'ubuntu-24.04-live-server-amd64.iso'
+        (self.tmp / desktop).write_bytes(b'x')
+        page = (f'<td>\n {desktop}\t </td><td> {server}\n</td>'
+                '<td> ubuntu-24.10-beta-amd64.iso \n</td>')
+        self.assertEqual(self._run(page=page, now=UBUNTU_FROZEN_NOW), {
+            'ORPHAN:' + desktop, 'NEW:' + server})
+
     def test_no_alert_when_current_versions_fully_present(self):
         for name in UBUNTU_ISOS:
             (self.tmp / name).write_bytes(b'x' * 100)
