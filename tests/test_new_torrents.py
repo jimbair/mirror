@@ -2075,6 +2075,9 @@ class TestUbuntuChecker(unittest.TestCase):
             '<td>Apr 23, 2020</td><td>May 2025</td><td>Apr 2035</td></tr>'
             '</table>'
         )
+        # Keep the other complete tables: this test varies the target
+        # line's clock, not the schedule's structural validity.
+        page += UBUNTU_SCHEDULE_PAGE.split('</table>', 1)[1]
         c = make_checker(nt.UbuntuChecker, self.tmp)
         c._eol_cache_path = self.eol_cache
 
@@ -2085,8 +2088,8 @@ class TestUbuntuChecker(unittest.TestCase):
         c.fetch = _fetch
 
         # 'hard' mode keys on the last tier of any kind: End of Life Apr 2035.
-        self.assertEqual(c._eol_lines(now=(2035, 4)), set())
-        self.assertEqual(c._eol_lines(now=(2035, 5)), {'20.04'})
+        self.assertNotIn('20.04', c._eol_lines(now=(2035, 4)))
+        self.assertIn('20.04', c._eol_lines(now=(2035, 5)))
 
     def _failing_eol_fetch(self, page, now=None):
         """A checker whose schedule fetch fails (fetch() returns False
@@ -2137,6 +2140,31 @@ class TestUbuntuChecker(unittest.TestCase):
         self.assertIn('MALFORMED:Ubuntu-EOL', updates)
         self.assertNotIn('NEW:Ubuntu-12.04.5', updates)
         self.assertIn('NEW:Ubuntu-26.04', updates)
+
+    def test_partial_schedule_does_not_replace_valid_cache(self):
+        self._run(now=UBUNTU_FROZEN_NOW)
+        cache = self.eol_cache.read_bytes()
+        tracker = ('<td>ubuntu-12.04.5-desktop-i386.iso</td>\n'
+                   '<td>ubuntu-26.04-desktop-amd64.iso</td>\n')
+        first_table = UBUNTU_SCHEDULE_PAGE.split('</table>', 1)[0] + '</table>'
+        missing_row = re.sub(r'<tr><td>Ubuntu 12.04 ESM.*?</tr>', '',
+                             UBUNTU_SCHEDULE_PAGE)
+        for schedule in (first_table, missing_row,
+                         UBUNTU_SCHEDULE_PAGE.replace('Apr 2019', 'unknown'),
+                         UBUNTU_SCHEDULE_PAGE.replace('</tr></table>', '</table>', 1)):
+            with self.subTest(schedule=schedule):
+                updates = self._run(page=tracker, schedule=schedule,
+                                    now=UBUNTU_FROZEN_NOW)
+                self.assertIn('MALFORMED:Ubuntu-EOL', updates)
+                self.assertNotIn('NEW:Ubuntu-12.04.5', updates)
+                self.assertEqual(self.eol_cache.read_bytes(), cache)
+
+    def test_blank_historical_point_release_date_uses_its_lines_other_row(self):
+        schedule = UBUNTU_SCHEDULE_PAGE.replace('</table>',
+            '<tr><td>Ubuntu 20.04.1 LTS</td><td>Focal</td><td>Docs</td>'
+            '<td>Aug 2020</td><td></td><td></td></tr></table>', 1)
+        updates = self._run(schedule=schedule, now=UBUNTU_FROZEN_NOW)
+        self.assertNotIn('MALFORMED:Ubuntu-EOL', updates)
 
     def test_corrupt_cache_fails_open_without_crash(self):
         """A cache file in any shape _eol_cache_save() didn't write is

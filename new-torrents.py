@@ -8,6 +8,7 @@
 import argparse
 import fcntl
 import gzip
+import html
 import http.client
 import json
 import os
@@ -1325,7 +1326,7 @@ class UbuntuChecker(Checker):
 
     def _sched_cells(self, row_html: str) -> list[str]:
         """Cell texts of one <tr> row: inner tags stripped, whitespace collapsed."""
-        return [' '.join(re.sub(r'<[^>]+>', ' ', cell).split())
+        return [' '.join(html.unescape(re.sub(r'<[^>]+>', ' ', cell)).split())
                 for cell in self._SCHED_CELL_RE.findall(row_html)]
 
     def _sched_ym(self, cell: str) -> tuple[int, int] | None:
@@ -1368,9 +1369,18 @@ class UbuntuChecker(Checker):
         if self._EOL_MODE == 'off':
             return set()
         data: ScheduleData | None = None
+        cached = self._eol_cache_load()
         if self.fetch('https://ubuntu.com/project/docs/release-team/'
                       'list-of-releases/', 'Ubuntu-EOL'):
             data = self._parse_schedule()
+            if data is not None and cached is not None:
+                # Historical rows remain relevant after support ends. A
+                # response that silently loses previously parsed lines is
+                # not a healthy replacement, even if every table header
+                # and some dates survived the scrape.
+                if any(not set(old) <= set(new)
+                       for old, new in zip(cached, data)):
+                    data = None
             if data is not None:
                 # Side effect only: a later run whose fetch or parse
                 # fails falls back to this. Never blocks the verdict.
@@ -1383,7 +1393,7 @@ class UbuntuChecker(Checker):
                 # the broken page is still worth surfacing.
                 self.alert('MALFORMED:Ubuntu-EOL')
         if data is None:
-            data = self._eol_cache_load()
+            data = cached
             self._debug('EOL schedule from cache' if data is not None
                         else 'EOL schedule unavailable')
         if data is None:
@@ -1397,48 +1407,68 @@ class UbuntuChecker(Checker):
         per-line support end dates -- the raw material for the EOL
         verdict, which _eol_from() derives itself at whatever clock it's
         called with. Returns None when the page carries no usable dates
-        at all; the caller alerts MALFORMED:Ubuntu-EOL in that case.
+        or when table/row coverage is incomplete; the caller reports
+        MALFORMED:Ubuntu-EOL and retains the last healthy cache.
         """
         std_end: dict[str, tuple[int, int]] = {}  # standard support
         esm_end: dict[str, tuple[int, int]] = {}  # ESM / Ubuntu Pro
         max_end: dict[str, tuple[int, int]] = {}  # last tier of any kind
         lts_lines: set[str] = set()
+        seen: dict[str, set[str]] = {}
+        dated: dict[str, set[str]] = {}
 
         for table in self._SCHED_TABLE_RE.findall(self._page):
             rows = self._SCHED_ROW_RE.findall(table)
             if not rows:
                 continue
-            header = ' '.join(self._sched_cells(rows[0]))
+            header = ' '.join(self._sched_cells(rows[0])).lower()
             hcols = [' '.join(c.split()).lower()
                      for c in self._sched_cells(rows[0])]
             std_col = next((i for i, c in enumerate(hcols)
                             if 'end of standard support' in c), None)
             eol_col = next((i for i, c in enumerate(hcols)
                             if c == 'end of life'), None)
-            if 'End of Standard Support' in header and 'End of Life' in header:
+            if 'end of standard support' in header and 'end of life' in header:
                 kind = 'LTS'
-            elif 'Detailed ESM coverage' in header:
+            elif 'detailed esm coverage' in header:
                 kind = 'ESM'
-            elif 'Detailed Legacy coverage' in header:
+            elif 'detailed legacy coverage' in header:
                 kind = 'LEGACY'
-            elif 'Code name' in header and 'End of Life' in header:
+            elif 'code name' in header and 'end of life' in header:
                 kind = 'PAST'
             else:
                 continue
+            if len(re.findall(r'<tr\b', table, re.IGNORECASE)) != len(rows):
+                return None
+            seen.setdefault(kind, set())
+            dated.setdefault(kind, set())
             for row in rows[1:]:
                 cells = self._sched_cells(row)
-                if eol_col is None or eol_col >= len(cells):
+                if not cells:
                     continue
                 m = re.search(r'(\d{1,2}\.\d{2})', cells[0])
                 if not m:
                     continue
                 line = m.group(1)
+                seen[kind].add(line)
+                if eol_col is None or eol_col >= len(cells):
+                    return None
                 eol_ym = self._sched_ym(cells[eol_col])
+                # Blank cells are real on historical point-release rows;
+                # another row for that same line carries the date. A
+                # nonempty unparseable date is structure drift, however.
+                if cells[eol_col] and eol_ym is None:
+                    return None
+                if eol_ym is not None:
+                    dated[kind].add(line)
                 if kind == 'LTS':
                     lts_lines.add(line)
-                    if std_col is not None and std_col < len(cells):
-                        self._sched_update(std_end, line,
-                                           self._sched_ym(cells[std_col]))
+                    if std_col is None or std_col >= len(cells):
+                        return None
+                    std_ym = self._sched_ym(cells[std_col])
+                    if cells[std_col] and std_ym is None:
+                        return None
+                    self._sched_update(std_end, line, std_ym)
                     self._sched_update(max_end, line, eol_ym)
                 elif kind == 'ESM':
                     lts_lines.add(line)
@@ -1451,11 +1481,13 @@ class UbuntuChecker(Checker):
                     self._sched_update(std_end, line, eol_ym)
                     self._sched_update(max_end, line, eol_ym)
 
-        if not (std_end or esm_end or max_end):
-            # The page yielded no dates at all: structure change (or a
-            # short error shell that still passed fetch()). The caller
-            # alerts MALFORMED:Ubuntu-EOL rather than silently disabling
-            # the filter.
+        if (set(seen) != {'LTS', 'ESM', 'LEGACY', 'PAST'}
+                or any(not lines or not lines <= dated[kind]
+                       for kind, lines in seen.items())
+                or not seen.get('LTS', set()) <= set(std_end)):
+            # All four tables are necessary: accepting just one surviving
+            # table poisons the good cache and resurrects omitted EOL lines
+            # as NEW on this run and on subsequent schedule outages.
             return None
         return ScheduleData(std_end=std_end, esm_end=esm_end,
                             max_end=max_end, lts_lines=frozenset(lts_lines))
