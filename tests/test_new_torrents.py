@@ -2391,9 +2391,8 @@ class TestFedoraChecker(unittest.TestCase):
         self.assertIn('MALFORMED:Fedora-Tracker', updates)
 
     def test_malformed_entries_do_not_break_valid_versions(self):
-        """Malformed entries are skipped individually: the valid version
-        42 is still tracked (no NEW alert since its dir exists) and no
-        MALFORMED or EXCEPTION fires for the garbage around it."""
+        """A malformed stable version alerts without blocking the usable
+        version's checks or turning the bad version into a removal."""
         (self.tmp / 'Fedora-Workstation-Live-x86_64-42').mkdir()
         page = json.dumps([
             'garbage',
@@ -2410,14 +2409,13 @@ class TestFedoraChecker(unittest.TestCase):
             status='Fedora-Workstation-Live-x86_64-42',
             page=page,
         )
-        self.assertNotIn('MALFORMED:Fedora-Tracker', updates)
+        self.assertIn('MALFORMED:Fedora-Tracker', updates)
         self.assertNotIn('NEW:Fedora-42', updates)
         self.assertFalse(any(u.startswith('EXCEPTION') for u in updates))
 
     def test_null_torrents_key_entry_is_skipped(self):
-        """A 'torrents' key present but null is unusable; the entry is
-        skipped (the local 41 dir then reads as DROPPED) instead of
-        crashing the checker."""
+        """A null torrent list reports malformed metadata, not a dropped
+        version: the tracker explicitly says the version still exists."""
         (self.tmp / 'Fedora-Workstation-Live-x86_64-41').mkdir()
         (self.tmp / 'Fedora-Workstation-Live-x86_64-42').mkdir()
         page = json.dumps([
@@ -2436,8 +2434,8 @@ class TestFedoraChecker(unittest.TestCase):
             ),
             page=page,
         )
-        self.assertIn('DROPPED:Fedora-41', updates)
-        self.assertNotIn('MALFORMED:Fedora-Tracker', updates)
+        self.assertNotIn('DROPPED:Fedora-41', updates)
+        self.assertIn('MALFORMED:Fedora-Tracker', updates)
         self.assertNotIn('NEW:Fedora-42', updates)
         self.assertFalse(any(u.startswith('EXCEPTION') for u in updates))
 
@@ -2461,9 +2459,33 @@ class TestFedoraChecker(unittest.TestCase):
             status='Fedora-Workstation-Live-x86_64-42',
             page=page,
         )
-        self.assertNotIn('MALFORMED:Fedora-Tracker', updates)
+        self.assertIn('MALFORMED:Fedora-Tracker', updates)
         self.assertNotIn('NEW:Fedora-42', updates)
         self.assertNotIn('STALE:Fedora-Workstation-Live-x86_64-42', updates)
+
+
+    def test_unusable_version_metadata_never_implies_removal(self):
+        name = 'Fedora-Workstation-Live-x86_64-42'
+        (self.tmp / name).mkdir()
+        for fields in ({}, {'torrents': []}, {'torrents': None},
+                       {'torrents': 'bad'}, {'torrents': [None]},
+                       {'torrents': [{'torrent': ''}]}):
+            with self.subTest(fields=fields):
+                page = json.dumps([
+                    dict(name='42', **fields),
+                    {'name': '43', 'torrents': [
+                        {'torrent': 'Fedora-Server-dvd-x86_64-43.torrent'}]},
+                ])
+                self.assertEqual(self._run(status=name, page=page), {
+                    'MALFORMED:Fedora-Tracker', 'NEW:Fedora-43'})
+
+    def test_partial_torrent_list_checks_valid_files_without_false_stale(self):
+        local = 'Fedora-Workstation-Live-x86_64-42'
+        (self.tmp / local).mkdir()
+        page = json.dumps([{'name': '42', 'torrents': [
+            {'torrent': 'Fedora-Server-dvd-x86_64-42.torrent'}, None]}])
+        self.assertEqual(self._run(status=local, page=page), {
+            'MALFORMED:Fedora-Tracker', 'NEW:Fedora-Server-dvd-x86_64-42'})
 
 
 # AlmaChecker

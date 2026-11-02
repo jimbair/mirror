@@ -898,19 +898,35 @@ class FedoraChecker(Checker):
         # of the structure-change paths use. Malformed entries are skipped
         # individually so one bad entry can't take down the versions the
         # rest still describe; if nothing usable survives, the page has
-        # changed shape.
+        # changed shape. A malformed version is still present upstream,
+        # however: missing metadata is not evidence its files were removed.
         torrents_by_version: dict[str, list[str]] = {}
+        seen_versions: set[str] = set()
+        incomplete_versions: set[str] = set()
         for entry in data if isinstance(data, list) else []:
             if not isinstance(entry, dict):
                 continue
             name = entry.get('name')
-            torrents = entry.get('torrents', [])
-            if not isinstance(name, str) or not isinstance(torrents, list):
+            if not isinstance(name, str) or not name:
                 continue
-            torrents_by_version.setdefault(name, []).extend(
+            seen_versions.add(name)
+            torrents = entry.get('torrents')
+            if not isinstance(torrents, list) or not torrents:
+                incomplete_versions.add(name)
+                continue
+            usable = [
                 t['torrent'] for t in torrents
                 if isinstance(t, dict) and isinstance(t.get('torrent'), str)
-            )
+                and t['torrent'].endswith('.torrent')
+                and len(t['torrent']) > len('.torrent')
+            ]
+            if len(usable) != len(torrents):
+                incomplete_versions.add(name)
+            if usable:
+                torrents_by_version.setdefault(name, []).extend(usable)
+
+        if any(ver.isdigit() for ver in incomplete_versions):
+            self.alert('MALFORMED:Fedora-Tracker')
 
         # Empty version map means the JSON structure changed
         if not torrents_by_version:
@@ -957,16 +973,23 @@ class FedoraChecker(Checker):
                 self.alert(f'NEW:Fedora-{ver}')
                 continue
 
-            self._check_version(ver, sorted(torrents_by_version[ver]))
+            self._check_version(ver, sorted(torrents_by_version[ver]),
+                                complete=ver not in incomplete_versions)
 
         for ver in local_versions:
-            if ver not in tracker_versions:
+            if ver not in seen_versions:
                 self.alert(f'DROPPED:Fedora-{ver}')
 
-    def _check_version(self, ver: str, ver_torrents: list[str]) -> None:
+    def _check_version(self, ver: str, ver_torrents: list[str],
+                       complete: bool = True) -> None:
         """Check individual torrents for a single Fedora version."""
         for torrent in ver_torrents:
             self.check_dir(torrent.removesuffix('.torrent'))
+
+        # Valid entries can still reveal new/orphan torrents, but a broken
+        # sibling item may be exactly the local file that appears absent.
+        if not complete:
+            return
 
         for dirpath in self.iso_dir.glob(f'Fedora-*-{ver}/'):
             directory = dirpath.name
