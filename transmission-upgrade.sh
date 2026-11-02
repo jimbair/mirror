@@ -13,6 +13,62 @@ SERVICE="transmission-daemon"
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
 die()  { echo "[ERROR] $*" >&2; exit 1; }
 
+restart_service() {
+    systemctl start "$SERVICE" || return 1
+    sleep 2
+    systemctl is-active --quiet "$SERVICE"
+}
+
+restore_service_on_exit() {
+    local result=$?
+    trap - EXIT HUP INT TERM
+    if [[ "$RESTART_SERVICE" == true ]]; then
+        log "Restoring $SERVICE after upgrade failure..."
+        # An unsuccessful install can still leave usable binaries behind.
+        # Try to restore the original running state, but retain the install
+        # error and make a failed recovery explicit instead of claiming
+        # success. This is recovery, not a rollback of installed files.
+        if ! restart_service; then
+            echo "[ERROR] Could not restore $SERVICE — check: journalctl -u $SERVICE" >&2
+            result=1
+        fi
+    fi
+    exit "$result"
+}
+
+install_build() {
+    RESTART_SERVICE=false
+    trap restore_service_on_exit EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
+        # Arm recovery before stopping: even a failed stop or an interrupt
+        # immediately after it must not strand a previously running daemon.
+        RESTART_SERVICE=true
+        log "Stopping $SERVICE..."
+        systemctl stop "$SERVICE" || die "Could not stop $SERVICE; install aborted"
+    fi
+
+    log "Installing..."
+    cmake --install build || die "Install stage failed"
+
+    if [[ "$RESTART_SERVICE" == true ]]; then
+        log "Restarting $SERVICE..."
+        restart_service || die "$SERVICE failed to start — check: journalctl -u $SERVICE"
+        RESTART_SERVICE=false
+        log "$SERVICE restarted successfully."
+    fi
+    trap - EXIT HUP INT TERM
+}
+
+# Expose the install lifecycle to tests without running root-only setup,
+# network requests, builds, or installation when this file is sourced.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return
+fi
+
 # Must be run as root
 [[ $EUID -eq 0 ]] || die "This script must be run as root."
 
@@ -108,30 +164,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release || die "Build stage 1 failed"
 log "Compiling (using $(nproc) cores)..."
 cmake --build build -- -j"$(nproc)" || die "Build stage 2 failed"
 
-# Shut it down, if running
-if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
-    log "Stopping $SERVICE..."
-    systemctl stop "$SERVICE"
-    RESTART_SERVICE=true
-else
-    RESTART_SERVICE=false
-fi
-
-# Install it
-log "Installing..."
-cmake --install build || die "Install stage failed"
-
-# Start it if we stopped it
-if [[ "$RESTART_SERVICE" == true ]]; then
-    log "Restarting $SERVICE..."
-    systemctl start "$SERVICE"
-    sleep 2
-    if systemctl is-active --quiet "$SERVICE"; then
-        log "$SERVICE restarted successfully."
-    else
-        die "$SERVICE failed to start — check: journalctl -u $SERVICE"
-    fi
-fi
+install_build
 
 # Did we do good work?
 INSTALLED_NOW=$(/usr/local/bin/transmission-remote --version 2>&1 \

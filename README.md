@@ -114,11 +114,15 @@ Transmission, rsync, or production data:
 python3.11 -B tests/test_new_torrents.py -v
 python3.11 -B tests/test_status_update.py -v
 python3.11 -B tests/test_status_update_sh.py -v
+python3.11 -B tests/test_transmission_upgrade.py -v
 bash -n status-update.sh
+bash -n transmission-upgrade.sh
 ```
 
-CI runs the three suites on Ubuntu and AlmaLinux 10. Representative upstream
-snippets and their source URLs live in [tests/fixtures](tests/fixtures/README.md).
+CI runs the suites on Ubuntu and AlmaLinux 10. Upgrade tests stub host commands
+and exercise service recovery without root or a real installation.
+Representative upstream snippets and their source URLs live in
+[tests/fixtures](tests/fixtures/README.md).
 See [AGENTS.md](AGENTS.md) for architecture invariants and contribution guidance.
 
 ## Commit conventions

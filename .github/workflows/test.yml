@@ -10,6 +10,8 @@ on:
       - 'tests/test_status_update.py'
       - 'status-update.sh'
       - 'tests/test_status_update_sh.py'
+      - 'transmission-upgrade.sh'
+      - 'tests/test_transmission_upgrade.py'
       - '.github/workflows/test.yml'
   pull_request:
     paths:
@@ -20,8 +22,27 @@ on:
       - 'tests/test_status_update.py'
       - 'status-update.sh'
       - 'tests/test_status_update_sh.py'
+      - 'transmission-upgrade.sh'
+      - 'tests/test_transmission_upgrade.py'
       - '.github/workflows/test.yml'
 jobs:
+  maintenance-shell-ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: bash -n transmission-upgrade.sh
+      - run: python3 tests/test_transmission_upgrade.py -v
+  maintenance-shell-almalinux:
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    steps:
+      - uses: actions/checkout@v4
+      - run: dnf install -y python3
+      - run: bash -n transmission-upgrade.sh
+      - run: python3 tests/test_transmission_upgrade.py -v
   status-update-shell-ubuntu:
     runs-on: ubuntu-latest
     steps:

@@ -18,6 +18,7 @@ All commands run from the repo root (the directory containing this file):
 python3 tests/test_new_torrents.py -v   # tests for new-torrents.py
 python3 tests/test_status_update.py -v  # tests for status_update.py
 python3 tests/test_status_update_sh.py -v  # active shell publication tests
+python3 tests/test_transmission_upgrade.py -v  # stubbed service lifecycle tests
 python3 new-torrents.py --help          # checker CLI; select with a positional name
 python3 new-torrents.py mint            # just Mint; names are case-insensitive
 bash -n status-update.sh               # shell syntax check
@@ -39,7 +40,7 @@ python3 status_update.py                # build status page (needs transmission-
   The scripts under test are imported via `importlib` in each test file (the
   hyphen in `new-torrents.py` rules out a plain import) — preserve that pattern
   if you add or rename test files.
-- CI (`.github/workflows/test.yml`) runs all three suites on Ubuntu (Python 3.11)
+- CI (`.github/workflows/test.yml`) runs the suites on Ubuntu (Python 3.11)
   and in an `almalinux:10` container, and only when the script/test/workflow
   paths or `tests/fixtures/**` change. If you touch a script but not its test
   file, update the workflow's `paths` list only if the relationship changes.
@@ -213,11 +214,14 @@ they live:
   `status-update.sh` is the version actively in use; migrating to the python
   version is currently a TODO to be completed by the author. Publication is
   tested in `tests/test_status_update_sh.py` on Ubuntu and AlmaLinux in CI;
-  the host-specific collectors are stubbed. Other shell scripts have no CI.
+  the host-specific collectors are stubbed.
 - `transmission-upgrade.sh` — builds Transmission from source on AlmaLinux
   (root, dnf) while upstream package bugs are open. Destructive by design
   (replaces the system daemon); verify version and checksums before running
-  it on a host.
+  it on a host. Service recovery is covered by
+  `tests/test_transmission_upgrade.py` with host commands stubbed in CI.
+  A failed install or interruption attempts to restore a previously running
+  service and still exits non-zero; this does not roll back installed files.
 
 ## Context that lives outside this repo
 
