@@ -434,6 +434,23 @@ class TestCheckerBase(unittest.TestCase):
         self.assertIn('NEW:archlinux-2025.01.01-x86_64.iso', c.updates)
         self.assertNotIn('ORPHAN:archlinux-2025.01.01-x86_64.iso', c.updates)
 
+    def test_check_iso_disappearing_during_a_disk_check_is_missing(self):
+        c = self._checker()
+        path = MagicMock()
+        path.exists.return_value = True
+        path.stat.side_effect = FileNotFoundError(2, 'removed concurrently')
+        with patch.object(c, '_safe_path', return_value=path):
+            c.check_iso('archlinux-2025.01.01-x86_64.iso')
+        self.assertEqual(c.updates, {'NEW:archlinux-2025.01.01-x86_64.iso'})
+
+    def test_check_iso_keeps_permission_errors_visible(self):
+        c = self._checker()
+        path = MagicMock()
+        path.stat.side_effect = PermissionError(13, 'not readable')
+        with patch.object(c, '_safe_path', return_value=path), \
+             self.assertRaises(PermissionError):
+            c.check_iso('archlinux-2025.01.01-x86_64.iso')
+
     def test_check_dir_in_status_no_alert(self):
         d = self.tmp / 'Fedora-Workstation-42'
         d.mkdir()
@@ -1428,6 +1445,15 @@ class TestArchChecker(unittest.TestCase):
         old.symlink_to('no-such-target.iso')
         updates = self._run(status='archlinux-2025.06.01-x86_64.iso')
         self.assertNotIn('STALE:archlinux-2024.01.01-x86_64.iso', updates)
+
+    def test_stale_file_disappearing_during_the_scan_is_skipped(self):
+        path = MagicMock()
+        path.name = 'archlinux-2024.01.01-x86_64.iso'
+        path.exists.return_value = True
+        path.stat.side_effect = FileNotFoundError(2, 'removed concurrently')
+        with patch.object(Path, 'glob', return_value=[path]):
+            updates = self._run(status='archlinux-2025.06.01-x86_64.iso')
+        self.assertEqual(updates, set())
 
 
 # CachyChecker
@@ -2946,6 +2972,17 @@ class TestDebianChecker(unittest.TestCase):
         status = 'debian-12.9.0-amd64-DVD-1.iso debian-12.9.0-arm64-DVD-1.iso'
         updates = self._run(status=status)
         self.assertEqual(updates, {'STALE:debian-12.9.0-oldvariant-1.iso'})
+
+    def test_duplicate_rsync_names_are_checked_once(self):
+        iso = 'debian-12.9.0-amd64-DVD-1.iso'
+        (self.tmp / iso).write_bytes(b'x')
+        c = make_checker(nt.DebianChecker, self.tmp, iso)
+        result = self._rsync(stdout=DEBIAN_RSYNC_OUTPUT * 2)
+        with patch('subprocess.run', return_value=result), \
+             patch.object(c, 'check_iso', wraps=c.check_iso) as check:
+            c.check()
+        self.assertEqual(c.updates, {'NEW:debian-12.9.0-arm64-DVD-1.iso'})
+        self.assertEqual(len(check.call_args_list), 2)
 
     def test_version_parsed_across_edu_live_mac_and_source_variants(self):
         """The point release must parse correctly regardless of where the

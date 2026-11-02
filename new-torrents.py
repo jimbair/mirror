@@ -6,6 +6,7 @@
 # We send the output as a POST to /fail in the event of a non-zero exit.
 
 import argparse
+import errno
 import fcntl
 import gzip
 import html
@@ -572,11 +573,24 @@ class Checker(ABC):
             self.alert(f'UNSAFE:{iso}')
             return
         # ISO is on disk but transmission has no record of it
-        if path.exists() and path.stat().st_size > 0:
+        if self._has_content(path):
             self.alert(f'ORPHAN:{iso}')
         # ISO is not on disk and not known to transmission
         else:
             self.alert(new_alert)
+
+    @staticmethod
+    def _has_content(path: Path) -> bool:
+        # A single stat avoids a redundant lookup and the exists()/stat()
+        # race when Transmission or the maintainer removes a file between
+        # calls. Keep real I/O/permission errors visible to run() rather
+        # than misreporting them as a newly missing release.
+        try:
+            return path.stat().st_size > 0
+        except OSError as e:
+            if e.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+                return False
+            raise
 
     def check_dir(self, directory: str) -> None:
         """Check a torrent directory against transmission status and local disk."""
@@ -801,7 +815,13 @@ class MintChecker(Checker):
             self.alert(f'NEW:Linux-Mint-{current}')
             return
 
-        local_current = [p for p in local_isos if self._version_of(p.name) == current]
+        # Reuse parsed versions for release presence, supported-release
+        # checks, and cleanup instead of rescanning names for each release.
+        local_versions = {p.name: self._version_of(p.name) for p in local_isos}
+        local_by_version: dict[str | None, list[Path]] = {}
+        for path in local_isos:
+            local_by_version.setdefault(local_versions[path.name], []).append(path)
+        local_current = local_by_version.get(current, [])
 
         if not local_current:
             # Nothing for the new release yet: one alert beats one per file.
@@ -842,8 +862,7 @@ class MintChecker(Checker):
 
         if supported is not None:
             for ver in sorted((supported & set(versions)) - {current}, key=ver_key):
-                local_ver = [p for p in local_isos
-                             if self._version_of(p.name) == ver]
+                local_ver = local_by_version.get(ver, [])
                 if not local_ver:
                     # Supported, but nothing mirrored for it yet.
                     self.alert(f'NEW:Linux-Mint-{ver}')
@@ -872,7 +891,7 @@ class MintChecker(Checker):
         for path in local_isos:
             if path.name in upstream_set:
                 continue
-            ver = self._version_of(path.name)
+            ver = local_versions[path.name]
             if ver is None:
                 # Unparseable local file; keep visible individually.
                 self.alert(f'STALE:{path.name}')
@@ -950,7 +969,7 @@ class CachyChecker(Checker):
 
         upstream_set = set(upstream_isos)
         for path in self.iso_dir.glob('cachyos-*.iso'):
-            if not (path.exists() and path.stat().st_size > 0):
+            if not self._has_content(path):
                 continue
             if path.name not in upstream_set:
                 self.alert(f'STALE:{path.name}')
@@ -983,7 +1002,7 @@ class ArchChecker(Checker):
         self.check_iso(current_iso, f'NEW:Arch-{current_release}')
 
         for path in self.iso_dir.glob('archlinux-*.iso'):
-            if not (path.exists() and path.stat().st_size > 0):
+            if not self._has_content(path):
                 continue
             if path.name != current_iso:
                 self.alert(f'STALE:{path.name}')
@@ -1113,7 +1132,8 @@ class FedoraChecker(Checker):
     def _check_version(self, ver: str, ver_torrents: list[str],
                        complete: bool = True) -> None:
         """Check individual torrents for a single Fedora version."""
-        for torrent in ver_torrents:
+        known_torrents = set(ver_torrents)
+        for torrent in sorted(known_torrents):
             self.check_dir(torrent.removesuffix('.torrent'))
 
         # Valid entries can still reveal new/orphan torrents, but a broken
@@ -1123,7 +1143,7 @@ class FedoraChecker(Checker):
 
         for dirpath in self.iso_dir.glob(f'Fedora-*-{ver}/'):
             directory = dirpath.name
-            if f'{directory}.torrent' not in ver_torrents:
+            if f'{directory}.torrent' not in known_torrents:
                 self.alert(f'STALE:{directory}')
 
 
@@ -1683,7 +1703,8 @@ class UbuntuChecker(Checker):
             self.alert('MALFORMED:Ubuntu-Tracker')
             return
 
-        upstream_versions = {self._version_of(iso) for iso in upstream_isos}
+        upstream_versions_by_name = {iso: self._version_of(iso) for iso in upstream_isos}
+        upstream_versions = set(upstream_versions_by_name.values())
         upstream_versions.discard(None)
         # Every filename failed to parse a version; structure may have changed
         if not upstream_versions:
@@ -1715,7 +1736,7 @@ class UbuntuChecker(Checker):
                 eol_lines = set()
                 self.alert('MALFORMED:Ubuntu-EOL')
                 upstream_versions = {
-                    v for v in (self._version_of(iso) for iso in upstream_isos)
+                    v for v in upstream_versions_by_name.values()
                     if v is not None
                 }
 
@@ -1731,8 +1752,9 @@ class UbuntuChecker(Checker):
         # (_artifact_key) carries its own currency verdict; the flat set
         # of all of them feeds the NEW/STALE logic below as before.
         current_by_artifact: dict[tuple[str, str], str] = {}
-        for iso in upstream_isos:
-            v = self._version_of(iso)
+        iso_by_artifact: dict[tuple[str, str], str] = {}
+        keys_by_iso: dict[str, tuple[str, str]] = {}
+        for iso, v in upstream_versions_by_name.items():
             if v is None or v not in upstream_versions:
                 # v is None: unparseable filename (the MALFORMED bails
                 # above guarantee at least one parseable name, not all);
@@ -1741,9 +1763,11 @@ class UbuntuChecker(Checker):
                 # (or the fail-open rebuild of it).
                 continue
             key = (self._line_of(v), self._artifact_key(iso))
+            keys_by_iso[iso] = key
             if (key not in current_by_artifact
                     or ver_key(v) > ver_key(current_by_artifact[key])):
                 current_by_artifact[key] = v
+                iso_by_artifact[key] = iso
         current_versions = set(current_by_artifact.values())
 
         # The upstream ISOs the mirror should actually hold: the newest
@@ -1757,13 +1781,9 @@ class UbuntuChecker(Checker):
         # fetch material nor a seeding candidate, so transmission not
         # knowing about it is not an orphan); the stale scan below applies
         # the same rule in reverse to name accidental on-disk duplicates.
-        target_isos: set[str] = set()
-        for iso in upstream_isos:
-            v = self._version_of(iso)
-            if (v is not None
-                    and current_by_artifact.get(
-                        (self._line_of(v), self._artifact_key(iso))) == v):
-                target_isos.add(iso)
+        target_by_version: dict[str, list[str]] = {}
+        for key, iso in iso_by_artifact.items():
+            target_by_version.setdefault(current_by_artifact[key], []).append(iso)
 
         local_isos = sorted(self.iso_dir.glob('*buntu*.iso'))
         if not local_isos:
@@ -1772,10 +1792,12 @@ class UbuntuChecker(Checker):
                 self.alert(f'NEW:Ubuntu-{ver}')
             return
 
+        local_versions = {p.name: self._version_of(p.name) for p in local_isos}
+        local_by_version: dict[str | None, list[Path]] = {}
+        for path in local_isos:
+            local_by_version.setdefault(local_versions[path.name], []).append(path)
         for current_version in current_versions:
-            local_current = [
-                p for p in local_isos if self._version_of(p.name) == current_version
-            ]
+            local_current = local_by_version.get(current_version, [])
             if not local_current:
                 # Nothing for this line's new release yet: one alert beats one per file.
                 self.alert(f'NEW:Ubuntu-{current_version}')
@@ -1788,15 +1810,14 @@ class UbuntuChecker(Checker):
                 # artifact — its newest) and transmission is only expected
                 # to know the ISOs we actually seed, so it can neither NEW
                 # nor ORPHAN from here.
-                for iso in target_isos:
-                    if self._version_of(iso) == current_version:
-                        self.check_iso(iso)
+                for iso in target_by_version[current_version]:
+                    self.check_iso(iso)
 
         upstream_set = set(upstream_isos)
         stale_versions: set[str] = set()
         eol_lines_present: set[str] = set()
         for path in local_isos:
-            ver = self._version_of(path.name)
+            ver = local_versions[path.name]
             line = self._line_of(ver) if ver is not None else None
             if line is not None and line in eol_lines:
                 # Canonical keeps past-EOL ISOs on the tracker, so the
@@ -1815,8 +1836,7 @@ class UbuntuChecker(Checker):
                     # the file's name is upstream and its line is not EOL
                     # (that branch continued above), so the max loop
                     # processed its artifact key.
-                    newest = current_by_artifact[
-                        (line, self._artifact_key(path.name))]
+                    newest = current_by_artifact[keys_by_iso[path.name]]
                     if newest != ver:
                         # Older listed revision of its own artifact.
                         # Per-file when the version is still the newest
@@ -1911,7 +1931,7 @@ class ProxmoxChecker(Checker):
         # only mean upstream retracted a release -- exactly what we want
         # surfaced, not suppressed.
         for path in self.iso_dir.glob('proxmox-ve_*.iso'):
-            if not (path.exists() and path.stat().st_size > 0):
+            if not self._has_content(path):
                 continue
             if path.name in versions:
                 continue
@@ -1997,17 +2017,20 @@ class DebianChecker(Checker):
 
         self._failures.clear('Debian')
 
-        upstream_isos = sorted(
+        upstream_isos = sorted({
             line.split()[-1].rsplit('/', 1)[-1].removesuffix('.torrent')
             for line in result.stdout.splitlines()
             if line.endswith('.torrent')
-        )
+        })
         # rsync succeeded but returned no .torrent files; structure may have changed
         if not upstream_isos:
             self.alert('MALFORMED:Debian-Tracker')
             return
 
-        upstream_versions = {self._version_of(iso) for iso in upstream_isos}
+        upstream_by_version: dict[str | None, list[str]] = {}
+        for iso in upstream_isos:
+            upstream_by_version.setdefault(self._version_of(iso), []).append(iso)
+        upstream_versions = set(upstream_by_version)
         upstream_versions.discard(None)
         # Every filename failed to parse a version; structure may have changed
         if not upstream_versions:
@@ -2021,7 +2044,8 @@ class DebianChecker(Checker):
             self.alert(f'NEW:Debian-{current_version}')
             return
 
-        local_current = [p for p in local_isos if self._version_of(p.name) == current_version]
+        local_versions = {p.name: self._version_of(p.name) for p in local_isos}
+        local_current = [p for p in local_isos if local_versions[p.name] == current_version]
 
         if not local_current:
             # Nothing for the new release yet: one alert beats one per file.
@@ -2030,16 +2054,15 @@ class DebianChecker(Checker):
             # Already partway through mirroring the current release (or it's
             # been fully mirrored); fall back to per-file checks so stragglers
             # and orphans still surface individually.
-            for iso in upstream_isos:
-                if self._version_of(iso) == current_version:
-                    self.check_iso(iso)
+            for iso in upstream_by_version[current_version]:
+                self.check_iso(iso)
 
         upstream_set = set(upstream_isos)
         stale_versions: set[str] = set()
         for path in local_isos:
             if path.name in upstream_set:
                 continue
-            ver = self._version_of(path.name)
+            ver = local_versions[path.name]
             if ver is not None and ver != current_version:
                 # Whole prior release superseded; group instead of one alert per file.
                 stale_versions.add(ver)
