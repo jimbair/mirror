@@ -1067,8 +1067,7 @@ class TestMintChecker(unittest.TestCase):
         """A failed directory fetch for one supported version skips only
         that version (fail-open per version); the other versions' alerts
         still fire and the run does not crash. The interception is by URL
-        because every version directory shares the 'Linux-Mint-VER'
-        failure-tracker name."""
+        so the simulated outage remains scoped to one directory."""
         index = (
             '<a href="19.3/">19.3/</a>'
             '<a href="20.3/">20.3/</a>'
@@ -1100,6 +1099,58 @@ class TestMintChecker(unittest.TestCase):
         self.assertEqual(
             c.updates, {'NEW:Linux-Mint-20.3', 'EOL:Linux-Mint-19.3'})
 
+    def test_directory_failures_accumulate_despite_healthy_siblings(self):
+        """Real fetch bookkeeping must survive healthy sibling requests;
+        fake_fetch_seq skips the counters and cannot expose this bug."""
+        local = MINT_ISOS + ['linuxmint-21.3-cinnamon-64bit.iso']
+        for name in local:
+            (self.tmp / name).write_bytes(b'x')
+        failure_path = self.tmp / 'failures.json'
+        healthy = {
+            'https://pub.linuxmint.io/stable/': MINT_INDEX,
+            'https://pub.linuxmint.io/stable/22.0/': MINT_VER,
+            'https://linuxmint.com/download_all.php': MINT_SUPPORTED_BOTH,
+        }
+        recovered = False
+
+        def upstream(request, **kwargs):
+            url = request.full_url
+            if url.endswith('/21.3/'):
+                if not recovered:
+                    raise urllib.error.URLError('directory unavailable')
+                body = MINT_VER_21_3
+            else:
+                body = healthy[url]
+            response = MagicMock()
+            response.__enter__.return_value = response
+            response.read.return_value = (body + _PAD).encode()
+            response.headers.get_content_charset.return_value = 'utf-8'
+            response.headers.get.return_value = ''
+            return response
+
+        for run in range(1, 6):
+            tracker = nt.FailureTracker(failure_path, 3)
+            c = make_checker(nt.MintChecker, self.tmp, ' '.join(local),
+                             failures=tracker)
+            with patch('urllib.request.urlopen', side_effect=upstream):
+                c.check()
+            tracker.save()
+            self.assertEqual(tracker.count('Linux-Mint-21.3'), run)
+            self.assertEqual(tracker.count('Linux-Mint-22.0'), 0)
+            self.assertEqual(bool(c.updates), run >= 3)
+            if run >= 3:
+                self.assertTrue(any(u.startswith('DOWN:pub.linuxmint.io:')
+                                    for u in c.updates))
+
+        recovered = True
+        tracker = nt.FailureTracker(failure_path, 3)
+        c = make_checker(nt.MintChecker, self.tmp, ' '.join(local),
+                         failures=tracker)
+        with patch('urllib.request.urlopen', side_effect=upstream):
+            c.check()
+        self.assertEqual(tracker.count('Linux-Mint-21.3'), 0)
+        self.assertFalse(any(u.startswith('DOWN:') for u in c.updates))
+
     def test_support_page_unparseable_alerts_and_fails_open(self):
         """A support page with no version cells alerts MALFORMED and
         fails open: only the current version is tracked and no local
@@ -1118,8 +1169,7 @@ class TestMintChecker(unittest.TestCase):
         """An unfetchable support page fails open without alerting:
         nothing is flagged past EOL and the run does not crash. Keyed by
         fetch name rather than URL because the support page has its own
-        'Linux-Mint-Supported' tracker name, unlike the version
-        directories which all share 'Linux-Mint-VER'."""
+        'Linux-Mint-Supported' tracker name."""
         for iso in MINT_ISOS:
             (self.tmp / iso).write_bytes(b'x' * 100)
         (self.tmp / 'linuxmint-20.3-cinnamon-64bit.iso').write_bytes(b'x' * 100)

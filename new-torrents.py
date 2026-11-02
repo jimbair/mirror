@@ -70,7 +70,7 @@ class FailureTracker:
     resetting an ongoing outage counter.
 
     Thread-safety: unsynchronized by design -- every counter name belongs
-    to exactly one checker thread (Mint owns Linux-Mint/-VER/-Supported,
+    to exactly one checker thread (Mint owns Linux-Mint/-VERSION/-Supported,
     Ubuntu owns Ubuntu/Ubuntu-EOL, the rest own their distro name), so no
     two threads ever touch the same key, and save() runs once on the main
     thread after the executor drains. If a future checker ever shares a
@@ -651,7 +651,11 @@ class MintChecker(Checker):
 
         current = sorted(versions, key=ver_key)[-1]
 
-        if not self.fetch(f'https://pub.linuxmint.io/stable/{current}/', 'Linux-Mint-VER'):
+        # Each directory has its own outage history. Sharing one counter
+        # lets this healthy current-directory fetch erase an older supported
+        # directory's persistent failure before it can reach the threshold.
+        if not self.fetch(f'https://pub.linuxmint.io/stable/{current}/',
+                          f'Linux-Mint-{current}'):
             return
         if not self.body_ok('pub.linuxmint.io'):
             return
@@ -716,7 +720,7 @@ class MintChecker(Checker):
                     self.alert(f'NEW:Linux-Mint-{ver}')
                     continue
                 if not self.fetch(f'https://pub.linuxmint.io/stable/{ver}/',
-                                  'Linux-Mint-VER'):
+                                  f'Linux-Mint-{ver}'):
                     continue
                 if not self.body_ok('pub.linuxmint.io'):
                     continue
