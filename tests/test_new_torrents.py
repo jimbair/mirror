@@ -2816,6 +2816,31 @@ class TestFedoraChecker(unittest.TestCase):
                 self.assertEqual(self._run(status=name, page=page), {
                     'MALFORMED:Fedora-Tracker', 'NEW:Fedora-43'})
 
+    def test_unidentified_entries_never_imply_dropped_versions(self):
+        local = 'Fedora-Workstation-Live-x86_64-42'
+        (self.tmp / local).mkdir()
+        bad_entries = [None, 42, {}, {'torrents': []}]
+        bad_entries.extend({'name': name, 'torrents': [
+            {'torrent': local + '.torrent'}]}
+            for name in (42, True, None, '', [], {}))
+        for entry in bad_entries:
+            with self.subTest(entry=entry):
+                page = json.dumps([entry, {'name': '43', 'torrents': [
+                    {'torrent': 'Fedora-Server-dvd-x86_64-43.torrent'}]}])
+                self.assertEqual(self._run(status=local, page=page), {
+                    'MALFORMED:Fedora-Tracker', 'NEW:Fedora-43'})
+
+    def test_unidentified_entry_cannot_make_a_known_version_stale(self):
+        local = 'Fedora-Workstation-Live-x86_64-42'
+        (self.tmp / local).mkdir()
+        page = json.dumps([
+            {'name': 42, 'torrents': [{'torrent': local + '.torrent'}]},
+            {'name': '42', 'torrents': [
+                {'torrent': 'Fedora-Server-dvd-x86_64-42.torrent'}]},
+        ])
+        self.assertEqual(self._run(status=local, page=page), {
+            'MALFORMED:Fedora-Tracker', 'NEW:Fedora-Server-dvd-x86_64-42'})
+
     def test_partial_torrent_list_checks_valid_files_without_false_stale(self):
         local = 'Fedora-Workstation-Live-x86_64-42'
         (self.tmp / local).mkdir()

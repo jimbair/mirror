@@ -1070,11 +1070,14 @@ class FedoraChecker(Checker):
         torrents_by_version: dict[str, list[str]] = {}
         seen_versions: set[str] = set()
         incomplete_versions: set[str] = set()
+        unidentified_versions = False
         for entry in data if isinstance(data, list) else []:
             if not isinstance(entry, dict):
+                unidentified_versions = True
                 continue
             name = entry.get('name')
             if not isinstance(name, str) or not name:
+                unidentified_versions = True
                 continue
             seen_versions.add(name)
             torrents = entry.get('torrents')
@@ -1092,7 +1095,7 @@ class FedoraChecker(Checker):
             if usable:
                 torrents_by_version.setdefault(name, []).extend(usable)
 
-        if any(ver.isdigit() for ver in incomplete_versions):
+        if unidentified_versions or any(ver.isdigit() for ver in incomplete_versions):
             self.alert('MALFORMED:Fedora-Tracker')
 
         # Empty version map means the JSON structure changed
@@ -1141,10 +1144,15 @@ class FedoraChecker(Checker):
                 continue
 
             self._check_version(ver, sorted(torrents_by_version[ver]),
-                                complete=ver not in incomplete_versions)
+                                complete=(not unidentified_versions
+                                          and ver not in incomplete_versions))
 
+        # An entry with no usable identity could describe any local
+        # version, or additional torrents in a valid sibling version.
+        # Keep positive checks above, but no removal conclusion is sound
+        # until every entry can at least be assigned to a version.
         for ver in local_versions:
-            if ver not in seen_versions:
+            if not unidentified_versions and ver not in seen_versions:
                 self.alert(f'DROPPED:Fedora-{ver}')
 
     def _check_version(self, ver: str, ver_torrents: list[str],
