@@ -3309,6 +3309,22 @@ class TestMain(unittest.TestCase):
         ret = self._run_main(rsync_present=False)
         self.assertEqual(ret, 1)
 
+    def test_non_debian_checker_does_not_require_rsync(self):
+        self.iso_dir.mkdir()
+        (self.iso_dir / 'status.txt').write_text('Sum: 1')
+        with patch.object(nt.ArchChecker, 'check') as check:
+            ret = self._run_main(rsync_present=False, argv=['arch'])
+        self.assertEqual(ret, 0)
+        check.assert_called_once()
+
+    def test_debian_only_run_requires_rsync_before_network_work(self):
+        self.iso_dir.mkdir()
+        (self.iso_dir / 'status.txt').write_text('Sum: 1')
+        with patch.object(nt.DebianChecker, 'check') as check:
+            ret = self._run_main(rsync_present=False, argv=['debian'])
+        self.assertEqual(ret, 1)
+        check.assert_not_called()
+
     def test_clean_run_returns_0(self):
         """When all checkers produce no alerts, main() returns 0."""
         self.iso_dir.mkdir()

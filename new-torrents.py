@@ -2188,8 +2188,11 @@ def _run(args: argparse.Namespace) -> int:
         print(f'ERROR: transmission download directory {ISO_DIR} is missing. Exiting.')
         return 1
 
-    # Bail early if rsync is missing
-    if shutil.which('rsync') is None:
+    checkers = [args.checker_cls] if args.checker_cls is not None else CHECKERS
+    # Only Debian uses rsync. An unrelated --help/Arch/Mint invocation
+    # should not need an otherwise unused external program installed.
+    needs_rsync = any(issubclass(cls, DebianChecker) for cls in checkers)
+    if needs_rsync and shutil.which('rsync') is None:
         print('ERROR: Please install rsync to proceed. Exiting.')
         return 1
 
@@ -2208,7 +2211,6 @@ def _run(args: argparse.Namespace) -> int:
     # Run the selected checker(s) concurrently. Show the live status
     # display when running interactively or when --verbose is passed;
     # cron gets quiet output.
-    checkers = [args.checker_cls] if args.checker_cls is not None else CHECKERS
     interactive = sys.stderr.isatty() or args.verbose
     names = [cls.__name__ for cls in checkers]
     display = StatusDisplay(names) if interactive else None
