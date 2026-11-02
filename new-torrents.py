@@ -10,6 +10,7 @@ import fcntl
 import gzip
 import html
 import http.client
+import io
 import json
 import os
 import re
@@ -64,6 +65,10 @@ MINT_SUPPORT_CACHE_FILE = Path.home() / '.config' / 'new-torrents' / 'mint-suppo
 ###########
 # HELPERS #
 ###########
+
+class FetchLimitError(ValueError):
+    """A response exceeded the encoded or decompressed body size limit."""
+
 
 class FailureTracker:
     """Persists consecutive fetch failure counts across runs.
@@ -342,6 +347,12 @@ class Checker(ABC):
     After run() returns, self.updates contains all alerts raised.
     """
 
+    _FETCH_TIMEOUT = 10
+    _FETCH_BUDGET = 30.0
+    _MAX_FETCH_BYTES = 8 * 1024 * 1024
+    _MAX_DECODED_BYTES = 16 * 1024 * 1024
+    _READ_CHUNK = 64 * 1024
+
     def __init__(self, iso_dir: Path, status_content: str,
                  failures: FailureTracker,
                  display: 'StatusDisplay | None' = None) -> None:
@@ -377,6 +388,7 @@ class Checker(ABC):
         """
         domain = url.split('/')[2]
         self._debug(f'fetch {url}')
+        deadline = time.monotonic() + self._FETCH_BUDGET
         try:
             req = urllib.request.Request(
                 url,
@@ -384,12 +396,15 @@ class Checker(ABC):
                 # pages to non-browser agents
                 headers={'Accept-Encoding': 'gzip, deflate', 'User-Agent': 'curl/8.5.0'},
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                raw = resp.read()
+            with urllib.request.urlopen(req, timeout=self._FETCH_TIMEOUT) as resp:
+                raw = self._read_body(resp, deadline)
                 encoding = resp.headers.get_content_charset('utf-8')
-                ce = resp.headers.get('Content-Encoding', '')
+                ce = resp.headers.get('Content-Encoding', '').strip().lower()
                 if ce == 'gzip':
-                    raw = gzip.decompress(raw)
+                    # GzipFile.read(size) limits decompression itself, not
+                    # just the length checked after allocating the output.
+                    with gzip.GzipFile(fileobj=io.BytesIO(raw)) as decoded:
+                        raw = decoded.read(self._MAX_DECODED_BYTES + 1)
                 elif ce == 'deflate':
                     # RFC 1950 (zlib-wrapped) is the correct interpretation
                     # of "deflate", but some servers actually send raw,
@@ -400,10 +415,14 @@ class Checker(ABC):
                     # the first attempt fails, rather than treating a
                     # merely-mislabeled body as a fetch failure.
                     try:
-                        raw = zlib.decompress(raw)
+                        raw = self._inflate(raw, zlib.MAX_WBITS)
                     except zlib.error:
-                        raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+                        raw = self._inflate(raw, -zlib.MAX_WBITS)
+                if len(raw) > self._MAX_DECODED_BYTES:
+                    raise FetchLimitError('decoded response exceeds '
+                                          f'{self._MAX_DECODED_BYTES} bytes')
                 self._page = raw.decode(encoding, errors='replace')
+                self._check_deadline(deadline)
 
             self._debug(f'fetch ok ({len(self._page)} bytes)')
             self._failures.clear(name)
@@ -418,11 +437,48 @@ class Checker(ABC):
         # gzip/deflate" body, LookupError from a garbage charset name in the
         # Content-Type header, and http.client.HTTPException (e.g.
         # IncompleteRead) from a connection that drops mid-response.
-        except (urllib.error.URLError, OSError, zlib.error, EOFError,
+        except (urllib.error.URLError, OSError, zlib.error, EOFError, FetchLimitError,
                 LookupError, http.client.HTTPException) as e:
             self._page = ''
             self._record_failure(name, domain, self._describe_fetch_error(e))
             return False
+
+    def _check_deadline(self, deadline: float) -> None:
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f'HTTP fetch exceeded {self._FETCH_BUDGET:g}s elapsed limit')
+
+    def _read_body(self, response, deadline: float) -> bytes:
+        """Read within a size/elapsed budget, keeping the socket timeout.
+
+        HTTPResponse.read() can keep filling its buffer forever if a
+        server trickles data often enough to reset the socket timeout.
+        read1() performs at most one underlying read, so every received
+        chunk returns control to the deadline check. An individual blocked
+        operation can still take up to _FETCH_TIMEOUT seconds; this is not
+        a process-level watchdog for OS name resolution or connection setup.
+        """
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            self._check_deadline(deadline)
+            chunk = response.read1(min(self._READ_CHUNK,
+                                       self._MAX_FETCH_BYTES - size + 1))
+            self._check_deadline(deadline)
+            if not chunk:
+                return b''.join(chunks)
+            size += len(chunk)
+            if size > self._MAX_FETCH_BYTES:
+                raise FetchLimitError(f'encoded response exceeds {self._MAX_FETCH_BYTES} bytes')
+            chunks.append(chunk)
+
+    def _inflate(self, raw: bytes, wbits: int) -> bytes:
+        decoder = zlib.decompressobj(wbits)
+        decoded = decoder.decompress(raw, self._MAX_DECODED_BYTES + 1)
+        if len(decoded) > self._MAX_DECODED_BYTES or decoder.unconsumed_tail:
+            raise FetchLimitError(f'decoded response exceeds {self._MAX_DECODED_BYTES} bytes')
+        if not decoder.eof:
+            raise zlib.error('incomplete deflate stream')
+        return decoded
 
     @staticmethod
     def _describe_fetch_error(e: Exception) -> str:

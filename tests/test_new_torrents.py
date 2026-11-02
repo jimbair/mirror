@@ -28,6 +28,7 @@ import time
 import unittest
 import urllib.error
 import zlib
+from email.message import Message
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -92,6 +93,15 @@ def fake_fetch_seq(checker, pages):
         return True
 
     return _fetch
+
+
+def http_response(body, encoding='', charset='utf-8'):
+    """A finite byte stream with real HTTP header parsing and read1()."""
+    response = io.BytesIO(body)
+    response.headers = Message()
+    response.headers['Content-Type'] = f'text/html; charset={charset}'
+    response.headers['Content-Encoding'] = encoding
+    return response
 
 
 class TestFailureTracker(unittest.TestCase):
@@ -510,7 +520,7 @@ class TestCheckerBase(unittest.TestCase):
         mock_resp = MagicMock()
         mock_resp.__enter__ = lambda s: s
         mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_resp.read.return_value = b'hello world' * 50
+        mock_resp.read1.side_effect = io.BytesIO(b'hello world' * 50).read1
         mock_resp.headers.get_content_charset.return_value = 'utf-8'
         mock_resp.headers.get.side_effect = self._content_encoding('')
         with patch('urllib.request.urlopen', return_value=mock_resp):
@@ -643,7 +653,7 @@ class TestCheckerBase(unittest.TestCase):
         mock_resp = MagicMock()
         mock_resp.__enter__ = lambda s: s
         mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_resp.read.return_value = b'not valid zlib data at all'
+        mock_resp.read1.side_effect = io.BytesIO(b'not valid zlib data at all').read1
         mock_resp.headers.get_content_charset.return_value = 'utf-8'
         mock_resp.headers.get.side_effect = self._content_encoding('deflate')
         with patch('urllib.request.urlopen', return_value=mock_resp):
@@ -661,7 +671,7 @@ class TestCheckerBase(unittest.TestCase):
         mock_resp = MagicMock()
         mock_resp.__enter__ = lambda s: s
         mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_resp.read.return_value = full[:len(full)//2]
+        mock_resp.read1.side_effect = io.BytesIO(full[:len(full)//2]).read1
         mock_resp.headers.get_content_charset.return_value = 'utf-8'
         mock_resp.headers.get.side_effect = self._content_encoding('gzip')
         with patch('urllib.request.urlopen', return_value=mock_resp):
@@ -680,7 +690,7 @@ class TestCheckerBase(unittest.TestCase):
         mock_resp = MagicMock()
         mock_resp.__enter__ = lambda s: s
         mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_resp.read.return_value = gzip.compress(b'<html>gzipped body</html>' * 10)
+        mock_resp.read1.side_effect = io.BytesIO(gzip.compress(b'<html>gzipped body</html>' * 10)).read1
         mock_resp.headers.get_content_charset.return_value = 'utf-8'
         mock_resp.headers.get.side_effect = self._content_encoding('gzip')
         with patch('urllib.request.urlopen', return_value=mock_resp):
@@ -702,7 +712,7 @@ class TestCheckerBase(unittest.TestCase):
         mock_resp = MagicMock()
         mock_resp.__enter__ = lambda s: s
         mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_resp.read.return_value = raw_deflate_body
+        mock_resp.read1.side_effect = io.BytesIO(raw_deflate_body).read1
         mock_resp.headers.get_content_charset.return_value = 'utf-8'
         mock_resp.headers.get.side_effect = self._content_encoding('deflate')
         with patch('urllib.request.urlopen', return_value=mock_resp):
@@ -718,7 +728,7 @@ class TestCheckerBase(unittest.TestCase):
         mock_resp = MagicMock()
         mock_resp.__enter__ = lambda s: s
         mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_resp.read.return_value = b'hello world' * 50
+        mock_resp.read1.side_effect = io.BytesIO(b'hello world' * 50).read1
         mock_resp.headers.get_content_charset.return_value = 'totally-bogus-charset'
         mock_resp.headers.get.side_effect = self._content_encoding('')
         with patch('urllib.request.urlopen', return_value=mock_resp):
@@ -736,6 +746,89 @@ class TestCheckerBase(unittest.TestCase):
             result = c.fetch('https://example.com/x', 'svc')
         self.assertFalse(result)
         self.assertEqual(self.ftrack._counts.get('svc', 0), 1)
+
+    def test_fetch_encoded_size_limit_uses_failure_threshold(self):
+        c = self._checker()
+        c._MAX_FETCH_BYTES = 8
+        for run in range(1, 4):
+            c.updates.clear()
+            with patch('urllib.request.urlopen', return_value=http_response(b'x' * 9)):
+                self.assertFalse(c.fetch('https://example.com/x', 'svc'))
+            self.assertEqual(self.ftrack.count('svc'), run)
+            self.assertEqual(bool(c.updates), run >= 3)
+        self.assertIn('encoded response exceeds 8 bytes', next(iter(c.updates)))
+
+    def test_fetch_bounds_decompression_for_each_supported_encoding(self):
+        body = b'x' * 1024
+        raw = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+        raw_body = raw.compress(body) + raw.flush()
+        for encoding, encoded in (('gzip', gzip.compress(body)),
+                                  ('deflate', zlib.compress(body)),
+                                  ('deflate', raw_body)):
+            with self.subTest(encoding=encoding, body=encoded):
+                c = self._checker()
+                c._MAX_DECODED_BYTES = 32
+                with patch('urllib.request.urlopen',
+                           return_value=http_response(encoded, encoding)):
+                    self.assertFalse(c.fetch('https://example.com/x', 'svc'))
+                self.assertEqual(c._page, '')
+
+    def test_fetch_accepts_bodies_exactly_at_size_limits(self):
+        body = b'x' * 32
+        for encoding, encoded in (('', body), ('GZip', gzip.compress(body)),
+                                  ('deflate', zlib.compress(body))):
+            with self.subTest(encoding=encoding):
+                c = self._checker()
+                c._MAX_FETCH_BYTES = len(encoded)
+                c._MAX_DECODED_BYTES = len(body)
+                with patch('urllib.request.urlopen',
+                           return_value=http_response(encoded, encoding)):
+                    self.assertTrue(c.fetch('https://example.com/x', 'svc'))
+                self.assertEqual(c._page, body.decode())
+
+    def test_fetch_stops_a_slow_stream_by_elapsed_budget(self):
+        c = self._checker()
+        c._FETCH_BUDGET = 1
+        elapsed = [0.0]
+        response = http_response(b'xxxxx')
+
+        def trickle(size):
+            elapsed[0] += 0.4
+            return b'x'
+
+        response.read1 = MagicMock(side_effect=trickle)
+        with patch('time.monotonic', side_effect=lambda: elapsed[0]), \
+             patch('urllib.request.urlopen', return_value=response):
+            self.assertFalse(c.fetch('https://example.com/x', 'svc'))
+        self.assertEqual(response.read1.call_count, 3)
+        self.assertEqual(self.ftrack.count('svc'), 1)
+
+    def test_fetch_checks_elapsed_time_after_opening(self):
+        c = self._checker()
+        c._FETCH_BUDGET = 1
+        elapsed = [0.0]
+        response = http_response(b'content')
+        response.read1 = MagicMock(wraps=response.read1)
+
+        def open_response(*args, **kwargs):
+            elapsed[0] = 2.0
+            return response
+
+        with patch('time.monotonic', side_effect=lambda: elapsed[0]), \
+             patch('urllib.request.urlopen', side_effect=open_response):
+            self.assertFalse(c.fetch('https://example.com/x', 'svc'))
+        response.read1.assert_not_called()
+
+    def test_fetch_handles_a_connection_drop_after_partial_body(self):
+        c = self._checker()
+        c._page = 'previous response'
+        response = http_response(b'')
+        response.read1 = MagicMock(side_effect=[
+            b'partial', http.client.IncompleteRead(b'broken')])
+        with patch('urllib.request.urlopen', return_value=response):
+            self.assertFalse(c.fetch('https://example.com/x', 'svc'))
+        self.assertEqual(c._page, '')
+        self.assertEqual(self.ftrack.count('svc'), 1)
 
     def test_body_ok_alerts_on_empty_page(self):
         """body_ok fires when page is empty."""
@@ -1126,7 +1219,7 @@ class TestMintChecker(unittest.TestCase):
                 body = healthy[url]
             response = MagicMock()
             response.__enter__.return_value = response
-            response.read.return_value = (body + _PAD).encode()
+            response.read1.side_effect = io.BytesIO((body + _PAD).encode()).read1
             response.headers.get_content_charset.return_value = 'utf-8'
             response.headers.get.return_value = ''
             return response
