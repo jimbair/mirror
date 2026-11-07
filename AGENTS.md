@@ -18,12 +18,14 @@ All commands run from the repo root (the directory containing this file):
 python3 tests/test_new_torrents.py -v  # tests for new-torrents.py
 python3 tests/test_status_update.py -v  # tests for status_update.py
 python3 tests/test_status_update_sh.py -v  # active shell publication tests
+python3 tests/test_mirror_index.py -v  # HTML fragments and publication tests
 python3 tests/test_transmission_upgrade.py -v  # stubbed service lifecycle tests
 python3 tests/test_debian_torrents_fetch.py -v  # isolated torrent collection tests
 python3 new-torrents.py --help  # checker CLI; select with a positional name
 python3 new-torrents.py mint  # just Mint; names are case-insensitive
 python3 new-torrents.py --update  # manual in-place self-update; -u also works
 bash -n status-update.sh  # shell syntax check
+bash -n mirror-index.sh  # index wrapper syntax check
 python3 status_update.py  # build status page (needs transmission-remote, vnstat)
 ```
 
@@ -236,6 +238,13 @@ they live:
   version is currently a TODO to be completed by the author. Publication is
   tested in `tests/test_status_update_sh.py` on Ubuntu and AlmaLinux in CI;
   the host-specific collectors are stubbed.
+- `mirror-index.sh` — generates nginx autoindex header/footer fragments in
+  `Downloads/.theme/` using the same public host data as `status-update.sh`.
+  Build both before publishing, HTML-escape dynamic text, and replace each
+  atomically with mode `0644`. It does not write `status.txt`; keep the
+  existing status job until a separate consolidation migrates its readers.
+  Tests in `tests/test_mirror_index.py` stub collectors and use disposable
+  directories; CI runs them on Ubuntu and AlmaLinux.
 - `transmission-upgrade.sh` — builds Transmission from source on AlmaLinux
   (root, dnf) while upstream package bugs are open. Destructive by design
   (replaces the system daemon); verify version and checksums before running

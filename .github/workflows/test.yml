@@ -10,6 +10,8 @@ on:
       - 'tests/test_status_update.py'
       - 'status-update.sh'
       - 'tests/test_status_update_sh.py'
+      - 'mirror-index.sh'
+      - 'tests/test_mirror_index.py'
       - 'transmission-upgrade.sh'
       - 'tests/test_transmission_upgrade.py'
       - 'debian-torrents-fetch.sh'
@@ -24,6 +26,8 @@ on:
       - 'tests/test_status_update.py'
       - 'status-update.sh'
       - 'tests/test_status_update_sh.py'
+      - 'mirror-index.sh'
+      - 'tests/test_mirror_index.py'
       - 'transmission-upgrade.sh'
       - 'tests/test_transmission_upgrade.py'
       - 'debian-torrents-fetch.sh'
@@ -68,6 +72,23 @@ jobs:
       - run: dnf install -y python3
       - run: bash -n status-update.sh
       - run: python3 tests/test_status_update_sh.py -v
+  mirror-index-ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: bash -n mirror-index.sh
+      - run: python3 tests/test_mirror_index.py -v
+  mirror-index-almalinux:
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    steps:
+      - uses: actions/checkout@v4
+      - run: dnf install -y python3
+      - run: bash -n mirror-index.sh
+      - run: python3 tests/test_mirror_index.py -v
   new-torrents-ubuntu:
     runs-on: ubuntu-latest
     steps:

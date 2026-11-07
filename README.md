@@ -136,6 +136,21 @@ and data that are absent from a normal development checkout. Both publish
 file-only write permission is insufficient. Set up directory access for the
 cron user before switching builders.
 
+`mirror-index.sh` separately generates `.theme/header.html` and
+`.theme/footer.html` under the download directory for the host's nginx
+autoindex wrapper. The `.theme` directory and nginx integration must already
+exist, and the cron user needs write access to that directory. Both fragments
+are built before publication; each is replaced atomically with mode `0644`.
+A collection or build failure leaves both previous fragments in place. A
+failure of the second rename can leave a new header with the previous footer;
+the command still exits non-zero, and each fragment remains complete.
+
+The footer publishes the same host data as `status-update.sh`: the complete
+speedtest log, vnStat output, IPv6 statistics, and the torrent listing sorted
+by ratio. Dynamic text is HTML-escaped. This script does not update
+`status.txt`; keep the existing status-builder job running because the torrent
+checker still relies on that file.
+
 ## Tests and development
 
 Tests create temporary files and mock network access. They do not require
@@ -145,9 +160,11 @@ Transmission, rsync, or production data:
 python3.11 -B tests/test_new_torrents.py -v
 python3.11 -B tests/test_status_update.py -v
 python3.11 -B tests/test_status_update_sh.py -v
+python3.11 -B tests/test_mirror_index.py -v
 python3.11 -B tests/test_transmission_upgrade.py -v
 python3.11 -B tests/test_debian_torrents_fetch.py -v
 bash -n status-update.sh
+bash -n mirror-index.sh
 bash -n transmission-upgrade.sh
 bash -n debian-torrents-fetch.sh
 ```
