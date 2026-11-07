@@ -1,12 +1,146 @@
 #!/usr/bin/env python3
-"""Exercise upgrade service recovery without root or host commands."""
+"""Exercise upgrade preparation, verification, and service recovery safely."""
 
+import io
 import subprocess
+import tarfile
+import tempfile
 import unittest
 from pathlib import Path
 
 
 SCRIPT = Path(__file__).resolve().parent.parent / 'transmission-upgrade.sh'
+
+
+class TestUpgradePreparation(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='transmission upgrade test ')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.sources = self.root / 'sources'
+        self.sources.mkdir()
+        self.build = self.sources / 'transmission-4.1.4'
+        self.archive = self.root / 'release.tar'
+        with tarfile.open(self.archive, 'w') as archive:
+            payload = b'# disposable source fixture\n'
+            info = tarfile.TarInfo('transmission-4.1.4/CMakeLists.txt')
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+    def _run(self, stubs=''):
+        body = '''source "$1"
+SRC_DIR=$2
+TARBALL_PATH=$3
+TARBALL=release.tar
+BUILD_DIR=$4
+''' + stubs + '''
+prepare_build
+printf 'BUILD_REACHED:%s\\n' "$PWD"
+'''
+        return subprocess.run(
+            ['bash', '-c', body, 'upgrade-preparation-test', str(SCRIPT),
+             str(self.sources), str(self.archive), str(self.build)],
+            cwd=self.root, capture_output=True, text=True, timeout=5)
+
+    def test_success_extracts_and_enters_the_expected_source_directory(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('BUILD_REACHED:' + str(self.build), result.stdout)
+        self.assertEqual((self.build / 'CMakeLists.txt').read_bytes(),
+                         b'# disposable source fixture\n')
+
+    def test_success_removes_stale_source_before_extraction(self):
+        self.build.mkdir()
+        (self.build / 'stale.txt').write_text('old build')
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.build / 'stale.txt').exists())
+        self.assertTrue((self.build / 'CMakeLists.txt').is_file())
+
+    def test_failed_stale_cleanup_stops_before_extraction(self):
+        self.build.mkdir()
+        stale = self.build / 'stale.txt'
+        stale.write_text('old build')
+        result = self._run('''rm() { return 7; }
+tar() { printf 'TAR_REACHED\\n'; }
+''')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Could not remove stale build', result.stderr)
+        self.assertNotIn('TAR_REACHED', result.stdout)
+        self.assertNotIn('BUILD_REACHED', result.stdout)
+        self.assertEqual(stale.read_text(), 'old build')
+
+    def test_failed_extraction_with_partial_directory_stops_before_build(self):
+        result = self._run('''tar() {
+    mkdir -p "$BUILD_DIR"
+    printf partial > "$BUILD_DIR/partial.txt"
+    return 17
+}
+''')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Tarball extraction failed', result.stderr)
+        self.assertNotIn('BUILD_REACHED', result.stdout)
+        self.assertEqual((self.build / 'partial.txt').read_text(), 'partial')
+        self.assertTrue(self.archive.is_file())
+
+    def test_missing_expected_directory_stops_before_build(self):
+        result = self._run('tar() { return 0; }\n')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Expected source dir not found', result.stderr)
+        self.assertNotIn('BUILD_REACHED', result.stdout)
+
+    def test_failed_directory_change_stops_before_build(self):
+        result = self._run('cd() { return 1; }\n')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Could not enter source directory', result.stderr)
+        self.assertNotIn('BUILD_REACHED', result.stdout)
+
+
+class TestUpgradeVersionVerification(unittest.TestCase):
+    def _run(self, output='transmission-remote 4.1.4 (build abc123)', status=0):
+        body = '''source "$1"
+LATEST_VERSION=4.1.4
+TRANSMISSION_REMOTE=remote
+version_output=$2
+version_status=$3
+remote() {
+    [[ "$*" == --version ]] || return 99
+    printf '%s\\n' "$version_output" >&2
+    return "$version_status"
+}
+verify_install
+'''
+        return subprocess.run(
+            ['bash', '-c', body, 'upgrade-version-test', str(SCRIPT), output, str(status)],
+            capture_output=True, text=True, timeout=5)
+
+    def test_matching_installed_version_reports_success(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Upgrade complete. Installed version: 4.1.4', result.stdout)
+
+    def test_old_or_unexpected_installed_version_fails(self):
+        for version in ('4.1.3', '4.2.0'):
+            with self.subTest(version=version):
+                result = self._run('transmission-remote ' + version)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('does not match expected 4.1.4', result.stderr)
+                self.assertIn(version, result.stderr)
+                self.assertNotIn('Upgrade complete', result.stdout)
+
+    def test_missing_installed_version_fails(self):
+        for output in ('', 'no version available'):
+            with self.subTest(output=output):
+                result = self._run(output)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Failed to capture installed version', result.stderr)
+                self.assertNotIn('Upgrade complete', result.stdout)
+
+    def test_failed_version_command_fails_even_if_output_matches(self):
+        result = self._run(status=7)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Failed to query installed version', result.stderr)
+        self.assertNotIn('Upgrade complete', result.stdout)
 
 
 class TestUpgradeServiceRecovery(unittest.TestCase):

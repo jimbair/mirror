@@ -20,7 +20,7 @@ All commands run from the repo root (the directory containing this file):
 python3 tests/test_new_torrents.py -v  # tests for new-torrents.py
 python3 tests/test_mirror_index.py -v  # HTML fragments and publication tests
 python3 tests/test_ipv6_stats.py -v  # IPv6 counters and route selection tests
-python3 tests/test_transmission_upgrade.py -v  # stubbed service lifecycle tests
+python3 tests/test_transmission_upgrade.py -v  # preparation, version, service tests
 python3 tests/test_debian_torrents_fetch.py -v  # isolated torrent collection tests
 python3 new-torrents.py --help  # checker CLI; select with a positional name
 python3 new-torrents.py mint  # just Mint; names are case-insensitive
@@ -248,7 +248,10 @@ they live:
 - `transmission-upgrade.sh` — builds Transmission from source on AlmaLinux
   (root, dnf) while upstream package bugs are open. Destructive by design
   (replaces the system daemon); verify version and checksums before running
-  it on a host. Service recovery is covered by
+  it on a host. Abort failed directory setup, stale cleanup, extraction, or
+  directory changes before building. Verify the installed client version
+  matches the requested release before reporting success. These paths and
+  service recovery are covered by
   `tests/test_transmission_upgrade.py` with host commands stubbed in CI.
   A failed install or interruption attempts to restore a previously running
   service and still exits non-zero; this does not roll back installed files.

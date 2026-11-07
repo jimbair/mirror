@@ -163,6 +163,12 @@ including link-layer overhead and non-IP traffic. The displayed boot timestamp
 assumes the interface counters have remained intact since boot; collection
 is stateless.
 
+`transmission-upgrade.sh` verifies the release checksum, stops on source
+preparation failures, and requires the installed client version to match the
+requested release before reporting success. A failed install attempts to
+restore a previously running service and still exits non-zero; installed
+files are not rolled back.
+
 ## Tests and development
 
 Tests create temporary files and mock network access. They do not require
@@ -179,8 +185,9 @@ bash -n transmission-upgrade.sh
 bash -n debian-torrents-fetch.sh
 ```
 
-CI runs the suites on Ubuntu and AlmaLinux 10. Upgrade tests stub host commands
-and exercise service recovery without root or a real installation.
+CI runs the suites on Ubuntu and AlmaLinux 10. Upgrade tests use disposable
+sources and stub host commands to exercise preparation failures, installed
+version checks, and service recovery without root or a real installation.
 Torrent-fetch tests stub rsync and keep all downloads in temporary directories.
 Representative upstream snippets and their source URLs live in
 [tests/fixtures](tests/fixtures/README.md).

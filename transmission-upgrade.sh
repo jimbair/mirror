@@ -8,10 +8,43 @@
 SRC_DIR="/usr/src/transmission"
 GITHUB_API="https://api.github.com/repos/transmission/transmission/releases/latest"
 SERVICE="transmission-daemon"
+TRANSMISSION_REMOTE="/usr/local/bin/transmission-remote"
 
 # Helpers
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
 die()  { echo "[ERROR] $*" >&2; exit 1; }
+
+installed_version() {
+    local output
+    output=$("$TRANSMISSION_REMOTE" --version 2>&1) || return 1
+    grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' <<< "$output" | head -1
+}
+
+prepare_build() {
+    if [[ -d "$BUILD_DIR" ]]; then
+        log "Source directory already exists; removing stale build: $BUILD_DIR"
+        rm -rf -- "$BUILD_DIR" || die "Could not remove stale build: $BUILD_DIR"
+    fi
+    log "Extracting $TARBALL..."
+    # tar can create the expected directory before failing partway through.
+    # Its exit status, not directory existence alone, establishes that the
+    # source is complete. A failed cd must also stop before cmake can build
+    # an unrelated project in the caller's working directory.
+    tar xf "$TARBALL_PATH" -C "$SRC_DIR" || die "Tarball extraction failed"
+    [[ -d "$BUILD_DIR" ]] || die "Expected source dir not found after extraction: $BUILD_DIR"
+    cd -- "$BUILD_DIR" || die "Could not enter source directory: $BUILD_DIR"
+}
+
+verify_install() {
+    local installed_now
+    installed_now=$(installed_version) || die "Failed to query installed version after install"
+    [[ -n "$installed_now" ]] || die "Failed to capture installed version after install"
+    # A successful install command can still leave the old executable in
+    # place. Check the requested release before reporting upgrade success.
+    [[ "$installed_now" == "$LATEST_VERSION" ]] \
+        || die "Installed version $installed_now does not match expected $LATEST_VERSION"
+    log "Upgrade complete. Installed version: $installed_now"
+}
 
 restart_service() {
     systemctl start "$SERVICE" || return 1
@@ -63,8 +96,8 @@ install_build() {
     trap - EXIT HUP INT TERM
 }
 
-# Expose the install lifecycle to tests without running root-only setup,
-# network requests, builds, or installation when this file is sourced.
+# Expose preparation, verification, and the install lifecycle to tests without
+# running root-only setup, network requests, builds, or installation on source.
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
     return
 fi
@@ -102,10 +135,8 @@ TARBALL_DIGEST=$(echo "$API_RESPONSE" \
 
 # Check installed version
 INSTALLED_VERSION=""
-if [[ -x /usr/local/bin/transmission-remote ]]; then
-    INSTALLED_VERSION=$(/usr/local/bin/transmission-remote --version 2>&1 \
-        | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' \
-        | head -1)
+if [[ -x "$TRANSMISSION_REMOTE" ]]; then
+    INSTALLED_VERSION=$(installed_version) || die "Could not query installed Transmission version"
 fi
 
 # Exit if we can't find the installed version
@@ -126,7 +157,7 @@ TARBALL="transmission-${LATEST_VERSION}.tar.xz"
 TARBALL_PATH="$SRC_DIR/$TARBALL"
 RELEASE_BASE="https://github.com/transmission/transmission/releases/download/${LATEST_VERSION}"
 
-mkdir -p "$SRC_DIR"
+mkdir -p -- "$SRC_DIR" || die "Could not create source directory: $SRC_DIR"
 
 if [[ -f "$TARBALL_PATH" ]]; then
     log "Tarball already present: $TARBALL_PATH"
@@ -149,16 +180,9 @@ log "Checksum OK."
 
 # Extract it, fresh if needed
 BUILD_DIR="$SRC_DIR/transmission-${LATEST_VERSION}"
-if [[ -d "$BUILD_DIR" ]]; then
-    log "Source directory already exists; removing stale build: $BUILD_DIR"
-    rm -rf "$BUILD_DIR"
-fi
-log "Extracting $TARBALL..."
-tar xf "$TARBALL_PATH" -C "$SRC_DIR"
-[[ -d "$BUILD_DIR" ]] || die "Expected source dir not found after extraction: $BUILD_DIR"
+prepare_build
 
 # Build it
-cd "$BUILD_DIR"
 log "Configuring build..."
 cmake -B build -DCMAKE_BUILD_TYPE=Release || die "Build stage 1 failed"
 log "Compiling (using $(nproc) cores)..."
@@ -166,12 +190,5 @@ cmake --build build -- -j"$(nproc)" || die "Build stage 2 failed"
 
 install_build
 
-# Did we do good work?
-INSTALLED_NOW=$(/usr/local/bin/transmission-remote --version 2>&1 \
-    | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' \
-    | head -1)
-[[ -n "$INSTALLED_NOW" ]] || die "Failed to capture installed version after install"
-
-# All done
-log "Upgrade complete. Installed version: $INSTALLED_NOW"
+verify_install
 exit 0
