@@ -43,8 +43,10 @@ TRANSMISSION_TIMEOUT = 30
 # Number of consecutive fetch failures before a domain is reported as down.
 # Transient outages are silently ignored until this threshold is reached.
 FAIL_THRESHOLD = 3
+
 # XDG-compliant config dir; created on first run if absent
 FAIL_FILE = Path.home() / '.config' / 'new-torrents' / 'failures.json'
+
 # Prevents two overlapping invocations (e.g. a manual run colliding with
 # cron, or a prior run stuck far longer than expected) from racing on
 # FAIL_FILE and doubling up on every upstream fetch. Uses flock() rather
@@ -52,6 +54,7 @@ FAIL_FILE = Path.home() / '.config' / 'new-torrents' / 'failures.json'
 # open file descriptor, so it can never go stale across a crash, kill -9,
 # or reboot -- there's no on-disk "locked" state to clean up.
 LOCK_FILE = Path.home() / '.config' / 'new-torrents' / 'lock'
+
 # Last-known-good parsed Ubuntu support schedule (per-line support-end
 # dates, not a precomputed EOL verdict -- the verdict is re-derived from
 # the dates as the clock advances, so a cached schedule stays correct
@@ -62,6 +65,7 @@ LOCK_FILE = Path.home() / '.config' / 'new-torrents' / 'lock'
 # consecutive failures, so a one-off outage is only visible as those
 # false NEWs).
 UBUNTU_EOL_CACHE_FILE = Path.home() / '.config' / 'new-torrents' / 'ubuntu-eol.json'
+
 # Membership in the last complete Mint support table, plus the archive
 # versions known at that instant. Cached absence says nothing about a
 # release that appeared later, so it must never make that new release EOL.
