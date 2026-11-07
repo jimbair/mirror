@@ -46,7 +46,7 @@ SAMPLE_OUTPUT = '\n'.join([
 ])
 
 # Verbatim `transmission-remote -l` output from Transmission 4.1.3 (build
-# 838877323f, the version on the production host), captured 2026-10-11. Unlike
+# 838877323f, then running on the production host), captured 2026-10-11. Unlike
 # SAMPLE_OUTPUT these are the byte-for-byte references AGENTS.md asks for:
 # every space below was printed by Transmission, so
 # TransmissionTable.from_output(...).render() has to reproduce them exactly.

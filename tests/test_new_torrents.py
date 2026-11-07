@@ -50,7 +50,7 @@ spec.loader.exec_module(nt)
 _PAD = ' ' * 300
 
 
-def make_checker(cls, iso_dir, status_content='', failures=None, display=None):
+def make_checker(cls, iso_dir, known_torrents=(), failures=None, display=None):
     """Construct a checker with a real FailureTracker backed by a temp file."""
     if failures is None:
         fd = tempfile.NamedTemporaryFile(suffix='.json', delete=False)
@@ -62,7 +62,11 @@ def make_checker(cls, iso_dir, status_content='', failures=None, display=None):
         # leaking one stray JSON per make_checker() call. If a future
         # test ever calls save(), it recreates the file from scratch.
         Path(fd.name).unlink()
-    checker = cls(iso_dir, status_content, failures, display)
+    # Older fixtures join whitespace-free machine filenames for brevity.
+    # Iterable fixtures represent full names, including embedded whitespace.
+    if isinstance(known_torrents, str):
+        known_torrents = known_torrents.split()
+    checker = cls(iso_dir, frozenset(known_torrents), failures, display)
     if isinstance(checker, nt.MintChecker):
         checker._supported_cache_path = iso_dir / 'mint-supported.json'
     return checker
@@ -112,6 +116,95 @@ def http_wire_response(body, headers):
     response = http.client.HTTPResponse(sock)
     response.begin()
     return response
+
+
+class TestTransmissionInventory(unittest.TestCase):
+    # Synthetic replies matching both envelopes negotiated by the 4.1.4 CLI.
+    # --list requests object rows (no table format) and --json emits the raw
+    # response: https://github.com/transmission/transmission/blob/4.1.4/utils/remote.cc
+    @staticmethod
+    def reply(torrents, modern=True):
+        if modern:
+            return {'jsonrpc': '2.0', 'id': 7, 'result': {'torrents': torrents}}
+        return {'result': 'success', 'tag': 7, 'arguments': {'torrents': torrents}}
+
+    def test_both_envelopes_preserve_exact_names_and_include_every_status(self):
+        rows = [
+            {'name': 'arch.iso', 'status': 0, 'error': 1},
+            {'name': 'Fedora Workstation.iso', 'status': 4},
+            {'name': 'image<&>é.iso', 'status': 6},
+            {'name': 'literal&amp;.iso', 'comment': 'unrelated.iso'},
+            {'name': ' padded name.iso '},
+            {'name': 'arch.iso'},
+        ]
+        expected = frozenset(row['name'] for row in rows)
+        for modern in (False, True):
+            with self.subTest(modern=modern):
+                names = nt._parse_transmission_names(json.dumps(self.reply(rows, modern)))
+                self.assertIsInstance(names, frozenset)
+                self.assertEqual(names, expected)
+                self.assertNotIn('unrelated.iso', names)
+
+    def test_empty_inventory_is_valid_in_both_envelopes(self):
+        for modern in (False, True):
+            with self.subTest(modern=modern):
+                self.assertEqual(nt._parse_transmission_names(
+                    json.dumps(self.reply([], modern))), frozenset())
+
+    def test_invalid_json_and_rpc_envelopes_are_rejected(self):
+        replies = [
+            '', '{', 'null', '[]', '"text"', '{}',
+            json.dumps({'result': 'permission denied', 'arguments': {'torrents': []}}),
+            json.dumps({'arguments': {'torrents': []}}),
+            json.dumps({'jsonrpc': '1.0', 'result': {'torrents': []}}),
+            json.dumps({'jsonrpc': '2.0', 'error': {'code': -1, 'message': 'failed'}}),
+            json.dumps({'jsonrpc': '2.0', 'error': None, 'result': {'torrents': []}}),
+            json.dumps({'result': 'success', 'error': {'message': 'failed'},
+                        'arguments': {'torrents': []}}),
+        ]
+        for reply in replies:
+            with self.subTest(reply=reply), self.assertRaises(ValueError):
+                nt._parse_transmission_names(reply)
+
+    def test_incomplete_inventory_is_rejected_instead_of_partially_used(self):
+        malformed = [
+            None, [], 'text', {}, {'torrents': None}, {'torrents': {}},
+            {'torrents': 'arch.iso'}, {'torrents': [None]},
+            {'torrents': [{'name': 'valid.iso'}, {}]},
+        ]
+        malformed.extend({'torrents': [{'name': name}]}
+                         for name in (None, '', 42, False, [], {}))
+        for modern in (False, True):
+            for arguments in malformed:
+                reply = ({'jsonrpc': '2.0', 'result': arguments} if modern else
+                         {'result': 'success', 'arguments': arguments})
+                with self.subTest(reply=reply), self.assertRaises(ValueError):
+                    nt._parse_transmission_names(json.dumps(reply))
+
+    def test_load_runs_one_read_only_json_query_with_a_timeout(self):
+        reply = json.dumps(self.reply([{'name': 'arch.iso'}]))
+        with patch('subprocess.run', return_value=subprocess.CompletedProcess(
+                [], 0, stdout=reply, stderr='')) as run:
+            self.assertEqual(nt._load_transmission_names(), frozenset({'arch.iso'}))
+        run.assert_called_once_with(
+            [nt.TRANSMISSION_REMOTE, '--json', '--list'],
+            capture_output=True, text=True, encoding='utf-8',
+            timeout=nt.TRANSMISSION_TIMEOUT)
+
+    def test_nonzero_exit_is_rejected_even_if_stdout_is_a_valid_inventory(self):
+        reply = json.dumps(self.reply([]))
+        with patch('subprocess.run', return_value=subprocess.CompletedProcess(
+                [], 17, stdout=reply, stderr='Connection refused\nadditional detail')):
+            with self.assertRaisesRegex(ValueError, 'exit 17: Connection refused'):
+                nt._load_transmission_names()
+
+    def test_rpc_error_with_exit_zero_is_rejected(self):
+        for reply in ({'result': 'permission denied', 'arguments': {}},
+                      {'jsonrpc': '2.0', 'error': {'message': 'permission denied'}}):
+            with self.subTest(reply=reply), patch('subprocess.run', return_value=
+                    subprocess.CompletedProcess([], 0, stdout=json.dumps(reply), stderr='')):
+                with self.assertRaisesRegex(ValueError, 'permission denied'):
+                    nt._load_transmission_names()
 
 
 class TestFailureTracker(unittest.TestCase):
@@ -395,7 +488,7 @@ class TestCheckerBase(unittest.TestCase):
 
     def _checker(self, status=''):
         # Use AlmaChecker as a concrete stand-in for the abstract base
-        return make_checker(nt.AlmaChecker, self.tmp, status_content=status,
+        return make_checker(nt.AlmaChecker, self.tmp, known_torrents=status,
                             failures=self.ftrack)
 
     @staticmethod
@@ -481,25 +574,29 @@ class TestCheckerBase(unittest.TestCase):
         self.assertIn('ORPHAN:Fedora-Workstation-42', c.updates)
 
     def test_check_dir_prefix_of_unrelated_entry_not_treated_as_known(self):
-        """A raw substring test on status_content would treat
+        """A raw substring test on known_torrents would treat
         'Fedora-Workstation-Live-x86_64-42' as already known if only the
         unrelated, longer 'Fedora-Workstation-Live-x86_64-420' (a
         different Fedora major) were actually present -- directory names
         have no trailing extension to act as a natural boundary the way
         *.iso filenames do, so a version number that's an exact numeric
         prefix of another silently masks a genuinely missing release.
-        Requires a whole-token match instead of a plain substring test."""
+        Requires a whole-name match instead of a plain substring test."""
         c = self._checker(status='Fedora-Workstation-Live-x86_64-420')
         c.check_dir('Fedora-Workstation-Live-x86_64-42')
         self.assertIn('NEW:Fedora-Workstation-Live-x86_64-42', c.updates)
 
-    def test_check_dir_still_matches_known_entry_with_trailing_whitespace(self):
-        """The whole-token fix must not regress the common case: a real
-        status_content entry followed by whitespace/newline (as in real
-        transmission-remote -l output) still counts as known."""
-        c = self._checker(status='Fedora-Workstation-Live-x86_64-42\n')
-        c.check_dir('Fedora-Workstation-Live-x86_64-42')
+    def test_known_names_with_spaces_and_html_characters_match_exactly(self):
+        names = ('Fedora Workstation<&>é.iso', 'Fedora Workstation directory')
+        c = self._checker(status=names)
+        c.check_iso(names[0])
+        c.check_dir(names[1])
         self.assertEqual(c.updates, set())
+
+    def test_name_inside_an_unrelated_torrent_is_not_known(self):
+        c = self._checker(status=('other arch.iso files',))
+        c.check_iso('arch.iso')
+        self.assertEqual(c.updates, {'NEW:arch.iso'})
 
     def test_check_iso_blocks_relative_path_traversal(self):
         """A scraped name is never opened or read, only checked for
@@ -1021,7 +1118,7 @@ class TestMintChecker(unittest.TestCase):
             # longer sequence; each listed version with local files
             # appends its own directory page in ascending version order.
             pages = [MINT_INDEX, MINT_VER, MINT_SUPPORTED]
-        c = make_checker(nt.MintChecker, self.tmp, status_content=status)
+        c = make_checker(nt.MintChecker, self.tmp, known_torrents=status)
         c.fetch = fake_fetch_seq(c, pages)
         c.check()
         return c.updates
@@ -1252,7 +1349,7 @@ class TestMintChecker(unittest.TestCase):
         for iso in local:
             (self.tmp / iso).write_bytes(b'x' * 100)
         c = make_checker(nt.MintChecker, self.tmp,
-                         status_content=' '.join(local))
+                         known_torrents=' '.join(local))
         seq = fake_fetch_seq(c, [index, MINT_VER, support])
 
         def _fetch(url, name):
@@ -1340,7 +1437,7 @@ class TestMintChecker(unittest.TestCase):
             (self.tmp / iso).write_bytes(b'x' * 100)
         (self.tmp / 'linuxmint-20.3-cinnamon-64bit.iso').write_bytes(b'x' * 100)
         c = make_checker(nt.MintChecker, self.tmp,
-                         status_content=' '.join(MINT_ISOS))
+                         known_torrents=' '.join(MINT_ISOS))
         seq = fake_fetch_seq(c, [MINT_INDEX, MINT_VER, MINT_SUPPORTED])
 
         def _fetch(url, name):
@@ -1483,7 +1580,7 @@ class TestArchChecker(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def _run(self, status='', page=ARCH_PAGE):
-        c = make_checker(nt.ArchChecker, self.tmp, status_content=status)
+        c = make_checker(nt.ArchChecker, self.tmp, known_torrents=status)
         c.fetch = fake_fetch_fn(c, page)
         c.check()
         return c.updates
@@ -1551,7 +1648,7 @@ class TestCachyChecker(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def _run(self, status='', page=CACHY_PAGE):
-        c = make_checker(nt.CachyChecker, self.tmp, status_content=status)
+        c = make_checker(nt.CachyChecker, self.tmp, known_torrents=status)
         c.fetch = fake_fetch_fn(c, page)
         c.check()
         return c.updates
@@ -1749,7 +1846,7 @@ class TestUbuntuChecker(unittest.TestCase):
 
     def _run(self, status='', page=UBUNTU_PAGE, schedule=UBUNTU_SCHEDULE_PAGE,
              now=None):
-        c = make_checker(nt.UbuntuChecker, self.tmp, status_content=status)
+        c = make_checker(nt.UbuntuChecker, self.tmp, known_torrents=status)
         # Redirect the cache off the real config dir: unit tests must
         # never read or write the host's ubuntu-eol.json.
         c._eol_cache_path = self.eol_cache
@@ -1917,7 +2014,7 @@ class TestUbuntuChecker(unittest.TestCase):
                      'ubuntu-24.04-desktop-amd64.iso'):
             (self.tmp / name).write_bytes(b'x' * 100)
         c = make_checker(nt.UbuntuChecker, self.tmp,
-                         status_content='ubuntu-12.04.5-dvd-amd64.iso '
+                         known_torrents='ubuntu-12.04.5-dvd-amd64.iso '
                                         'ubuntu-24.04-desktop-amd64.iso')
         c._eol_cache_path = self.eol_cache
 
@@ -2643,7 +2740,7 @@ class TestProxmoxChecker(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def _run(self, status='', page=PROXMOX_PAGE):
-        c = make_checker(nt.ProxmoxChecker, self.tmp, status_content=status)
+        c = make_checker(nt.ProxmoxChecker, self.tmp, known_torrents=status)
         c.fetch = fake_fetch_fn(c, page)
         c.check()
         return c.updates
@@ -2748,7 +2845,7 @@ class TestFedoraChecker(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def _run(self, status='', page=FEDORA_JSON):
-        c = make_checker(nt.FedoraChecker, self.tmp, status_content=status)
+        c = make_checker(nt.FedoraChecker, self.tmp, known_torrents=status)
         c.fetch = fake_fetch_fn(c, page)
         c.check()
         return c.updates
@@ -3014,7 +3111,7 @@ class TestAlmaChecker(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def _run(self, status='', page=ALMA_PAGE):
-        c = make_checker(nt.AlmaChecker, self.tmp, status_content=status)
+        c = make_checker(nt.AlmaChecker, self.tmp, known_torrents=status)
         c.fetch = fake_fetch_fn(c, page)
         c.check()
         return c.updates
@@ -3163,7 +3260,7 @@ class TestDebianChecker(unittest.TestCase):
     def _run(self, status='', rsync_result=None):
         if rsync_result is None:
             rsync_result = self._rsync()
-        c = make_checker(nt.DebianChecker, self.tmp, status_content=status)
+        c = make_checker(nt.DebianChecker, self.tmp, known_torrents=status)
         with patch('subprocess.run', return_value=rsync_result):
             c.check()
         return c.updates
@@ -3417,11 +3514,14 @@ class TestMain(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.iso_dir = self.tmp / 'Downloads'
+        self.query = self.enterContext(patch('subprocess.run', return_value=
+            subprocess.CompletedProcess([], 0, stdout=json.dumps({
+                'jsonrpc': '2.0', 'id': 7, 'result': {'torrents': []},
+            }), stderr='')))
 
     def _run_main(self, rsync_present=True, argv=None, extra_patches=None):
         patches = {
             'ISO_DIR': self.iso_dir,
-            'STATUS_FILE': self.iso_dir / 'status.txt',
             'FAIL_FILE': self.tmp / 'failures.json',
             'LOCK_FILE': self.tmp / 'lock',
         }
@@ -3449,7 +3549,7 @@ class TestMain(unittest.TestCase):
 
     def test_lock_held_by_another_open_prevents_run(self):
         """A distinct open() of the lock file already holding flock() must
-        make main() return 1 without touching ISO_DIR/STATUS_FILE at all --
+        make main() return 1 without touching ISO_DIR or querying Transmission --
         two separate open() calls on the same file conflict via flock()
         even within one process (verified directly: this isn't relying on
         an assumption about cross-process semantics)."""
@@ -3460,7 +3560,7 @@ class TestMain(unittest.TestCase):
         holder_fd.write('4242')
         holder_fd.flush()
         try:
-            # Deliberately do NOT create iso_dir/status.txt -- if main()
+            # Deliberately do NOT create iso_dir -- if main()
             # incorrectly proceeded past the lock check, it would fail for
             # a DIFFERENT reason (missing ISO_DIR) and still return 1,
             # which would make this test pass for the wrong reason. Check
@@ -3471,6 +3571,7 @@ class TestMain(unittest.TestCase):
             self.assertEqual(ret, 1)
             self.assertIn('another instance is already running', buf.getvalue())
             self.assertEqual(lock_path.read_text(), '4242')
+            self.query.assert_not_called()
         finally:
             holder_fd.close()
 
@@ -3493,7 +3594,6 @@ class TestMain(unittest.TestCase):
         """The lock must not leak past a single run -- a second, later
         invocation needs to succeed normally once the first has finished."""
         self.iso_dir.mkdir()
-        (self.iso_dir / 'status.txt').write_text('Sum: 1')
 
         def noop_run(self_inner):
             return set()
@@ -3550,35 +3650,101 @@ class TestMain(unittest.TestCase):
     def test_missing_iso_dir_returns_1(self):
         ret = self._run_main()
         self.assertEqual(ret, 1)
+        self.query.assert_not_called()
 
-    def test_missing_status_file_returns_1(self):
+    def test_missing_status_file_does_not_block_the_checker(self):
         self.iso_dir.mkdir()
-        ret = self._run_main()
-        self.assertEqual(ret, 1)
+        with patch.object(nt.ArchChecker, 'check') as check:
+            self.assertEqual(self._run_main(argv=['arch']), 0)
+        check.assert_called_once()
+        self.query.assert_called_once()
+        self.assertFalse((self.iso_dir / 'status.txt').exists())
 
-    def test_empty_status_file_returns_1(self):
+    def test_empty_or_corrupt_status_file_is_ignored(self):
         self.iso_dir.mkdir()
-        (self.iso_dir / 'status.txt').write_text('')
-        ret = self._run_main()
-        self.assertEqual(ret, 1)
+        for content in (b'', b'not a status report', b'\xff'):
+            with self.subTest(content=content):
+                (self.iso_dir / 'status.txt').write_bytes(content)
+                self.query.reset_mock()
+                with patch.object(nt.ArchChecker, 'check') as check:
+                    self.assertEqual(self._run_main(argv=['arch']), 0)
+                check.assert_called_once()
+                self.query.assert_called_once()
 
-    def test_malformed_status_file_returns_1(self):
-        """status.txt without 'Sum:' is rejected."""
+    def test_failed_inventory_aborts_before_checkers_and_state_changes(self):
         self.iso_dir.mkdir()
-        (self.iso_dir / 'status.txt').write_text('some content but no sum line')
-        ret = self._run_main()
-        self.assertEqual(ret, 1)
+        valid = json.dumps({'result': 'success', 'arguments': {'torrents': []}})
+        cases = [
+            (FileNotFoundError('transmission-remote missing'), 0, valid, ''),
+            (PermissionError('transmission-remote not executable'), 0, valid, ''),
+            (subprocess.TimeoutExpired('transmission-remote', nt.TRANSMISSION_TIMEOUT), 0, valid, ''),
+            (UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid byte'), 0, '', ''),
+            (None, 17, valid, 'Connection refused\nsecond line'),
+            (None, 0, '', ''),
+            (None, 0, '{"result":', ''),
+            (None, 0, json.dumps({'result': 'permission denied'}), ''),
+            (None, 0, json.dumps({'jsonrpc': '2.0', 'error': {'message': 'failed\n' * 100}}), ''),
+            (None, 0, json.dumps({'jsonrpc': '2.0', 'result': {'torrents': [
+                {'name': 'valid.iso'}, {'name': None},
+            ]}}), ''),
+        ]
+        for error, code, stdout, stderr in cases:
+            with self.subTest(error=error, code=code, stdout=stdout):
+                self.query.reset_mock()
+                self.query.side_effect = error
+                self.query.return_value = subprocess.CompletedProcess(
+                    [], code, stdout=stdout, stderr=stderr)
+                out = io.StringIO()
+                with patch.object(nt.ArchChecker, 'run') as run, \
+                     patch.object(nt, 'FailureTracker') as tracker, \
+                     patch('sys.stdout', out):
+                    self.assertEqual(self._run_main(argv=['arch']), 1)
+                run.assert_not_called()
+                tracker.assert_not_called()
+                self.query.assert_called_once()
+                self.assertFalse((self.tmp / 'failures.json').exists())
+                lines = out.getvalue().splitlines()
+                self.assertEqual(len(lines), 1)
+                self.assertTrue(lines[0].startswith('ERROR:transmission: '))
+                self.assertLessEqual(len(lines[0]), len('ERROR:transmission: ') + 300)
+
+    def test_one_inventory_query_supplies_the_same_snapshot_to_all_checkers(self):
+        self.iso_dir.mkdir()
+        names = ('arch.iso', 'Fedora shared directory', 'image<&>é.iso')
+        self.query.return_value.stdout = json.dumps({
+            'jsonrpc': '2.0', 'result': {'torrents': [{'name': name} for name in names]},
+        })
+        snapshots = []
+
+        def check(c):
+            snapshots.append(c._known_torrents)
+            c.check_iso(names[0])
+            c.check_dir(names[1])
+            c.check_iso(names[2])
+
+        checker_patches = [patch.object(cls, 'check', check) for cls in nt.CHECKERS]
+        for p in checker_patches:
+            p.start()
+        try:
+            self.assertEqual(self._run_main(), 0)
+        finally:
+            for p in checker_patches:
+                p.stop()
+        self.query.assert_called_once()
+        self.assertEqual(len(snapshots), len(nt.CHECKERS))
+        self.assertEqual(snapshots[0], frozenset(names))
+        self.assertTrue(all(snapshot is snapshots[0] for snapshot in snapshots))
+        self.assertFalse((self.iso_dir / 'status.txt').exists())
 
     def test_missing_rsync_returns_1(self):
         """When rsync is not installed, main() bails out and returns 1."""
         self.iso_dir.mkdir()
-        (self.iso_dir / 'status.txt').write_text('Sum: 1')
         ret = self._run_main(rsync_present=False)
         self.assertEqual(ret, 1)
+        self.query.assert_not_called()
 
     def test_non_debian_checker_does_not_require_rsync(self):
         self.iso_dir.mkdir()
-        (self.iso_dir / 'status.txt').write_text('Sum: 1')
         with patch.object(nt.ArchChecker, 'check') as check:
             ret = self._run_main(rsync_present=False, argv=['arch'])
         self.assertEqual(ret, 0)
@@ -3586,7 +3752,6 @@ class TestMain(unittest.TestCase):
 
     def test_debian_only_run_requires_rsync_before_network_work(self):
         self.iso_dir.mkdir()
-        (self.iso_dir / 'status.txt').write_text('Sum: 1')
         with patch.object(nt.DebianChecker, 'check') as check:
             ret = self._run_main(rsync_present=False, argv=['debian'])
         self.assertEqual(ret, 1)
@@ -3595,7 +3760,6 @@ class TestMain(unittest.TestCase):
     def test_clean_run_returns_0(self):
         """When all checkers produce no alerts, main() returns 0."""
         self.iso_dir.mkdir()
-        (self.iso_dir / 'status.txt').write_text('Sum: 1')
 
         def noop_run(self_inner):
             return set()
@@ -3614,7 +3778,6 @@ class TestMain(unittest.TestCase):
     def test_alerts_produce_nonzero_exit(self):
         """When checkers return alerts, main() returns 1."""
         self.iso_dir.mkdir()
-        (self.iso_dir / 'status.txt').write_text('Sum: 1')
 
         def alert_run(self_inner):
             return {'NEW:something'}
@@ -3635,7 +3798,6 @@ class TestMain(unittest.TestCase):
         not run() -- the real, unpatched run() is what contains the fix)
         must not crash main() or prevent it from finishing cleanly."""
         self.iso_dir.mkdir()
-        (self.iso_dir / 'status.txt').write_text('Sum: 1')
 
         def ok_check(self_inner):
             pass  # no alerts
@@ -3659,7 +3821,6 @@ class TestMain(unittest.TestCase):
 
     def test_state_save_failure_reports_existing_alerts_and_closes_display(self):
         self.iso_dir.mkdir()
-        (self.iso_dir / 'status.txt').write_text('Sum: 1')
         for error in (PermissionError('read-only state'), OSError('disk full')):
             for existing_alert in (False, True):
                 with self.subTest(error=error, alert=existing_alert):
@@ -3687,7 +3848,6 @@ class TestMain(unittest.TestCase):
         separator blank line to separate the status board from — it
         shouldn't be there."""
         self.iso_dir.mkdir()
-        (self.iso_dir / 'status.txt').write_text('Sum: 1')
 
         def noop_run(self_inner):
             return set()
@@ -3714,7 +3874,6 @@ class TestMain(unittest.TestCase):
         should still get a blank line separating it from the alert list
         that follows on stdout."""
         self.iso_dir.mkdir()
-        (self.iso_dir / 'status.txt').write_text('Sum: 1')
 
         def alert_run(self_inner):
             return {'NEW:something'}
@@ -3749,6 +3908,13 @@ class TestMain(unittest.TestCase):
         self.assertIn('usage:', out)
         for cls in nt.CHECKERS:
             self.assertIn(cls.__name__.removesuffix('Checker').lower(), out)
+
+    def test_help_skips_the_inventory_query_and_lock(self):
+        with patch('sys.stdout', io.StringIO()), self.assertRaises(SystemExit) as cm:
+            self._run_main(argv=['--help'])
+        self.assertEqual(cm.exception.code, 0)
+        self.query.assert_not_called()
+        self.assertFalse((self.tmp / 'lock').exists())
 
     def test_help_documents_down_alert_form(self):
         """--help is the only place the alert vocabulary is documented, so
@@ -3795,7 +3961,6 @@ class TestMain(unittest.TestCase):
         invoked, and the selected checker's alerts still drive the exit
         code and the alert output."""
         self.iso_dir.mkdir()
-        (self.iso_dir / 'status.txt').write_text('Sum: 1')
         called: list[str] = []
 
         def run_for(cls):
@@ -3844,8 +4009,9 @@ class TestSelfUpdate(unittest.TestCase):
             nt, __file__=str(self.target),
             LOCK_FILE=self.root / 'state' / 'lock',
             FAIL_FILE=self.root / 'state' / 'failures.json',
-            ISO_DIR=self.root / 'missing-downloads',
-            STATUS_FILE=self.root / 'missing-downloads' / 'status.txt'))
+            ISO_DIR=self.root / 'missing-downloads'))
+        self.enterContext(patch.object(nt, '_load_transmission_names',
+            side_effect=AssertionError('self-update must not query Transmission')))
 
     def response(self, source=None, length=None):
         source = self.source if source is None else source

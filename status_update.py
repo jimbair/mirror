@@ -5,8 +5,8 @@
 # Pulls bandwidth stats from vnstat, the last manual speedtest result, and a
 # transmission-remote -l torrent listing (sorted by ratio, or another column
 # via --sort) into a single status page. Installed atomically so concurrent
-# readers (and new-torrents.py, which treats status.txt as ground truth for
-# what transmission already knows about) never see a half-written file.
+# web readers never see a half-written file. The torrent checker queries
+# Transmission directly and does not depend on this legacy plaintext page.
 
 import os
 import subprocess
@@ -305,12 +305,12 @@ class StatusReport:
     def write(self, destination: Path) -> None:
         """Publish a complete snapshot through a same-directory replacement.
 
-        The checker treats status.txt as ground truth, and web clients read
-        it concurrently. Building in memory does not make an in-place write
-        atomic: opening the public path still truncates it before writing.
-        Stage beside it so replacement stays on one filesystem, and leave
-        the previous snapshot intact on build, write, or publication errors.
-        Like the shell builder, this requires parent-directory write access.
+        Web clients read status.txt concurrently. Building in memory does not
+        make an in-place write atomic: opening the public path still truncates
+        it before writing. Stage beside it so replacement stays on one
+        filesystem, and leave the previous snapshot intact on build, write,
+        or publication errors. Like the shell builder, this requires
+        parent-directory write access.
         """
         content = self.build()
         temporary: Path | None = None

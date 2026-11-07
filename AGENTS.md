@@ -7,8 +7,10 @@ Guidance for AI coding agents (and humans) working in this repository.
 Scripts that operate the Linux torrent mirror at [mirror.tsue.net](https://mirror.tsue.net/).
 The production host runs AlmaLinux 10 with Transmission; these scripts live in
 cron there. The repo has no build step or third-party Python packages. The
-Debian checker needs rsync; the status builders also need the host tools and
-data described in README.md. The checker uses Unix-only `fcntl.flock`.
+checker needs `transmission-remote` with JSON output support (production uses
+4.1.4); Debian additionally needs rsync. The status builders need the host
+tools and data described in README.md. The checker uses Unix-only
+`fcntl.flock`.
 
 ## Commands
 
@@ -63,11 +65,15 @@ Keep them (and their comments) intact when refactoring.
   alert makes the process exit non-zero, which is how healthchecks.io fires.
   Alerts repeat every run until the condition clears — a silent no-op (exit 0)
   is a bug, not an optimization. Never "fix" an alert into silence.
-- **status.txt is ground truth** for what Transmission already knows about.
-  Both status builders write it atomically precisely so concurrent readers
-  (including this script) never see a half-written file. Preserve the
-  temp-then-install pattern. The cron user needs parent-directory write
-  access; file-only write permission cannot support atomic replacement.
+- **Transmission inventory:** run `transmission-remote --json --list` from
+  `/usr/local/bin` once under the checker lock, with a 30-second timeout,
+  before starting checker threads. Validate both negotiated RPC envelopes
+  and every torrent name; JSON mode can exit 0 on an RPC error. A failed or
+  invalid inventory must exit 1 with an operational alert, never become an
+  empty snapshot that causes false NEW/ORPHAN alerts. A valid empty list is
+  allowed. Share the immutable complete-name set across all checker threads;
+  include stopped/downloading/error-marked torrents. Do not read status.txt
+  or HTML for inventory.
 - **Threading invariant:** checkers run in a `ThreadPoolExecutor`, and each
   failure-tracker counter name is owned by exactly one checker thread — that
   is why `FailureTracker` is unsynchronized by design. If a new checker ever
@@ -124,8 +130,8 @@ Keep them (and their comments) intact when refactoring.
 
 Each `Checker` subclass documents in its docstring exactly what it watches
 (that text feeds `--help`). When adding a distro, follow the existing shape:
-fetch → parse → `check_iso`/`check_dir` comparisons against status.txt and
-disk → emit `NEW:`/`ORPHAN:`/`STALE:`/`EOL:`/`DROPPED:`/`MISSING:` alerts.
+fetch → parse → `check_iso`/`check_dir` comparisons against the live inventory
+and disk → emit `NEW:`/`ORPHAN:`/`STALE:`/`EOL:`/`DROPPED:`/`MISSING:` alerts.
 
 ## Adding a new distro checker
 
@@ -142,7 +148,7 @@ The feature-addition recipe for `new-torrents.py`:
 3. Do all network I/O through `self.fetch(url, name)` + `self.body_ok(...)`,
    and all disk/status comparisons through `self.check_iso()` /
    `self.check_dir()`. Those already implement the path-traversal guard
-   (`_safe_path`) and whole-token status matching — don't reimplement
+   (`_safe_path`) and exact whole-name inventory matching — don't reimplement
    either.
 4. Give the checker its own fetch-failure counter name(s); no two checker
    threads may share a name (threading invariant above).
@@ -154,7 +160,7 @@ The feature-addition recipe for `new-torrents.py`:
    the careful pattern: check valid entries, alert on unusable metadata, and
    avoid removal conclusions for malformed versions).
 6. Test with the shared helpers at the top of `tests/test_new_torrents.py`:
-   `make_checker(cls, iso_dir, status_content, ...)` to construct, and
+   `make_checker(cls, iso_dir, known_torrents, ...)` to construct, and
    `fake_fetch_fn` / `fake_fetch_seq` to inject pages (both pad past
    `body_ok()`'s 250-char minimum), `patch('subprocess.run')` for
    rsync-based checkers, and an injected `now` clock for date logic.
@@ -179,9 +185,10 @@ they live:
 - **Transfer/encoding quirks** in `Checker.fetch()`: raw-deflate mislabeled
   as `deflate`, garbage charsets, truncated gzip (`EOFError`), mid-response
   drops (`http.client.HTTPException`). Each has a `test_fetch_*` case.
-- **Name matching** must stay whole-token (`_status_tokens` set
+- **Name matching** must stay whole-name (`_known_torrents` set
   membership); a substring check would hide a missing release (`-42` vs
-  `-420`).
+  `-420`). Preserve spaces and HTML characters from JSON without stripping,
+  whitespace splitting, or HTML entity conversion.
 - **Scraped names are untrusted input**: `_safe_path()` blocks `..`/absolute
   traversal (alerting `UNSAFE:`); `stat()` must tolerate dangling symlinks;
   zero-byte ISOs count as missing.
@@ -217,6 +224,10 @@ they live:
 - **Commits:** conventional-commit style with a scope, lowercase subject
   (`fix(ubuntu): ...`, `test(fetch): ...`, `chore: ...`, `docs: ...`).
 - **Sign-off and attribution:** sign off every commit with `git commit -s`.
+  AI-assisted commits must include the active client's native AI-attribution
+  trailer, including commits created through shell commands. Verify the final
+  message with `git log -1 --format=%B`; do not assume attribution was added
+  automatically.
   Follow the active client's native AI-attribution defaults unchanged. Do not
   override its trailer format or identity, add a second credit trailer, or
   add model names or reasoning-effort labels unless the client includes them
@@ -241,8 +252,9 @@ they live:
 - `mirror-index.sh` — generates nginx autoindex header/footer fragments in
   `Downloads/.theme/` using the same public host data as `status-update.sh`.
   Build both before publishing, HTML-escape dynamic text, and replace each
-  atomically with mode `0644`. It does not write `status.txt`; keep the
-  existing status job until a separate consolidation migrates its readers.
+  atomically with mode `0644`. It and the checker query Transmission
+  independently. The checker has no `status.txt` dependency; after deploying
+  this version, the old status job is optional for legacy page consumers.
   Tests in `tests/test_mirror_index.py` stub collectors and use disposable
   directories; CI runs them on Ubuntu and AlmaLinux.
 - `transmission-upgrade.sh` — builds Transmission from source on AlmaLinux

@@ -35,8 +35,10 @@ from typing import NamedTuple
 # Where transmission stores downloaded torrents
 ISO_DIR = Path('/var/lib/transmission/Downloads')
 
-# Mirror status page; the bottom of this file is transmission-remote -l output
-STATUS_FILE = ISO_DIR / 'status.txt'
+# Query the same local daemon as the status builders, independently of their
+# publication schedules. One bounded call supplies every checker in a run.
+TRANSMISSION_REMOTE = '/usr/local/bin/transmission-remote'
+TRANSMISSION_TIMEOUT = 30
 
 # Number of consecutive fetch failures before a domain is reported as down.
 # Transient outages are silently ignored until this threshold is reached.
@@ -77,6 +79,59 @@ MAX_UPDATE_BYTES = 2 * 1024 * 1024
 
 class FetchLimitError(ValueError):
     """A response exceeded the encoded or decompressed body size limit."""
+
+
+def _parse_transmission_names(output: str) -> frozenset[str]:
+    """Validate a complete RPC inventory and retain exact torrent names."""
+    reply = json.loads(output)
+    if not isinstance(reply, dict):
+        raise ValueError('expected a Transmission RPC response object')
+
+    # transmission-remote --json prints the raw response before its normal
+    # RPC error checks, so even exit 0 can contain an error. Its 4.1 client
+    # also negotiates between the legacy envelope and JSON-RPC 2.0; validate
+    # the corresponding success result before accepting either inventory.
+    if 'error' in reply:
+        error = reply['error']
+        message = (error.get('message', 'unknown error') if isinstance(error, dict)
+                   else 'invalid error response')
+        raise ValueError(f'Transmission RPC error: {message}')
+    if 'jsonrpc' in reply:
+        if reply['jsonrpc'] != '2.0':
+            raise ValueError('unsupported Transmission JSON-RPC version')
+        arguments = reply.get('result')
+    else:
+        if reply.get('result') != 'success':
+            raise ValueError(f'Transmission RPC failed: {reply.get("result", "missing result")}')
+        arguments = reply.get('arguments')
+
+    if not isinstance(arguments, dict) or not isinstance(arguments.get('torrents'), list):
+        raise ValueError('Transmission RPC response has no valid torrents list')
+
+    names = set()
+    for torrent in arguments['torrents']:
+        if (not isinstance(torrent, dict)
+                or not isinstance(torrent.get('name'), str) or not torrent['name']):
+            # A bad sibling cannot be treated as an absent torrent: that
+            # would manufacture NEW/ORPHAN alerts from an incomplete list.
+            raise ValueError('Transmission RPC inventory contains an invalid torrent name')
+        names.add(torrent['name'])
+    # An empty list is a valid inventory. Preserve spaces, Unicode and HTML
+    # characters in names, and share one immutable snapshot across threads.
+    return frozenset(names)
+
+
+def _load_transmission_names() -> frozenset[str]:
+    """Take one live inventory snapshot without writing any shared files."""
+    result = subprocess.run(
+        [TRANSMISSION_REMOTE, '--json', '--list'],
+        capture_output=True, text=True, encoding='utf-8',
+        timeout=TRANSMISSION_TIMEOUT,
+    )
+    if result.returncode != 0:
+        detail = ' '.join(result.stderr.split())[:200] or 'no stderr output'
+        raise ValueError(f'transmission-remote exit {result.returncode}: {detail}')
+    return _parse_transmission_names(result.stdout)
 
 
 class FailureTracker:
@@ -362,19 +417,14 @@ class Checker(ABC):
     _MAX_DECODED_BYTES = 16 * 1024 * 1024
     _READ_CHUNK = 64 * 1024
 
-    def __init__(self, iso_dir: Path, status_content: str,
+    def __init__(self, iso_dir: Path, known_torrents: frozenset[str],
                  failures: FailureTracker,
                  display: 'StatusDisplay | None' = None) -> None:
         self.iso_dir = iso_dir
-        self.status_content = status_content
-        # Precomputed once here rather than re-deriving per _known_to_transmission()
-        # call: status_content's Name column entries are whitespace-delimited,
-        # so splitting on whitespace once up front gives the exact same set
-        # of "whole token" candidates a per-call regex search would find,
-        # but as an O(1) membership test instead of re-compiling and
-        # re-scanning the whole blob for every single ISO/directory checked
-        # (hundreds of times per run for checkers like Debian).
-        self._status_tokens = set(status_content.split())
+        # All checker threads receive the same immutable snapshot, queried
+        # before the executor starts. Membership stays O(1) even for Debian's
+        # hundreds of checks, without another daemon call per artifact.
+        self._known_torrents = known_torrents
         self.updates: set[str] = set()
         self._page: str = ''
         self._failures = failures
@@ -545,17 +595,15 @@ class Checker(ABC):
         return True
 
     def _known_to_transmission(self, name: str) -> bool:
-        """True if name appears in status_content as a whole token, not
-        merely as a prefix of some longer, unrelated name. A plain
-        substring test would treat e.g. 'Fedora-Workstation-Live-x86_64-42'
+        """True if name exactly matches a registered torrent's full name.
+
+        A plain substring test would treat e.g. 'Fedora-Workstation-Live-x86_64-42'
         as already known if only '...-420' were actually present --
-        silently hiding a genuinely missing release. status_content's
-        Name column entries are whitespace-delimited, so an exact match
-        against the whitespace-split token set (precomputed once in
-        __init__) is equivalent to a whole-token regex search, without
-        recompiling and rescanning per call.
+        silently hiding a genuinely missing release. Whole-name membership
+        also preserves names containing spaces, and cannot mistake a word
+        within an unrelated torrent's name for a registered artifact.
         """
-        return name in self._status_tokens
+        return name in self._known_torrents
 
     def _safe_path(self, name: str) -> Path | None:
         """Resolve name against iso_dir, or None if the result would
@@ -2245,6 +2293,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         prog='new-torrents.py',
         description=(
             'Check for new ISO torrents to mirror on mirror.tsue.net.\n'
+            'Queries transmission-remote --json --list once per run.\n'
             '\n'
             'Alerts print to stdout, one per line; any alert makes the run\n'
             'exit non-zero so healthchecks.io fires. Each alert repeats\n'
@@ -2309,16 +2358,16 @@ def _run(args: argparse.Namespace) -> int:
         print('ERROR: Please install rsync to proceed. Exiting.')
         return 1
 
-    # Require a valid status.txt to proceed
-    if not STATUS_FILE.exists() or STATUS_FILE.stat().st_size == 0:
-        print(f'ERROR: status.txt is missing or empty at {STATUS_FILE}. Exiting.')
-        return 1
-
-    status_content = STATUS_FILE.read_text()
-    # 'Sum:' appears in the totals line of transmission-remote -l output;
-    # its absence means the file wasn't written by transmission or was truncated
-    if 'Sum:' not in status_content:
-        print(f'ERROR: status.txt appears malformed at {STATUS_FILE}. Exiting.')
+    # A missing/failed inventory must not look like an empty daemon and flood
+    # the report with false NEW/ORPHAN alerts. Query once under the checker
+    # lock and validate the whole response before starting any comparisons.
+    try:
+        known_torrents = _load_transmission_names()
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError) as e:
+        # Keep the one-alert-per-line contract even if the CLI/RPC diagnosis
+        # contains line breaks, and bound diagnostic output from a bad reply.
+        detail = ' '.join(str(e).split())[:300]
+        print(f'ERROR:transmission: {detail}')
         return 1
 
     # Run the selected checker(s) concurrently. Show the live status
@@ -2331,7 +2380,7 @@ def _run(args: argparse.Namespace) -> int:
     try:
         failures = FailureTracker(FAIL_FILE, FAIL_THRESHOLD)
         instances = [
-            cls(ISO_DIR, status_content, failures, display) for cls in checkers
+            cls(ISO_DIR, known_torrents, failures, display) for cls in checkers
         ]
         with ThreadPoolExecutor(max_workers=len(instances)) as pool:
             for future in as_completed(pool.submit(checker.run) for checker in instances):

@@ -11,6 +11,10 @@ update the production scripts.
   library; there is no package installation or build step.
 - `rsync` for the Debian checker and the default full checker run. Other
   individual checkers do not require it.
+- `transmission-remote` with JSON output support at
+  `/usr/local/bin/transmission-remote` and access to the local daemon for
+  torrent checks. The production host runs Transmission 4.1.4. The cron user
+  must be able to run `transmission-remote --json --list` successfully.
 - The status builders need the configured host's Transmission, vnStat,
   IPv6 statistics, and speedtest data. The active shell builder also uses
   Bash and standard Unix utilities.
@@ -36,10 +40,19 @@ Available selectors are `alma`, `arch`, `cachy`, `debian`, `fedora`, `mint`,
 as `MintChecker` also work. Progress goes to stderr and is enabled automatically
 when stderr is a terminal. Alerts go to stdout.
 
-The checker compares upstream listings with
-`/var/lib/transmission/Downloads/status.txt` and local files. `status.txt` is
-the source of truth for what Transmission already knows about. The checker
-reports work to do; downloading, adding, and removing torrents remain manual.
+The checker compares upstream listings with a live Transmission inventory
+and files under `/var/lib/transmission/Downloads`. It runs
+`/usr/local/bin/transmission-remote --json --list` once per invocation, with a
+30-second timeout, and shares an immutable set of complete torrent names
+among all distro checkers. Stopped, downloading, and error-marked torrents
+still count as known. No status page, HTML footer, or inventory cache is read.
+
+Both the legacy RPC and JSON-RPC 2.0 response envelopes are validated, including
+RPC errors returned with a successful CLI exit code. A failed query or invalid
+inventory prints `ERROR:transmission: ...` and exits 1 before running distro
+checks; it never substitutes an empty inventory. A valid empty torrent list
+is accepted. The checker reports work to do; downloading, adding, and removing
+torrents remain manual.
 
 | Exit code | Meaning |
 | --- | --- |
@@ -98,10 +111,10 @@ used to launch it. An identical download reports that it is already up to date.
 
 Updates overwrite local edits to `new-torrents.py`. Only this script is updated;
 the command exits and the next invocation uses the new version. Updating runs
-independently of torrent checks and needs no rsync, downloads, status file, or
-runtime-state directory. Update errors leave the installed script intact and
-exit 1; combining the option with a checker name or `--verbose` is a usage
-error (exit 2).
+independently of torrent checks and needs no Transmission CLI/daemon, rsync,
+downloads, or runtime-state directory. Update errors leave the installed
+script intact and exit 1; combining the option with a checker name or
+`--verbose` is a usage error (exit 2).
 
 ## State and scheduling
 
@@ -147,9 +160,11 @@ the command still exits non-zero, and each fragment remains complete.
 
 The footer publishes the same host data as `status-update.sh`: the complete
 speedtest log, vnStat output, IPv6 statistics, and the torrent listing sorted
-by ratio. Dynamic text is HTML-escaped. This script does not update
-`status.txt`; keep the existing status-builder job running because the torrent
-checker still relies on that file.
+by ratio. Dynamic text is HTML-escaped. The index builder and torrent checker
+query Transmission independently; neither depends on `status.txt`. After
+deploying this checker version, the old status-builder job can be retired if
+the legacy plaintext page has no other consumers. Existing host cron jobs
+and installed scripts are changed manually.
 
 ## Tests and development
 
@@ -179,6 +194,11 @@ See [AGENTS.md](AGENTS.md) for architecture invariants and contribution guidance
 ## Commit conventions
 
 Sign off every commit with `git commit -s`.
+
+AI-assisted commits must include the active client's native AI-attribution
+trailer, including commits created through shell commands. Verify the final
+message with `git log -1 --format=%B`; do not assume attribution was added
+automatically.
 
 Follow the active client's native AI-attribution defaults unchanged. Do not
 override its trailer format or identity, add a second credit trailer, or
