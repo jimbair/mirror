@@ -39,8 +39,8 @@ build_footer() {
 
   echo '<h2>Torrent Stats</h2><pre>' || return 1
   head -n 1 <<< "${REMOTE}" | html_escape || return 1
-  # Match status-update.sh's ratio ordering, including comma-separated and
-  # infinite ratios. Collapse Have/ETA units before locating the ratio field.
+  # Sort by ratio, including comma-separated and infinite ratios. Collapse
+  # Have/ETA units before locating the ratio field.
   sed '1d;$d' <<< "${REMOTE}" \
     | sed -E 's/ (B|kB|MB|GB|TB|sec|min|hr|day|month|year)/@\1/g' \
     | awk '{key=$7; if (key=="Inf") key="999999999"; else gsub(",","",key); print key "\t" $0}' \
@@ -74,7 +74,7 @@ main() {
 }
 
 # Sourcing exposes the real build/publication path to tests with stubbed host
-# collectors, without accessing production data or changing status.txt.
+# collectors, without accessing production data.
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"
 fi

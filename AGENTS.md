@@ -8,7 +8,7 @@ Scripts that operate the Linux torrent mirror at [mirror.tsue.net](https://mirro
 The production host runs AlmaLinux 10 with Transmission; these scripts live in
 cron there. The repo has no build step or third-party Python packages. The
 checker needs `transmission-remote` with JSON output support (production uses
-4.1.4); Debian additionally needs rsync. The status builders need the host
+4.1.4); Debian additionally needs rsync. The index builder needs the host
 tools and data described in README.md. The checker uses Unix-only
 `fcntl.flock`.
 
@@ -18,17 +18,13 @@ All commands run from the repo root (the directory containing this file):
 
 ```sh
 python3 tests/test_new_torrents.py -v  # tests for new-torrents.py
-python3 tests/test_status_update.py -v  # tests for status_update.py
-python3 tests/test_status_update_sh.py -v  # active shell publication tests
 python3 tests/test_mirror_index.py -v  # HTML fragments and publication tests
 python3 tests/test_transmission_upgrade.py -v  # stubbed service lifecycle tests
 python3 tests/test_debian_torrents_fetch.py -v  # isolated torrent collection tests
 python3 new-torrents.py --help  # checker CLI; select with a positional name
 python3 new-torrents.py mint  # just Mint; names are case-insensitive
 python3 new-torrents.py --update  # manual in-place self-update; -u also works
-bash -n status-update.sh  # shell syntax check
 bash -n mirror-index.sh  # index wrapper syntax check
-python3 status_update.py  # build status page (needs transmission-remote, vnstat)
 ```
 
 - **macOS interpreters:** the system `python3` (Xcode Command Line
@@ -116,16 +112,6 @@ Keep them (and their comments) intact when refactoring.
   Validation expects `Checker`, `main`, `_parse_args`, and `_run`; keep it in
   sync with entry-point refactors. Updates never run as part of normal checks.
 
-### status_update.py (Python status page builder)
-
-- The `transmission-remote -l` table rendering is **verified byte-for-byte
-  against real Transmission 4.1.3 captures** (fixed column widths, 2-space gutters,
-  no auto-widening). Don't "improve" the formatting to be data-driven —
-  matching transmission-remote exactly is the requirement.
-- `TransmissionRow.from_line` parsing depends on the observation that Have/ETA
-  are either a bare token or `NUMBER UNIT`; the unit frozensets are the
-  boundary between those fields and the free-text Name column.
-
 ### Checker classes
 
 Each `Checker` subclass documents in its docstring exactly what it watches
@@ -200,14 +186,10 @@ they live:
 - **Alert fan-out**: one upstream release change spans many files — group
   alerts (Mint's version-bump logic) instead of firing one per file.
 - **State durability**: every persisted file (`failures.json`,
-  `ubuntu-eol.json`, `mint-supported.json`, `status.txt`) is published through
-  a temporary file and same-directory replacement (`os.replace` in Python,
-  `mv` in the shell builder). Never copy over the public destination: that
-  exposes a truncated snapshot to concurrent readers.
-- **`status_update.py`**'s high-risk area is the table: rendering is
-  byte-for-byte against real `transmission-remote -l`; the `SAMPLE_OUTPUT`
-  fixture covers alignment, and the captured Transmission 4.1.3 fixtures
-  pin exact byte output, including error-marked IDs and overflow ratios.
+  `ubuntu-eol.json`, `mint-supported.json`, and the HTML header/footer) is
+  published through a temporary file and same-directory replacement
+  (`os.replace` in Python, `mv` in the index builder). Never copy over the
+  public destination: that exposes a truncated snapshot to concurrent readers.
 
 ## Conventions
 
@@ -244,19 +226,12 @@ they live:
   and a stubbed rsync; CI runs them on Ubuntu and AlmaLinux.
 - `new-speedtest.sh` — interactive; re-runs the speedtest and swaps
   `/home/jim/log/speedtest.log` if you accept it.
-- `status-update.sh` — the original version of `status_update.py`.
-  `status-update.sh` is the version actively in use; migrating to the python
-  version is currently a TODO to be completed by the author. Publication is
-  tested in `tests/test_status_update_sh.py` on Ubuntu and AlmaLinux in CI;
-  the host-specific collectors are stubbed.
 - `mirror-index.sh` — generates nginx autoindex header/footer fragments in
-  `Downloads/.theme/` using the same public host data as `status-update.sh`.
-  Build both before publishing, HTML-escape dynamic text, and replace each
-  atomically with mode `0644`. It and the checker query Transmission
-  independently. The checker has no `status.txt` dependency; after deploying
-  this version, the old status job is optional for legacy page consumers.
-  Tests in `tests/test_mirror_index.py` stub collectors and use disposable
-  directories; CI runs them on Ubuntu and AlmaLinux.
+  `Downloads/.theme/` using Transmission, vnStat, IPv6 statistics, and the
+  speedtest log. Build both before publishing, HTML-escape dynamic text, and
+  replace each atomically with mode `0644`. It and the checker query
+  Transmission independently. Tests in `tests/test_mirror_index.py` stub
+  collectors and use disposable directories; CI runs them on Ubuntu and AlmaLinux.
 - `transmission-upgrade.sh` — builds Transmission from source on AlmaLinux
   (root, dnf) while upstream package bugs are open. Destructive by design
   (replaces the system daemon); verify version and checksums before running
@@ -271,9 +246,9 @@ they live:
   host automatically — the maintainer copies them over by hand or explicitly
   runs `new-torrents.py --update` for that script. A merged change is not live
   until it has been deployed.
-- **Cadence (informational only)**: `new-torrents.py` runs hourly and
-  `status-update.sh` runs every 5 minutes on the production host. The actual
-  cron entries live on the host and are intentionally not in this repo.
+- **Cadence (informational only)**: `new-torrents.py` runs hourly on the
+  production host. The actual cron entries live on the host and are
+  intentionally not in this repo.
 - **The healthchecks.io URL is secret — never write it into this repo.**
   The ping is done by the cron wrapper, not the scripts; publishing the URL
   (or its /fail endpoint) would let anyone poison the alerts or mask a real
@@ -286,7 +261,7 @@ they live:
 ## Production paths referenced in code
 
 - ISOs/downloads: `/var/lib/transmission/Downloads` (`ISO_DIR`)
-- Status page: `.../Downloads/status.txt`
+- Index fragments: `.../Downloads/.theme/header.html` and `footer.html`
 - Speedtest log: `/home/jim/log/speedtest.log`
 - Runtime state: `~/.config/new-torrents/` (failures.json, lock,
   ubuntu-eol.json, mint-supported.json)

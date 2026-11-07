@@ -32,8 +32,8 @@ class TestMirrorIndex(unittest.TestCase):
         self.footer = self.theme / 'footer.html'
         self.header.write_text('old complete header\n')
         self.footer.write_text('old complete footer\n')
-        self.status = self.root / 'status.txt'
-        self.status.write_text('checker ground truth\n')
+        self.download = self.root / 'existing.iso'
+        self.download.write_bytes(b'existing download')
         self.speedtest = self.root / 'speedtest.log'
         self.speedtest.write_text('Speed <fast> & stable\n')
         self.remote = self.root / 'transmission.txt'
@@ -57,7 +57,7 @@ ipv6_stats() { printf 'IPv6 <share> & interface\\n'; }
             ['bash', '-c', command, 'mirror-index-test', str(SCRIPT),
              str(self.root), str(self.speedtest), str(self.remote)],
             capture_output=True, text=True, timeout=5)
-        self.assertEqual(self.status.read_text(), 'checker ground truth\n')
+        self.assertEqual(self.download.read_bytes(), b'existing download')
         self.assertEqual(list(self.theme.glob('*.tmp.*')), [])
         return result
 

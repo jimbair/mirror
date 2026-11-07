@@ -35,8 +35,8 @@ from typing import NamedTuple
 # Where transmission stores downloaded torrents
 ISO_DIR = Path('/var/lib/transmission/Downloads')
 
-# Query the same local daemon as the status builders, independently of their
-# publication schedules. One bounded call supplies every checker in a run.
+# Query the local daemon independently of HTML publication. One bounded call
+# supplies every checker in a run.
 TRANSMISSION_REMOTE = '/usr/local/bin/transmission-remote'
 TRANSMISSION_TIMEOUT = 30
 

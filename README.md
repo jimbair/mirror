@@ -15,9 +15,8 @@ update the production scripts.
   `/usr/local/bin/transmission-remote` and access to the local daemon for
   torrent checks. The production host runs Transmission 4.1.4. The cron user
   must be able to run `transmission-remote --json --list` successfully.
-- The status builders need the configured host's Transmission, vnStat,
-  IPv6 statistics, and speedtest data. The active shell builder also uses
-  Bash and standard Unix utilities.
+- The index builder needs Bash, standard Unix utilities, and the configured
+  host's Transmission, vnStat, IPv6 statistics, and speedtest data.
 
 On macOS, the system `python3` may be too old. Install a modern Python with
 `brew install python@3.11` and use `python3.11`, or
@@ -118,10 +117,9 @@ script intact and exit 1; combining the option with a checker name or
 
 ## State and scheduling
 
-The production checker runs hourly; the active `status-update.sh` builder runs
-every five minutes. The host's cron wrapper handles monitoring using the exit
-code. Monitoring credentials and complete cron entries do not belong in this
-repository.
+The production checker runs hourly. The host's cron wrapper handles monitoring
+using the exit code. Monitoring credentials and complete cron entries do not
+belong in this repository.
 
 Runtime state lives under `~/.config/new-torrents/`:
 
@@ -132,9 +130,9 @@ Runtime state lives under `~/.config/new-torrents/`:
   versions known when it was captured. Cached absence cannot make a later
   release EOL.
 
-The checker's state snapshots and the active shell builder's `status.txt` are
-published through temporary files followed by same-directory atomic replacement.
-State-write failures are reported while completed checker alerts remain available.
+The checker's state snapshots are published through temporary files followed
+by same-directory atomic replacement. State-write failures are reported while
+completed checker alerts remain available.
 
 Checker HTTP fetches allow 8 MiB of encoded data and 16 MiB after decompression.
 A 30-second elapsed budget is checked between reads alongside a 10-second
@@ -142,14 +140,7 @@ socket timeout. One blocking operation can outlast the remaining budget; this
 is not a process-level deadline for operating-system DNS or connection setup.
 Debian's rsync listing has a separate 60-second timeout.
 
-`status_update.py` is the Python status-builder alternative; migration from the
-active shell version is still pending. Both builders rely on production paths
-and data that are absent from a normal development checkout. Both publish
-`status.txt` atomically and require write access to its parent directory;
-file-only write permission is insufficient. Set up directory access for the
-cron user before switching builders.
-
-`mirror-index.sh` separately generates `.theme/header.html` and
+`mirror-index.sh` generates `.theme/header.html` and
 `.theme/footer.html` under the download directory for the host's nginx
 autoindex wrapper. The `.theme` directory and nginx integration must already
 exist, and the cron user needs write access to that directory. Both fragments
@@ -158,13 +149,11 @@ A collection or build failure leaves both previous fragments in place. A
 failure of the second rename can leave a new header with the previous footer;
 the command still exits non-zero, and each fragment remains complete.
 
-The footer publishes the same host data as `status-update.sh`: the complete
-speedtest log, vnStat output, IPv6 statistics, and the torrent listing sorted
-by ratio. Dynamic text is HTML-escaped. The index builder and torrent checker
-query Transmission independently; neither depends on `status.txt`. After
-deploying this checker version, the old status-builder job can be retired if
-the legacy plaintext page has no other consumers. Existing host cron jobs
-and installed scripts are changed manually.
+The footer publishes the complete speedtest log, vnStat output, IPv6
+statistics, and the torrent listing sorted by ratio. Dynamic text is
+HTML-escaped. The index builder and torrent checker query Transmission
+independently. Existing host cron jobs and installed scripts are changed
+manually.
 
 ## Tests and development
 
@@ -173,12 +162,9 @@ Transmission, rsync, or production data:
 
 ```sh
 python3.11 -B tests/test_new_torrents.py -v
-python3.11 -B tests/test_status_update.py -v
-python3.11 -B tests/test_status_update_sh.py -v
 python3.11 -B tests/test_mirror_index.py -v
 python3.11 -B tests/test_transmission_upgrade.py -v
 python3.11 -B tests/test_debian_torrents_fetch.py -v
-bash -n status-update.sh
 bash -n mirror-index.sh
 bash -n transmission-upgrade.sh
 bash -n debian-torrents-fetch.sh
