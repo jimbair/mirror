@@ -163,6 +163,13 @@ including link-layer overhead and non-IP traffic. The displayed boot timestamp
 assumes the interface counters have remained intact since boot; collection
 is stateless.
 
+`new-speedtest.sh` previews a fresh speedtest and replaces
+`/home/jim/log/speedtest.log` only after you accept it. Each session stages
+its own candidate beside the log, checks formatting and preview reads, and
+publishes with an atomic rename and mode `0644`. The log directory must be
+writable. Declining preserves the previous result; failures, EOF, and
+interruption also preserve it and clean up that session's temporary file.
+
 `transmission-upgrade.sh` verifies the release checksum, stops on source
 preparation failures, and requires the installed client version to match the
 requested release before reporting success. A failed install attempts to
@@ -179,15 +186,19 @@ python3.11 -B tests/test_new_torrents.py -v
 python3.11 -B tests/test_mirror_index.py -v
 python3.11 -B tests/test_ipv6_stats.py -v
 python3.11 -B tests/test_transmission_upgrade.py -v
+python3.11 -B tests/test_new_speedtest.py -v
 python3.11 -B tests/test_debian_torrents_fetch.py -v
 bash -n mirror-index.sh
 bash -n transmission-upgrade.sh
+bash -n new-speedtest.sh
 bash -n debian-torrents-fetch.sh
 ```
 
 CI runs the suites on Ubuntu and AlmaLinux 10. Upgrade tests use disposable
 sources and stub host commands to exercise preparation failures, installed
 version checks, and service recovery without root or a real installation.
+Speedtest tests stub the CLI and exercise concurrent approvals, cancellation,
+interruptions, and publication failures using temporary logs.
 Torrent-fetch tests stub rsync and keep all downloads in temporary directories.
 Representative upstream snippets and their source URLs live in
 [tests/fixtures](tests/fixtures/README.md).

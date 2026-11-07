@@ -21,11 +21,13 @@ python3 tests/test_new_torrents.py -v  # tests for new-torrents.py
 python3 tests/test_mirror_index.py -v  # HTML fragments and publication tests
 python3 tests/test_ipv6_stats.py -v  # IPv6 counters and route selection tests
 python3 tests/test_transmission_upgrade.py -v  # preparation, version, service tests
+python3 tests/test_new_speedtest.py -v  # isolated interactive publication tests
 python3 tests/test_debian_torrents_fetch.py -v  # isolated torrent collection tests
 python3 new-torrents.py --help  # checker CLI; select with a positional name
 python3 new-torrents.py mint  # just Mint; names are case-insensitive
 python3 new-torrents.py --update  # manual in-place self-update; -u also works
 bash -n mirror-index.sh  # index wrapper syntax check
+bash -n new-speedtest.sh  # interactive helper syntax check
 ```
 
 - **macOS interpreters:** the system `python3` (Xcode Command Line
@@ -199,10 +201,11 @@ they live:
 - **Alert fan-out**: one upstream release change spans many files — group
   alerts (Mint's version-bump logic) instead of firing one per file.
 - **State durability**: every persisted file (`failures.json`,
-  `ubuntu-eol.json`, `mint-supported.json`, and the HTML header/footer) is
-  published through a temporary file and same-directory replacement
-  (`os.replace` in Python, `mv` in the index builder). Never copy over the
-  public destination: that exposes a truncated snapshot to concurrent readers.
+  `ubuntu-eol.json`, `mint-supported.json`, `speedtest.log`, and the HTML
+  header/footer) is published through a temporary file and same-directory
+  replacement (`os.replace` in Python, `mv` in the shell scripts). Never copy
+  over the public destination: that exposes a truncated snapshot to concurrent
+  readers.
 
 ## Conventions
 
@@ -238,7 +241,12 @@ they live:
   in `tests/test_debian_torrents_fetch.py` use disposable working directories
   and a stubbed rsync; CI runs them on Ubuntu and AlmaLinux.
 - `new-speedtest.sh` — interactive; re-runs the speedtest and swaps
-  `/home/jim/log/speedtest.log` if you accept it.
+  `/home/jim/log/speedtest.log` only if you accept its displayed candidate.
+  Stage each session uniquely beside the log, check writes and previews,
+  then publish atomically with mode `0644`. Cancellation, failure, and
+  interruption clean up only that session's candidate. Tests in
+  `tests/test_new_speedtest.py` cover overlapping previews and publication
+  failures with disposable paths and a stub CLI; CI runs them on both OSes.
 - `mirror-index.sh` — generates nginx autoindex header/footer fragments in
   `Downloads/.theme/` using Transmission, vnStat, IPv6 statistics, and the
   speedtest log. Build both before publishing, HTML-escape dynamic text, and
