@@ -71,8 +71,7 @@ UBUNTU_EOL_CACHE_FILE = Path.home() / '.config' / 'new-torrents' / 'ubuntu-eol.j
 # release that appeared later, so it must never make that new release EOL.
 MINT_SUPPORT_CACHE_FILE = Path.home() / '.config' / 'new-torrents' / 'mint-supported.json'
 
-# A standalone installation can update without a Git checkout or any of
-# the mirror host's tools and data. Only this script is replaced.
+# --update replaces only this script with the version on GitHub's main branch.
 UPDATE_URL = 'https://raw.githubusercontent.com/jimbair/mirror/main/new-torrents.py'
 MAX_UPDATE_BYTES = 2 * 1024 * 1024
 
