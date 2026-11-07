@@ -19,6 +19,7 @@ All commands run from the repo root (the directory containing this file):
 ```sh
 python3 tests/test_new_torrents.py -v  # tests for new-torrents.py
 python3 tests/test_mirror_index.py -v  # HTML fragments and publication tests
+python3 tests/test_ipv6_stats.py -v  # IPv6 counters and route selection tests
 python3 tests/test_transmission_upgrade.py -v  # stubbed service lifecycle tests
 python3 tests/test_debian_torrents_fetch.py -v  # isolated torrent collection tests
 python3 new-torrents.py --help  # checker CLI; select with a positional name
@@ -118,6 +119,18 @@ Each `Checker` subclass documents in its docstring exactly what it watches
 (that text feeds `--help`). When adding a distro, follow the existing shape:
 fetch → parse → `check_iso`/`check_dir` comparisons against the live inventory
 and disk → emit `NEW:`/`ORPHAN:`/`STALE:`/`EOL:`/`DROPPED:`/`MISSING:` alerts.
+
+### ipv6-stats.py (interface traffic share)
+
+- Select an up, non-reject IPv4 route with both destination and mask zero.
+  A zero destination alone can select a more-specific route on another link.
+- Read IPv6 octets before total interface bytes. Reject negative counters
+  or an IPv6 subtotal greater than the total; preserve the index builder's
+  last good page through a non-zero collector exit instead of clamping.
+- The non-IPv6 remainder includes link-layer overhead and non-IP traffic;
+  do not label it as IPv4. The boot timestamp assumes intact counter lifetimes.
+  Keep collection stateless. Tests use synthetic `/proc` files, including
+  counter changes between reads, and run on Ubuntu and AlmaLinux in CI.
 
 ## Adding a new distro checker
 

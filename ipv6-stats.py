@@ -4,12 +4,13 @@ ipv6-stats.py -- report the percentage of interface traffic that has been
 IPv6 since the machine's last boot.
 
 Data sources (both are LIVE KERNEL COUNTERS):
-  - /proc/net/dev             total rx+tx bytes per interface, since boot
-  - /proc/net/dev_snmp6/<if>  IPv6-only rx+tx byte counters, since boot
+  - /proc/net/dev             total rx+tx bytes per interface
+  - /proc/net/dev_snmp6/<if>  IPv6-only rx+tx byte counters
 
-Both reset to zero on reboot, so the reported window is always
-"since last boot". If you need a longer window, these counters have to be
-polled and persisted over time yourself.
+Both reset to zero on reboot. The reported "since boot" window assumes
+the interface and its IPv6 counters have remained intact since then;
+recreating either can start a new counter period. If you need a longer
+window, these counters have to be polled and persisted over time yourself.
 
 Precision caveat: the two sources count slightly different things.
 /proc/net/dev reports frame bytes as seen by the interface, which on
@@ -33,6 +34,9 @@ PROC_NET_ROUTE = Path("/proc/net/route")
 PROC_NET_DEV_SNMP6 = Path("/proc/net/dev_snmp6")
 PROC_STAT = Path("/proc/stat")
 
+RTF_UP = 0x0001
+RTF_REJECT = 0x0200
+
 
 @dataclass
 class TrafficShare:
@@ -41,9 +45,19 @@ class TrafficShare:
     ipv6_bytes: int
     since: datetime
 
+    def __post_init__(self) -> None:
+        # A reset between reads can make the counters incomparable. Report
+        # the bad sample so the index builder keeps its last complete page.
+        if not 0 <= self.ipv6_bytes <= self.total_bytes:
+            raise ValueError(
+                f"inconsistent traffic counters for {self.interface!r}: "
+                f"IPv6={self.ipv6_bytes}, total={self.total_bytes}; "
+                "counters may have reset between reads"
+            )
+
     @property
-    def ipv4_bytes(self) -> int:
-        return max(self.total_bytes - self.ipv6_bytes, 0)
+    def non_ipv6_bytes(self) -> int:
+        return self.total_bytes - self.ipv6_bytes
 
     @property
     def ipv6_pct(self) -> float:
@@ -53,12 +67,21 @@ class TrafficShare:
 
 
 def default_interface() -> str:
-    """Return the interface used for the IPv4 default route."""
+    """Return the first up, non-reject IPv4 /0 route's interface."""
     for line in PROC_NET_ROUTE.read_text().splitlines()[1:]:
         fields = line.split()
-        if len(fields) >= 2 and fields[1] == "00000000":
+        # A zero destination alone also matches routes such as 0.0.0.0/1.
+        # Require a zero mask and usable flags before choosing an interface.
+        if (len(fields) < 8 or fields[1] != "00000000"
+                or fields[7] != "00000000"):
+            continue
+        try:
+            flags = int(fields[3], 16)
+        except ValueError:
+            continue
+        if flags & RTF_UP and not flags & RTF_REJECT:
             return fields[0]
-    raise RuntimeError("no default route found in /proc/net/route")
+    raise RuntimeError("no usable IPv4 default route found in /proc/net/route")
 
 
 def total_bytes_for(interface: str) -> int:
@@ -105,10 +128,15 @@ def boot_time() -> datetime:
 
 
 def gather(interface: str) -> TrafficShare:
+    # Sample the IPv6 subset first. Reading the total first lets traffic
+    # arriving between reads inflate the numerator past an older denominator,
+    # particularly soon after boot when the accumulated counters are small.
+    ipv6_bytes = ipv6_bytes_for(interface)
+    total_bytes = total_bytes_for(interface)
     return TrafficShare(
         interface=interface,
-        total_bytes=total_bytes_for(interface),
-        ipv6_bytes=ipv6_bytes_for(interface),
+        total_bytes=total_bytes,
+        ipv6_bytes=ipv6_bytes,
         since=boot_time(),
     )
 
@@ -122,22 +150,22 @@ def format_bytes(n: int) -> str:
     return f"{value:.1f} PiB"
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "-i", "--interface",
-        help="interface to report on (default: default-route interface)",
+        help="interface to report on (default: first usable IPv4 default route)",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="also print raw byte counts",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     try:
         interface = args.interface or default_interface()
         share = gather(interface)
-    except (RuntimeError, OSError) as exc:
+    except (RuntimeError, OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
@@ -148,9 +176,9 @@ def main() -> int:
     )
 
     if args.verbose:
-        print(f"  ipv4:  {format_bytes(share.ipv4_bytes)}")
-        print(f"  ipv6:  {format_bytes(share.ipv6_bytes)}")
-        print(f"  total: {format_bytes(share.total_bytes)}")
+        print(f"  non-IPv6: {format_bytes(share.non_ipv6_bytes)}")
+        print(f"  ipv6:     {format_bytes(share.ipv6_bytes)}")
+        print(f"  total:    {format_bytes(share.total_bytes)}")
 
     return 0
 

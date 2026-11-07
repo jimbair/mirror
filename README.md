@@ -155,6 +155,14 @@ HTML-escaped. The index builder and torrent checker query Transmission
 independently. Existing host cron jobs and installed scripts are changed
 manually.
 
+`ipv6-stats.py` supplies the index's IPv6 traffic share. It selects the first
+up, non-reject IPv4 default route, or accepts `--interface NAME`. It reads IPv6
+octets before total interface bytes and rejects inconsistent counters with
+exit 1. Verbose mode (`--verbose`) labels the remaining bytes as `non-IPv6`,
+including link-layer overhead and non-IP traffic. The displayed boot timestamp
+assumes the interface counters have remained intact since boot; collection
+is stateless.
+
 ## Tests and development
 
 Tests create temporary files and mock network access. They do not require
@@ -163,6 +171,7 @@ Transmission, rsync, or production data:
 ```sh
 python3.11 -B tests/test_new_torrents.py -v
 python3.11 -B tests/test_mirror_index.py -v
+python3.11 -B tests/test_ipv6_stats.py -v
 python3.11 -B tests/test_transmission_upgrade.py -v
 python3.11 -B tests/test_debian_torrents_fetch.py -v
 bash -n mirror-index.sh
