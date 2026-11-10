@@ -6,9 +6,15 @@ Applies bans by default; use --dry-run to preview without changing anything.
 A normal run temporarily serves a PeerGuardian blocklist and tells Transmission
 to download/reload it without restarting the daemon.
 
-By default, match clients whose names start with aria2/ and peers whose
-Base64-decoded peer ID starts with -GT0003- (anacrolix/torrent, also used
-by legitimate software). Use --no-block-gt0003 to disable that match.
+By default, match aria2/ client names and -GT0003- / -PC0200- peer IDs.
+Use --no-block-gt0003 or --no-block-pc0200 to disable either ID match.
+Additional client-name and peer-ID prefixes can be added in
+~/.config/transmission-client-ban/signatures.txt, one per line, e.g.:
+    client:AnotherDownloader/
+    peer-id:-XX1234-
+The file is optional and reloaded on every invocation. Peer-ID matches also
+accept the same signature at the start of Transmission's displayed client name
+when a decoded peer ID is unavailable. Identifiers are self-reported.
 
 Every matching peer IP is retained in blocked-ips.txt as an observation.
 After observing 5 distinct IPv6 addresses in one /64 (configurable), the entire
@@ -35,6 +41,8 @@ import threading
 from urllib import error, request
 
 DEFAULT_BLOCKLIST_URLS = {"", "https://www.example.com/blocklist", "http://www.example.com/blocklist"}
+DEFAULT_SIGNATURES_FILE = Path("~/.config/transmission-client-ban/signatures.txt").expanduser()
+DEFAULT_PEER_ID_PREFIXES = ("-GT0003-", "-PC0200-")
 
 
 class RPC:
@@ -151,35 +159,74 @@ def build_rules(addresses, ipv6_threshold):
     return rules, promoted
 
 
-def matching_reasons(peer, client_prefix, block_gt0003):
-    """Return identification matches for one peer; tolerate absent/malformed IDs."""
+def read_signatures(path):
+    """Read optional additional client and peer-ID prefixes; fail on typos."""
+    if not path.exists():
+        return set(), set()
+    client_prefixes, peer_id_prefixes = set(), set()
+    for num, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        kind, separator, value = line.partition(":")
+        value = value.strip()
+        if not separator or not value:
+            raise ValueError(f"Invalid signature in {path}, line {num}: {line!r}")
+        if kind == "client":
+            client_prefixes.add(value)
+        elif kind == "peer-id":
+            peer_id_prefixes.add(value)
+        else:
+            raise ValueError(f"Unknown signature type in {path}, line {num}: {kind!r}")
+    return client_prefixes, peer_id_prefixes
+
+
+def validate_peer_id_prefix(value):
+    """Peer IDs are 20 bytes; do not allow dangerously broad match strings."""
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"Peer-ID prefix must be ASCII: {value!r}") from exc
+    if not 4 <= len(encoded) <= 20:
+        raise ValueError(f"Peer-ID prefix must be 4-20 bytes: {value!r}")
+    return encoded
+
+
+def matching_reasons(peer, client_prefixes, peer_id_prefixes):
+    """Match configurable prefixes; tolerate absent/malformed Base64 peer IDs."""
     reasons = set()
     name = peer.get("client_name") or ""
-    if isinstance(name, str) and name.lower().startswith(client_prefix.lower()):
-        reasons.add(f"client: {name}")
+    if isinstance(name, str):
+        for prefix in client_prefixes:
+            if name.lower().startswith(prefix.lower()):
+                reasons.add(f"client: {name}")
+        # Some clients expose their peer-ID signature as their client name.
+        for prefix in peer_id_prefixes:
+            if name.startswith(prefix.decode("ascii")):
+                reasons.add(f"client ID: {prefix.decode('ascii')}")
 
-    if block_gt0003:
-        encoded = peer.get("peer_id")
-        if isinstance(encoded, str):
-            try:
-                peer_id = base64.b64decode(encoded, validate=True)
-            except (ValueError, binascii.Error):
-                pass
-            else:
-                if len(peer_id) == 20 and peer_id.startswith(b"-GT0003-"):
-                    reasons.add("peer ID: -GT0003-")
+    encoded = peer.get("peer_id")
+    if isinstance(encoded, str):
+        try:
+            peer_id = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            pass
+        else:
+            if len(peer_id) == 20:
+                for prefix in peer_id_prefixes:
+                    if peer_id.startswith(prefix):
+                        reasons.add(f"peer ID: {prefix.decode('ascii')}")
     return reasons
 
 
-def pg_payload(rules, client_prefix, block_gt0003=False):
-    # PeerGuardian labels do not need to be unique. Transmission accepts IPv6
-    # start-end ranges even though it does not parse IPv6 CIDR here.
-    label = ("peer-ban" if block_gt0003 else
-             "aria2" if client_prefix.lower().startswith("aria2") else "client-ban")
+def pg_payload(rules):
+    # PeerGuardian labels do not need to be unique. The persistent IP log does
+    # not distinguish reasons, so a generic label avoids claiming every rule
+    # came from aria2. Transmission accepts IPv6 start-end ranges, not CIDR.
     lines = []
     for rule in sorted(rules, key=rule_sort_key):
         network = ipaddress.ip_network(rule, strict=False)
-        lines.append(f"{label}:{network.network_address}-{network.broadcast_address}\n")
+        lines.append(f"peer-ban:{network.network_address}-{network.broadcast_address}\n")
     return "".join(lines).encode("ascii")
 
 
@@ -241,7 +288,11 @@ def main():
                         help="Prefer the TRANSMISSION_RPC_PASSWORD environment variable")
     parser.add_argument("--client-prefix", default="aria2/", help="Case-insensitive prefix (default: aria2/)")
     parser.add_argument("--no-block-gt0003", action="store_false", dest="block_gt0003", default=True,
-                        help="Do not ban peers with Base64 peer IDs starting -GT0003- (enabled by default)")
+                        help="Do not match -GT0003- (enabled by default)")
+    parser.add_argument("--no-block-pc0200", action="store_false", dest="block_pc0200", default=True,
+                        help="Do not match -PC0200- (enabled by default)")
+    parser.add_argument("--signatures-file", type=Path, default=DEFAULT_SIGNATURES_FILE,
+                        help="Optional text file with client: and peer-id: prefix lines")
     parser.add_argument("--state-file", type=Path,
                         default=Path("~/.local/state/transmission-client-ban/blocked-ips.txt").expanduser())
     parser.add_argument("--ipv6-threshold", type=int, default=5,
@@ -262,6 +313,16 @@ def main():
     # effective rules last applied. This permits future threshold changes and
     # avoids unnecessary reloads when a new IP is already inside a banned /64.
     rules_file = args.state_file.with_name("blocked-rules.txt")
+    extra_clients, extra_peers = read_signatures(args.signatures_file.expanduser())
+    if not args.client_prefix:
+        parser.error("--client-prefix cannot be empty")
+    client_prefixes = {args.client_prefix, *extra_clients}
+    peer_id_strings = set(DEFAULT_PEER_ID_PREFIXES) | extra_peers
+    if not args.block_gt0003:
+        peer_id_strings.discard("-GT0003-")
+    if not args.block_pc0200:
+        peer_id_strings.discard("-PC0200-")
+    peer_id_prefixes = {validate_peer_id_prefix(value) for value in peer_id_strings}
     rpc = RPC(args.rpc_url, args.username, args.password)
     info = rpc.call("session_get", {"fields": ["version", "rpc_version"]})
     if info.get("rpc_version", 0) < 18:
@@ -272,7 +333,7 @@ def main():
     reasons_by_ip = defaultdict(set)
     for torrent in torrents:
         for peer in torrent.get("peers", []):
-            reasons = matching_reasons(peer, args.client_prefix, args.block_gt0003)
+            reasons = matching_reasons(peer, client_prefixes, peer_id_prefixes)
             if not reasons:
                 continue
             try:
@@ -290,6 +351,8 @@ def main():
     promoted_before = {str(ipaddress.ip_network(rule)) for rule in applied_rules or set() if "/64" in rule and ":" in rule}
 
     print(f"Transmission: {info.get('version', '?')}")
+    print(f"Client filters: {', '.join(sorted(client_prefixes)) or 'none'}; "
+          f"peer IDs: {', '.join(sorted(peer_id_strings)) or 'none'}")
     print(f"Scanned {len(torrents)} torrents; found {len(observed)} matching IPs "
           f"across {sum(map(len, observed.values()))} torrent/peer combinations")
     print(f"Previously saved: {len(previous)}; new: {len(newly_found)}; total: {len(total)}")
@@ -321,7 +384,7 @@ def main():
             print("No rule changes; nothing to reload. Use --refresh to reapply saved bans.")
         return
 
-    count = reload_blocklist(rpc, pg_payload(rules, args.client_prefix, args.block_gt0003), args.bind_address,
+    count = reload_blocklist(rpc, pg_payload(rules), args.bind_address,
                              args.advertise_host, args.port, args.allow_existing_url)
     write_lines(args.state_file, sorted(total, key=address_sort_key))
     write_lines(rules_file, sorted(rules, key=rule_sort_key))
