@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
-"""Block Transmission peers advertising a selected BitTorrent client.
+"""Block selected Transmission peers using their client name or peer ID.
 
 Transmission 4.1+ (JSON-RPC 2.0); Python 3.9+; standard library only.
-Dry-run by default. With --apply, temporarily serves a PeerGuardian blocklist
-and instructs Transmission to download/reload it without restarting the daemon.
+Applies bans by default; use --dry-run to preview without changing anything.
+A normal run temporarily serves a PeerGuardian blocklist and tells Transmission
+to download/reload it without restarting the daemon.
+
+By default, match clients whose names start with aria2/ and peers whose
+Base64-decoded peer ID starts with -GT0003- (anacrolix/torrent, also used
+by legitimate software). Use --no-block-gt0003 to disable that match.
 
 Every matching peer IP is retained in blocked-ips.txt as an observation.
 After observing 5 distinct IPv6 addresses in one /64 (configurable), the entire
 /64 is blocked instead of its individual addresses. blocked-rules.txt records
 the last successfully applied effective rules using readable CIDR notation.
 The PeerGuardian data sent to Transmission uses start-end ranges, not IPv6 CIDR.
+Previously saved bans remain in place even if a matching option is disabled.
 
 Run on the same host/network namespace as transmission-daemon by default.
-Peer client names are self-reported and may be spoofed.
+Client names and peer IDs are self-reported and may be spoofed.
 """
 
 import argparse
 import base64
+import binascii
 from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
@@ -144,10 +151,31 @@ def build_rules(addresses, ipv6_threshold):
     return rules, promoted
 
 
-def pg_payload(rules, client_prefix):
+def matching_reasons(peer, client_prefix, block_gt0003):
+    """Return identification matches for one peer; tolerate absent/malformed IDs."""
+    reasons = set()
+    name = peer.get("client_name") or ""
+    if isinstance(name, str) and name.lower().startswith(client_prefix.lower()):
+        reasons.add(f"client: {name}")
+
+    if block_gt0003:
+        encoded = peer.get("peer_id")
+        if isinstance(encoded, str):
+            try:
+                peer_id = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error):
+                pass
+            else:
+                if len(peer_id) == 20 and peer_id.startswith(b"-GT0003-"):
+                    reasons.add("peer ID: -GT0003-")
+    return reasons
+
+
+def pg_payload(rules, client_prefix, block_gt0003=False):
     # PeerGuardian labels do not need to be unique. Transmission accepts IPv6
     # start-end ranges even though it does not parse IPv6 CIDR here.
-    label = "aria2" if client_prefix.lower().startswith("aria2") else "client-ban"
+    label = ("peer-ban" if block_gt0003 else
+             "aria2" if client_prefix.lower().startswith("aria2") else "client-ban")
     lines = []
     for rule in sorted(rules, key=rule_sort_key):
         network = ipaddress.ip_network(rule, strict=False)
@@ -212,11 +240,14 @@ def main():
     parser.add_argument("--password", default=os.getenv("TRANSMISSION_RPC_PASSWORD", ""),
                         help="Prefer the TRANSMISSION_RPC_PASSWORD environment variable")
     parser.add_argument("--client-prefix", default="aria2/", help="Case-insensitive prefix (default: aria2/)")
+    parser.add_argument("--no-block-gt0003", action="store_false", dest="block_gt0003", default=True,
+                        help="Do not ban peers with Base64 peer IDs starting -GT0003- (enabled by default)")
     parser.add_argument("--state-file", type=Path,
                         default=Path("~/.local/state/transmission-client-ban/blocked-ips.txt").expanduser())
     parser.add_argument("--ipv6-threshold", type=int, default=5,
                         help="Distinct observed IPv6 addresses needed to block their /64 (default: 5; 0 disables)")
-    parser.add_argument("--apply", action="store_true", help="Apply bans via a temporary HTTP blocklist endpoint")
+    parser.add_argument("--dry-run", action="store_true", help="Preview matches and rules without changing anything")
+    parser.add_argument("--apply", action="store_true", help=argparse.SUPPRESS)  # Legacy no-op for existing cron jobs.
     parser.add_argument("--refresh", action="store_true", help="Reapply saved bans even without rule changes")
     parser.add_argument("--bind-address", default="127.0.0.1", help="HTTP listener bind address")
     parser.add_argument("--advertise-host", default="127.0.0.1", help="Address Transmission can reach (same namespace by default)")
@@ -238,16 +269,18 @@ def main():
 
     torrents = rpc.call("torrent_get", {"fields": ["id", "name", "peers"]}).get("torrents", [])
     observed = {}
+    reasons_by_ip = defaultdict(set)
     for torrent in torrents:
         for peer in torrent.get("peers", []):
-            name = peer.get("client_name", "") or ""
-            if not name.lower().startswith(args.client_prefix.lower()):
+            reasons = matching_reasons(peer, args.client_prefix, args.block_gt0003)
+            if not reasons:
                 continue
             try:
                 ip = str(ipaddress.ip_address(peer["address"]))
             except (KeyError, ValueError):
                 continue
             observed.setdefault(ip, set()).add(torrent.get("name", "?"))
+            reasons_by_ip[ip].update(reasons)
 
     previous = read_addresses(args.state_file)
     newly_found = set(observed) - previous
@@ -262,7 +295,7 @@ def main():
     print(f"Previously saved: {len(previous)}; new: {len(newly_found)}; total: {len(total)}")
     for ip in sorted(newly_found, key=address_sort_key)[:25]:
         names = sorted(observed[ip])
-        print(f"  NEW {ip}  ({len(names)} torrent(s))")
+        print(f"  NEW {ip}  ({len(names)} torrent(s); {', '.join(sorted(reasons_by_ip[ip]))})")
         for name in names:
             print(f"      - {name}")
     if len(newly_found) > 25:
@@ -273,8 +306,8 @@ def main():
         if str(network) not in promoted_before:
             print(f"  PROMOTE {network}  ({count} observed addresses)")
 
-    if not args.apply:
-        print("DRY RUN: Nothing changed. Add --apply to save and apply the blocklist.")
+    if args.dry_run:
+        print("DRY RUN: Nothing changed. Omit --dry-run to save and apply the blocklist.")
         return
     if not total:
         print("No peers to ban; leaving Transmission unchanged.")
@@ -288,7 +321,7 @@ def main():
             print("No rule changes; nothing to reload. Use --refresh to reapply saved bans.")
         return
 
-    count = reload_blocklist(rpc, pg_payload(rules, args.client_prefix), args.bind_address,
+    count = reload_blocklist(rpc, pg_payload(rules, args.client_prefix, args.block_gt0003), args.bind_address,
                              args.advertise_host, args.port, args.allow_existing_url)
     write_lines(args.state_file, sorted(total, key=address_sort_key))
     write_lines(rules_file, sorted(rules, key=rule_sort_key))
