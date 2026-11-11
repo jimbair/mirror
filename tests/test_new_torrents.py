@@ -18,6 +18,7 @@ import http.client
 import importlib.util
 import io
 import json
+import os
 import re
 import shutil
 import socket
@@ -2005,9 +2006,8 @@ class TestUbuntuChecker(unittest.TestCase):
         self.assertEqual(updates, {'EOL:Ubuntu-12.04'})
 
     def test_local_eol_line_files_not_flagged_when_schedule_unavailable(self):
-        """Fail-open: when the schedule page can't be fetched, _eol_lines()
-        is None, nothing is EOL, and past-EOL local files that are still on
-        the tracker raise nothing -- exactly the pre-filter behavior."""
+        """Without a valid schedule or cache, report the outage but do not
+        incorrectly classify existing mirrored ISOs as EOL."""
         page = ('<td>ubuntu-12.04.5-dvd-amd64.iso</td>\n'
                 '<td>ubuntu-24.04-desktop-amd64.iso</td>\n')
         for name in ('ubuntu-12.04.5-dvd-amd64.iso',
@@ -2026,7 +2026,9 @@ class TestUbuntuChecker(unittest.TestCase):
 
         c.fetch = _fetch
         c.check()
-        self.assertEqual(c.updates, set())
+        self.assertEqual(c.updates, {
+            'DOWN:Ubuntu-EOL (ubuntu.com): fetch failed; no usable cached schedule'
+        })
 
     def test_local_eol_line_files_not_flagged_in_off_mode(self):
         """'off' mode disables the filter entirely: past-EOL local files
@@ -2466,6 +2468,59 @@ class TestUbuntuChecker(unittest.TestCase):
             c._eol_lines = functools.partial(
                 nt.UbuntuChecker._eol_lines, c, now=now)
         return c
+
+    def test_eol_fetch_uses_fresh_cache_without_down_alert(self):
+        self._run(now=UBUNTU_FROZEN_NOW)
+        c = self._failing_eol_fetch(UBUNTU_PAGE, now=UBUNTU_FROZEN_NOW)
+        old_fetch = c.fetch
+
+        def failing_fetch(url, name):
+            if name == 'Ubuntu-EOL':
+                c._record_failure(name, 'ubuntu.com', 'HTTP 503 Service Unavailable')
+                return False
+            return old_fetch(url, name)
+
+        c.fetch = failing_fetch
+        for _ in range(5):
+            c.check()
+        self.assertFalse(any(a.startswith('DOWN:') for a in c.updates))
+        self.assertEqual(c._failures.count('Ubuntu-EOL'), 5)
+
+    def test_eol_fetch_reports_expired_cache_but_still_filters(self):
+        self._run(now=UBUNTU_FROZEN_NOW)
+        old = time.time() - 73 * 3600
+        os.utime(self.eol_cache, (old, old))
+        page = ('<td>ubuntu-12.04.5-desktop-i386.iso</td>'
+                '<td>ubuntu-26.04-desktop-amd64.iso</td>')
+        c = self._failing_eol_fetch(page, now=UBUNTU_FROZEN_NOW)
+        old_fetch = c.fetch
+
+        def failing_fetch(url, name):
+            if name == 'Ubuntu-EOL':
+                c._record_failure(name, 'ubuntu.com', 'HTTP 503 Service Unavailable')
+                return False
+            return old_fetch(url, name)
+
+        c.fetch = failing_fetch
+        c.check()
+        self.assertTrue(any('DOWN:Ubuntu-EOL (ubuntu.com): HTTP 503' in a
+                            and '72h limit' in a for a in c.updates))
+        self.assertNotIn('NEW:Ubuntu-12.04.5', c.updates)
+
+    def test_eol_fetch_without_cache_alerts_immediately(self):
+        c = self._failing_eol_fetch(UBUNTU_PAGE, now=UBUNTU_FROZEN_NOW)
+        old_fetch = c.fetch
+
+        def failing_fetch(url, name):
+            if name == 'Ubuntu-EOL':
+                c._record_failure(name, 'ubuntu.com', 'HTTP 503 Service Unavailable')
+                return False
+            return old_fetch(url, name)
+
+        c.fetch = failing_fetch
+        c.check()
+        self.assertTrue(any(a.startswith('DOWN:Ubuntu-EOL (ubuntu.com): HTTP 503')
+                            and 'no usable cached schedule' in a for a in c.updates))
 
     def test_schedule_fetch_failure_falls_back_to_cache(self):
         """A transient schedule-page outage no longer re-alerts past-EOL

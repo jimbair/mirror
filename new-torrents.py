@@ -61,9 +61,8 @@ LOCK_FILE = Path.home() / '.config' / 'new-torrents' / 'lock'
 # after a line's tier ends). UbuntuChecker falls back to it when the
 # schedule page is unfetchable or unparseable: Canonical keeps past-EOL
 # releases on the tracker, so without the fallback every transient
-# outage re-alerts each of them as NEW (the domain-down alert needs 3
-# consecutive failures, so a one-off outage is only visible as those
-# false NEWs).
+# outage re-alerts each of them as NEW. Failed schedule fetches use the
+# cache silently for 72 hours; after that they report a stale-cache alert.
 UBUNTU_EOL_CACHE_FILE = Path.home() / '.config' / 'new-torrents' / 'ubuntu-eol.json'
 
 # Membership in the last complete Mint support table, plus the archive
@@ -419,6 +418,8 @@ class Checker(ABC):
     _MAX_FETCH_BYTES = 8 * 1024 * 1024
     _MAX_DECODED_BYTES = 16 * 1024 * 1024
     _READ_CHUNK = 64 * 1024
+    # A source with its own freshness policy can defer generic DOWN alerts.
+    _DEFERRED_FAILURE_NAMES: frozenset[str] = frozenset()
 
     def __init__(self, iso_dir: Path, known_torrents: frozenset[str],
                  failures: FailureTracker,
@@ -433,6 +434,7 @@ class Checker(ABC):
         self._failures = failures
         self._display = display
         self._name = self.__class__.__name__
+        self._last_failure_reason: str | None = None
 
     def _debug(self, msg: str) -> None:
         if self._display:
@@ -576,7 +578,12 @@ class Checker(ABC):
         fetch() and the rsync path so both report the same way.
         """
         self._failures.increment(name)
+        self._last_failure_reason = reason
         self._debug(f'failed: {reason}')
+        # Ubuntu EOL alerts depend on cache freshness, not fetch count.
+        # Still count attempts so a later alert retains diagnostics.
+        if name in self._DEFERRED_FAILURE_NAMES:
+            return
         # Check threshold against in-memory state; no disk read needed
         if self._failures.at_threshold(name):
             n = self._failures.count(name)
@@ -1386,9 +1393,9 @@ class UbuntuChecker(Checker):
     unfetchable or unparseable the checker falls back to the last
     successfully parsed schedule (cached on disk by a prior healthy run
     — see UBUNTU_EOL_CACHE_FILE) and re-derives the EOL verdict from
-    its dates, so a transient outage doesn't re-alert every past-EOL
-    line Canonical keeps on the tracker; only when no such cache
-    exists yet does it fail open and track every line the tracker lists.
+    its dates. Fetch failures use this cache silently for 72 hours;
+    afterward they alert, but still use its dates. Without a usable
+    cache, the checker alerts immediately and fails open.
 
     Version-level alerts (currency is per artifact signature — see
     _artifact_key — so a point release covering only some artifacts leaves
@@ -1457,6 +1464,8 @@ class UbuntuChecker(Checker):
     # can redirect it per-instance to a temp path without touching the
     # real one.
     _eol_cache_path: Path = UBUNTU_EOL_CACHE_FILE
+    _EOL_CACHE_MAX_AGE = 72 * 60 * 60
+    _DEFERRED_FAILURE_NAMES = frozenset({'Ubuntu-EOL'})
 
     def _version_of(self, filename: str) -> str | None:
         m = self._VERSION_RE.search(filename)
@@ -1522,11 +1531,12 @@ class UbuntuChecker(Checker):
 
         The live page is parsed fresh every run and the parsed dates
         are cached on disk as a side effect (_eol_cache_save); if the
-        page is unfetchable or yields no dates — which still alerts
-        MALFORMED:Ubuntu-EOL — the last-known-good cached schedule is
-        loaded and the verdict re-derived from its dates at the current
-        clock. The cache stores dates, not a verdict, so cached data
-        stays correct as each tier's end month passes.
+        page is unfetchable or yields no dates — malformed pages still
+        alert MALFORMED:Ubuntu-EOL — the last-known-good cached schedule
+        is loaded and the verdict re-derived from its dates at the
+        current clock. Fetch failures only alert if the cache is missing
+        or at least 72 hours old. The cache stores dates, not a verdict,
+        so EOL decisions still advance as the clock moves.
 
         Returns None only when the schedule is unusable AND no cached
         schedule exists: the caller then fails open and tracks every
@@ -1579,6 +1589,25 @@ class UbuntuChecker(Checker):
                 # the cached schedule below rescues this run's verdict --
                 # the broken page is still worth surfacing.
                 self.alert('MALFORMED:Ubuntu-EOL')
+        else:
+            # An HTTP failure is different from malformed HTML. Continue
+            # trying upstream on every run, but alert only when the last
+            # valid cache is missing or at least 72 hours old.
+            age = self._eol_cache_age() if cached is not None else None
+            if cached is None:
+                freshness = 'no usable cached schedule'
+            elif age is None:
+                freshness = 'cache age unavailable'
+            elif age >= self._EOL_CACHE_MAX_AGE:
+                freshness = f'cached schedule is {age / 3600:.1f}h old (72h limit)'
+            else:
+                freshness = None
+            if freshness is not None:
+                reason = self._last_failure_reason or 'fetch failed'
+                count = self._failures.count('Ubuntu-EOL')
+                attempts = f' ({count} consecutive failures)' if count else ''
+                self.alert(f'DOWN:Ubuntu-EOL (ubuntu.com): {reason}'
+                           f'{attempts}; {freshness}')
         if data is None:
             data = cached
             self._debug('EOL schedule from cache' if data is not None
@@ -1752,6 +1781,13 @@ class UbuntuChecker(Checker):
         tmp = self._eol_cache_path.with_name(self._eol_cache_path.name + '.tmp')
         tmp.write_text(json.dumps(payload, indent=2))
         os.replace(tmp, self._eol_cache_path)
+
+    def _eol_cache_age(self) -> float | None:
+        """Seconds since the last successfully saved valid schedule."""
+        try:
+            return max(0.0, time.time() - self._eol_cache_path.stat().st_mtime)
+        except OSError:
+            return None
 
     def _eol_cache_load(self) -> ScheduleData | None:
         """Load the last successfully parsed schedule, or None if the
