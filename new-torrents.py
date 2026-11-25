@@ -435,6 +435,9 @@ class Checker(ABC):
         self._display = display
         self._name = self.__class__.__name__
         self._last_failure_reason: str | None = None
+        # True when the last fetch's server said it answered from an expired
+        # cache entry (X-Cache-Status: STALE). Only callers that care read it.
+        self._stale_response: bool = False
 
     def _debug(self, msg: str) -> None:
         if self._display:
@@ -460,7 +463,10 @@ class Checker(ABC):
                 # pages to non-browser agents
                 headers={'Accept-Encoding': 'gzip, deflate', 'User-Agent': 'curl/8.5.0'},
             )
+            self._stale_response = False
             with urllib.request.urlopen(req, timeout=self._FETCH_TIMEOUT) as resp:
+                self._stale_response = ('stale' in
+                                        resp.headers.get('X-Cache-Status', '').lower())
                 raw = self._read_body(resp, deadline)
                 encoding = resp.headers.get_content_charset('utf-8')
                 ce = resp.headers.get('Content-Encoding', '').strip().lower()
@@ -1429,6 +1435,8 @@ class UbuntuChecker(Checker):
       MALFORMED:Ubuntu-Tracker - tracker page returned no ISOs, or none had a
                                   parseable version
       MALFORMED:Ubuntu-EOL     - support-schedule page returned no usable dates
+                                  (a response the server marks X-Cache-Status:
+                                  STALE is treated as an outage, not this)
     """
 
     _VERSION_RE = re.compile(r'(\d+\.\d+(?:\.\d+)*)')
@@ -1551,8 +1559,20 @@ class UbuntuChecker(Checker):
             now = (today.year, today.month)
         data: ScheduleData | None = None
         cached = self._eol_cache_load()
-        if self.fetch('https://ubuntu.com/project/docs/release-team/'
-                      'list-of-releases/', 'Ubuntu-EOL'):
+        fetched = self.fetch('https://ubuntu.com/project/docs/release-team/'
+                             'list-of-releases/', 'Ubuntu-EOL')
+        if fetched and self._stale_response:
+            # ubuntu.com's content cache sometimes answers from an expired
+            # entry (observed 2026-11-24: X-Cache-Status: STALE from
+            # content-cache-il3/1, Last-Modified 2026-08-25, a copy that
+            # predates the 26.10 row). That is an old page, not a changed
+            # one: treat it as an unavailable upstream so the cached
+            # schedule stands in and MALFORMED stays reserved for a page
+            # that really changed. The branch below alerts DOWN if the
+            # cache is missing or over 72 hours old.
+            fetched = False
+            self._last_failure_reason = 'served stale by ubuntu.com content cache'
+        if fetched:
             data = self._parse_schedule()
             if data is not None and cached is not None:
                 # Losing or shortening an unexpired tier is suspicious,
